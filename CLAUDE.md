@@ -397,9 +397,11 @@ this repo can alter directly — treat them as always-in-effect policy:
   Dependabot opens its PRs from branches of this repository, so they run on
   the self-hosted runner without approval, and a dependency bump executes
   the new upstream version's build scripts (and proc macros and tests)
-  there. That is accepted — the runner is ephemeral and CI jobs hold only a
-  read-only token — and it is why the job that can mint a crates.io token
-  never runs on that runner (see Release process).
+  there. That is accepted even though the runner mounts the host docker
+  socket, so such code can reach the host beyond its own ephemeral
+  container: nothing secret lives on that runner (CI jobs hold only a
+  read-only token), and the job that can mint a crates.io token never runs
+  there (see Release process).
 - A GitHub App's id (`APP_ID` repo variable) and private key
   (`APP_PRIVATE_KEY` repo secret) are what `auto-merge.yml` authenticates
   with.

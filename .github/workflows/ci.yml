@@ -16,8 +16,11 @@ name: CI
 # its PRs from branches of this repository, so they run here without
 # approval, and a dependency bump executes the new upstream version's build
 # scripts (and proc macros, and tests) on the self-hosted runner. That is
-# accepted — the runner is ephemeral and these jobs hold only a read-only
-# token. `ci-pass` is a pure result check and stays on a GitHub-hosted runner.
+# accepted, knowing the runner mounts the host docker socket, so such code
+# can reach the host beyond its own ephemeral container. The mitigation is
+# that nothing secret lives on that runner: these jobs hold only a read-only
+# token, and release.yml's publish job runs on a GitHub-hosted runner.
+# `ci-pass` is a pure result check and stays on a GitHub-hosted runner.
 #
 # `checks` builds once with the toolchain pinned in `rust-toolchain.toml`
 # and runs everything that toolchain needs to cover:

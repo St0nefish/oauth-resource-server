@@ -367,8 +367,15 @@ jobs:
             "$url") || code="curl exit $?"
           case "$code" in
             200)
+              # Only a re-run may find its own upload. On the first attempt a
+              # 200 means someone else published this version between `check`
+              # and now, and tagging GITHUB_SHA for it would be wrong.
+              if [ "${GITHUB_RUN_ATTEMPT}" -le 1 ]; then
+                echo "::error::oauth-resource-server ${VERSION} appeared on crates.io after the check job ran, from outside this run. Not tagging a release for an upload this workflow did not make."
+                exit 1
+              fi
               echo "upload=false" >> "$GITHUB_OUTPUT"
-              echo "::notice::oauth-resource-server ${VERSION} is already on crates.io (an earlier attempt uploaded it) — skipping the upload."
+              echo "::notice::oauth-resource-server ${VERSION} is already on crates.io (an earlier attempt of this run uploaded it) — skipping the upload."
               ;;
             404)
               echo "upload=true" >> "$GITHUB_OUTPUT"
