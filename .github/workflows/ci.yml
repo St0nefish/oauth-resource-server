@@ -31,8 +31,8 @@ name: CI
 # backends are additive, not mutually exclusive), tests, a `-D warnings` doc build (every public item
 # needs a doc comment — see `#![warn(missing_docs)]` in `src/lib.rs`),
 # `cargo audit`, and the packaging checks (`cargo package --list` and
-# `cargo publish --dry-run`) that catch a metadata mistake before a version
-# bump ever reaches `release.yml`. `release.yml`'s `verify` and `msrv` jobs
+# `cargo publish --dry-run`) that catch a metadata mistake before a release
+# ever reaches `release.yml`. `release.yml`'s `verify` and `msrv` jobs
 # repeat these steps before a publish; keep the two lists in step.
 #
 # `msrv` is a separate job on a separate, explicitly-installed toolchain
@@ -46,7 +46,9 @@ name: CI
 # two PRs each green against an older base can still combine into a broken
 # `master`; re-running the full gate on every push to `master` catches that
 # immediately. There is deliberately no separate `post-merge.yml` — this
-# workflow already is one, and a second would only duplicate the build.
+# workflow already is one, and a second would only duplicate the build. A
+# merge runs this workflow and nothing else: publishing happens only when the
+# maintainer publishes a GitHub release (see `release.yml`).
 #
 # Every action is pinned to a full commit SHA, with the release it
 # corresponds to in a trailing comment (dtolnay/rust-toolchain publishes no
@@ -175,8 +177,8 @@ jobs:
       - name: cargo publish --dry-run
         # Packages and verifies the crate (metadata, `include` list, doc
         # build inside the package) without uploading anything. This never
-        # touches crates.io; only `release.yml`, on a push to `master` whose
-        # Cargo.toml version is not yet published, does that.
+        # touches crates.io; only `release.yml`, when the maintainer
+        # publishes a GitHub release, does that.
         run: cargo publish --dry-run
 
   msrv:

@@ -100,12 +100,18 @@ This repository follows a simple trunk-based flow on `master`:
 You don't need to keep your branch up to date with `master` — CI re-runs on
 `master` after every merge. Rebase only if GitHub reports a conflict.
 
-Releases are published from `master` when a merged PR bumps `version` in
-`Cargo.toml` (with a matching `CHANGELOG.md` section): `release.yml` then
-publishes to crates.io and creates the `vX.Y.Z` tag and GitHub release.
+Merging a PR never publishes anything. A release happens in two steps: a
+merged PR bumps `version` in `Cargo.toml` and adds the matching
+`CHANGELOG.md` section, and then the maintainer publishes a GitHub release
+`vX.Y.Z` targeting that bump commit's SHA (not `master`, so a later merge
+cannot ride along into the release without a CHANGELOG entry). Publishing
+the release is what runs `release.yml`, which verifies the tagged commit,
+publishes it to crates.io, and sets the release notes from `CHANGELOG.md`.
 Publishing uses crates.io trusted publishing, bound to this repository's
-`release` GitHub environment, which only `master` can deploy to; no
-crates.io token is stored anywhere in the repository.
+`release` GitHub environment, which only `v*` release tags can deploy to;
+only repository admins can create those tags, only the maintainer's own
+release publication starts a publish, and no crates.io token is stored
+anywhere in the repository.
 Contributors don't bump the version or push tags — put your entry under
 `CHANGELOG.md`'s `[Unreleased]` section. See
 `.github/workflows/release.yml`'s header comment for the details.
