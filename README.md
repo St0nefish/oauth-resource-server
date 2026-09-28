@@ -485,35 +485,113 @@ for you:
 
 Add [`tower-http`](https://docs.rs/tower-http)'s `CorsLayer` as the outermost
 layer, so it also covers the metadata route and preflight requests to routes
-behind `AuthLayer`:
+behind `AuthLayer`. A browser-based **MCP** client additionally needs the
+Streamable HTTP transport's own headers and methods allowed, not just
+`Authorization`:
 
 ```rust
 use axum::Router;
-use axum::http::header::{AUTHORIZATION, CONTENT_TYPE, InvalidHeaderValue, WWW_AUTHENTICATE};
-use axum::http::{HeaderValue, Method};
+use axum::body::Body;
+use axum::http::header::{
+    AUTHORIZATION, CONTENT_TYPE, HeaderName, InvalidHeaderValue, WWW_AUTHENTICATE,
+};
+use axum::http::{HeaderValue, Method, Request};
+use tower::ServiceExt;
 use tower_http::cors::CorsLayer;
+
+// Streamable HTTP headers a browser-based MCP client's requests and
+// responses need CORS to cover, beyond `Authorization`/`Content-Type`:
+static MCP_SESSION_ID: HeaderName = HeaderName::from_static("mcp-session-id");
+static MCP_PROTOCOL_VERSION: HeaderName = HeaderName::from_static("mcp-protocol-version");
+static LAST_EVENT_ID: HeaderName = HeaderName::from_static("last-event-id");
 
 fn cors_for(client_origin: &str) -> Result<CorsLayer, InvalidHeaderValue> {
     Ok(CorsLayer::new()
         .allow_origin(HeaderValue::from_str(client_origin)?)
-        .allow_methods([Method::GET, Method::POST, Method::OPTIONS])
-        .allow_headers([AUTHORIZATION, CONTENT_TYPE])
-        // Without this, `WWW-Authenticate` is invisible to the browser's
-        // JavaScript even though it is on the wire.
-        .expose_headers([WWW_AUTHENTICATE]))
+        // `DELETE` is how an MCP client ends a session.
+        .allow_methods([Method::GET, Method::POST, Method::DELETE, Method::OPTIONS])
+        .allow_headers([
+            AUTHORIZATION,
+            CONTENT_TYPE,
+            // The MCP protocol version the client negotiated.
+            MCP_PROTOCOL_VERSION.clone(),
+            // The session id the client must echo back on every request.
+            MCP_SESSION_ID.clone(),
+            // SSE stream resumption after a dropped connection.
+            LAST_EVENT_ID.clone(),
+        ])
+        // `WWW-Authenticate` so the client's JavaScript can read a
+        // challenge; `Mcp-Session-Id` so it can read the session id the
+        // server assigned on `initialize` (both are otherwise invisible to
+        // `fetch`, per the CORS-safelisted response header list).
+        .expose_headers([WWW_AUTHENTICATE, MCP_SESSION_ID.clone()]))
 }
 
 fn with_cors(app: Router, client_origin: &str) -> Result<Router, InvalidHeaderValue> {
     Ok(app.layer(cors_for(client_origin)?))
 }
+
+fn header<'a>(headers: &'a axum::http::HeaderMap, name: &str) -> &'a str {
+    headers.get(name).unwrap().to_str().unwrap()
+}
+
+#[tokio::main]
+async fn main() {
+    let app = with_cors(Router::new(), "https://client.example.com").unwrap();
+
+    // Drive an actual preflight `OPTIONS` request through the layered
+    // router, so this snippet is exercised rather than only compiled.
+    let preflight = Request::builder()
+        .method(Method::OPTIONS)
+        .uri("/mcp")
+        .header("origin", "https://client.example.com")
+        .header("access-control-request-method", "POST")
+        .header(
+            "access-control-request-headers",
+            "authorization,content-type,mcp-protocol-version,mcp-session-id,last-event-id",
+        )
+        .body(Body::empty())
+        .unwrap();
+    let response = app.clone().oneshot(preflight).await.unwrap();
+    assert!(response.status().is_success());
+
+    let allow_headers =
+        header(response.headers(), "access-control-allow-headers").to_ascii_lowercase();
+    for h in [
+        "authorization",
+        "content-type",
+        "mcp-protocol-version",
+        "mcp-session-id",
+        "last-event-id",
+    ] {
+        assert!(allow_headers.contains(h), "missing {h}");
+    }
+    let allow_methods = header(response.headers(), "access-control-allow-methods");
+    for m in ["GET", "POST", "DELETE", "OPTIONS"] {
+        assert!(allow_methods.contains(m), "missing {m}");
+    }
+
+    // `Access-Control-Expose-Headers` is sent on the actual response, not
+    // the preflight.
+    let actual = Request::builder()
+        .method(Method::POST)
+        .uri("/mcp")
+        .header("origin", "https://client.example.com")
+        .body(Body::empty())
+        .unwrap();
+    let response = app.oneshot(actual).await.unwrap();
+    let expose_headers =
+        header(response.headers(), "access-control-expose-headers").to_ascii_lowercase();
+    assert!(expose_headers.contains("www-authenticate"));
+    assert!(expose_headers.contains("mcp-session-id"));
+}
 ```
 
-`allow_credentials(true)` and a wildcard `allow_origin` are mutually
-exclusive under the Fetch spec. A bearer token your JavaScript sets in the
-`Authorization` header itself is not a CORS "credential" — that setting is
-for cookies and browser-managed HTTP auth — so a deployment sending the
-token that way needs neither `allow_credentials` nor a wildcard origin
-together.
+No `allow_credentials` is needed here: a bearer token your JavaScript sets in
+the `Authorization` header is not a CORS credential (a cookie or
+browser-managed HTTP auth would be). Use an explicit origin, as above, rather
+than a wildcard — and never combine a wildcard `allow_origin` with
+`allow_credentials(true)` at all; the Fetch spec forbids it.
 
 ### Without axum
 
@@ -616,9 +694,12 @@ do not `#[serde(flatten)]` it.**
 `#[serde(flatten)]` buffers the input through a generic value first, and
 that buffering is what makes `deny_unknown_fields` stop firing for the
 struct it is applied to: a field neither struct recognizes is silently
-dropped instead of producing a `ConfigError`, defeating the whole point of
-the attribute. This is a general serde limitation, not specific to this
-crate — see [serde's own `flatten` docs](https://serde.rs/attr-flatten.html).
+dropped instead of failing to deserialize at all, defeating the whole point
+of the attribute. (This happens before `OAuthConfig::resolve` ever runs, so
+it is a plain serde deserialization error from your format crate, not this
+crate's own `ConfigError`.) This is a general serde limitation, not specific
+to this crate — see [serde's own `flatten`
+docs](https://serde.rs/attr-flatten.html).
 
 ```rust
 use oauth_resource_server::OAuthConfig;
@@ -630,7 +711,7 @@ struct FlattenedConfig {
     oauth: OAuthConfig,
 }
 
-#[derive(Deserialize, Default)]
+#[derive(Debug, Deserialize, Default)]
 struct NestedConfig {
     #[serde(default)]
     oauth: OAuthConfig,
@@ -641,7 +722,8 @@ struct NestedConfig {
 assert!(serde_yaml_ng::from_str::<FlattenedConfig>("isuer: x\n").is_ok());
 
 // Nested instead of flattened: the same typo is refused, as intended.
-assert!(serde_yaml_ng::from_str::<NestedConfig>("oauth:\n  isuer: x\n").is_err());
+let err = serde_yaml_ng::from_str::<NestedConfig>("oauth:\n  isuer: x\n").unwrap_err();
+assert!(err.to_string().contains("unknown field `isuer`"));
 ```
 
 ### Environment variables
@@ -1002,7 +1084,7 @@ use oauth_resource_server::AuthorizedToken;
 
 /// Read back what `AuthLayer` put on the request, given the `Parts` a tool
 /// handler's own extractor hands it.
-fn credential_from_parts(parts: &Parts) -> Option<&AuthorizedToken> {
+fn token_from_parts(parts: &Parts) -> Option<&AuthorizedToken> {
     parts.extensions.get::<AuthorizedToken>()
 }
 ```
@@ -1011,7 +1093,7 @@ With the [rmcp](https://docs.rs/rmcp) SDK, `StreamableHttpService` carries
 those `Parts` onto the request context a `#[tool]` handler receives (its own
 docs, "Accessing HTTP request data from tool handlers"): a handler taking
 `rmcp::handler::server::tool::Extension<http::request::Parts>` as a
-parameter gets exactly the `Parts` value `credential_from_parts` above
+parameter gets exactly the `Parts` value `token_from_parts` above
 expects, and `parts.extensions.get::<AuthorizedToken>()` inside the handler
 reaches the token this crate validated. `Extension<AuthorizedToken>` on its
 own does not do this: rmcp's `Extension<T>` extractor reads from its own

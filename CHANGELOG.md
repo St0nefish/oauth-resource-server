@@ -13,9 +13,15 @@ Before 1.0, a breaking change increments the minor version.
 ### Documentation
 
 - README: a new "CORS for browser-based clients" section, showing a
-  `tower-http` `CorsLayer` on the protected and metadata routes and why
-  `Access-Control-Expose-Headers: WWW-Authenticate` is needed for a
-  browser's JavaScript to read a challenge (#19).
+  `tower-http` `CorsLayer` on the protected and metadata routes, the
+  Streamable HTTP headers/methods (`Mcp-Session-Id`, `Mcp-Protocol-Version`,
+  `Last-Event-Id`, `DELETE`) a browser-based MCP client additionally needs
+  allowed, and why `Access-Control-Expose-Headers: WWW-Authenticate` and
+  `Mcp-Session-Id` are needed for a browser's JavaScript to read them. The
+  doctest drives an actual preflight `OPTIONS` request (and a follow-up
+  request) through the layered router with `tower::ServiceExt::oneshot` and
+  asserts on the response headers, so it is exercised, not just compiled
+  (#19).
 - README: a new "Embedding `OAuthConfig` in your own config" section
   explaining that `OAuthConfig`'s `#[serde(deny_unknown_fields)]` is
   silently defeated by `#[serde(flatten)]` in an application's own config
