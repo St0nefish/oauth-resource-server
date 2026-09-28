@@ -451,14 +451,21 @@ The flow:
 
 - **A merge never publishes.** Publishing happens only when the owner
   publishes a GitHub release: `.github/workflows/release.yml` triggers on
-  `release: published` and nothing else (no push or manual trigger). A
-  release created with `GITHUB_TOKEN` starts no workflow, which is intended —
-  only a human-created release publishes; a prerelease publishes too (a
-  `X.Y.Z-rc.N` version, which Cargo never selects unless asked for).
-  `check` (GitHub-hosted, read-only) checks out the tagged commit (the
-  event's `github.sha`, confirmed against the tag) and fails closed unless
-  the tag is `v<version>` for `Cargo.toml`'s version at that commit, the
-  commit is an ancestor of `master`, crates.io answers `404` for the version
+  `release: published` and nothing else (no push or manual trigger). The
+  guarantee is that the owner must do both halves: create the `v*` tag (the
+  tag ruleset allows only admins) and publish the release (`check` fails
+  unless `github.event.sender.login` is `St0nefish` — needed because a
+  release published with a GitHub App installation token *does* start
+  workflow runs, and the auto-merge App has `contents: write`, so it could
+  otherwise publish a release on an existing, unpublished `v*` tag). A
+  release created with `GITHUB_TOKEN` starts no workflow run at all. A
+  prerelease publishes too (a `X.Y.Z-rc.N` version, which Cargo never
+  selects unless asked for). `check` (GitHub-hosted, read-only) checks out
+  the tagged commit (the event's `github.sha`, confirmed against the tag)
+  and fails closed unless the sender is the owner, the tag is `v<version>`
+  for `Cargo.toml`'s version at that commit, the commit is an ancestor of
+  `master` (a mistake check, not a security boundary: the run uses the
+  workflow file at the tagged commit), crates.io answers `404` for the version
   (`200` fails the first attempt — the release is for an already-published
   version; any other answer always fails), and `CHANGELOG.md` has a
   non-empty `## [X.Y.Z]` section. Then `verify` and `msrv`
@@ -479,17 +486,26 @@ The flow:
   (and `Cargo.lock`) and moves `CHANGELOG.md`'s `[Unreleased]` entries under
   `## [X.Y.Z] - <date>` (plus the link references at the bottom) — merging
   it publishes nothing; (2) the owner runs
-  `gh release create vX.Y.Z --target master --title vX.Y.Z --notes "..."`
+  `gh release create vX.Y.Z --target <sha of the bump commit> --title vX.Y.Z --notes "..."`
   (or uses the web UI), which creates the tag and starts `release.yml`.
-- A failed run is re-run with "re-run failed jobs" on that run: `publish`
-  skips the upload and succeeds if an earlier attempt already made it, and
-  `release-notes` just writes the same notes again.
+  Target the bump commit's SHA, not `master`: with `--target master`,
+  anything merged after the bump would ride along into the release without
+  a CHANGELOG entry.
+- A transient failure (crates.io outage, runner hiccup) is re-run with
+  "re-run failed jobs" on that run: `publish` skips the upload and succeeds
+  if an earlier attempt already made it, and `release-notes` just writes the
+  same notes again. Runs are grouped per release tag and never cancelled.
+- A genuine `verify`/`msrv` failure (the tagged commit is broken) cannot be
+  fixed by a re-run, which repeats the same commit. Merge the fix, then as
+  the owner delete the release and its tag
+  (`gh release delete vX.Y.Z --cleanup-tag`) and create the release again at
+  the new commit. Nothing was uploaded: `publish` needs both jobs.
 - `release.yml` must keep its filename, and `publish` must keep
   `environment: release`: crates.io trusted publishing is registered for
-  this repository + `release.yml` + environment `release`, and that
-  environment's policy (only `v*` tags) together with the tag ruleset (only
-  admins create `v*` tags) is what limits minting a publish token to an
-  owner-created release.
+  this repository + `release.yml` + environment `release`. That
+  environment's policy (only `v*` tags), the tag ruleset (only admins create
+  `v*` tags) and the sender check together limit minting a publish token to
+  an owner-created, owner-published release.
 - There is no deploy-hold switch: nothing publishes until the owner
   creates a release, so batching changes is only a matter of when to do
   that.

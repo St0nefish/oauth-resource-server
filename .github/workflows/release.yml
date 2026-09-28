@@ -7,23 +7,41 @@ name: Release
 #   1. Merge a PR that bumps `version` in Cargo.toml (and Cargo.lock) and
 #      moves CHANGELOG.md's `[Unreleased]` entries under a matching
 #      `## [X.Y.Z] - <date>` heading, with its link reference at the bottom.
-#   2. The maintainer creates the release for that commit:
-#        gh release create vX.Y.Z --target master --title vX.Y.Z --notes "..."
-#      or the same through the web UI. Publishing the release creates the
-#      `vX.Y.Z` tag and starts this workflow. The notes given there are
-#      replaced by the CHANGELOG section once the crate is published.
+#   2. The maintainer creates the release for that commit, naming the bump
+#      commit's SHA rather than `master`:
+#        gh release create vX.Y.Z --target <sha of the bump commit> \
+#          --title vX.Y.Z --notes "..."
+#      or the same through the web UI. With `--target master`, anything
+#      merged after the bump would ride along into the release without a
+#      CHANGELOG entry. Publishing the release creates the `vX.Y.Z` tag and
+#      starts this workflow. The notes given there are replaced by the
+#      CHANGELOG section once the crate is published.
 #
-# Only a release a human publishes triggers this. GitHub starts no workflow
-# run for a release created with GITHUB_TOKEN, and that is intended. A tag
-# ruleset lets only repository admins create, move or delete `v*` tags, so
-# neither GITHUB_TOKEN nor the auto-merge App can make a release tag, and
-# nothing in this workflow ever creates or edits a tag. A prerelease is
+# Only the owner can cause a publish, and they have to do two things: create
+# the `v*` tag — a tag ruleset lets only repository admins create, move or
+# delete `v*` tags, so neither GITHUB_TOKEN nor the auto-merge App can — and
+# publish the release, which `check` enforces by failing unless the event's
+# sender is the owner. (A release published with a GitHub App installation
+# token does start workflow runs, and the auto-merge App has
+# `contents: write`, so without the sender check it could publish a release
+# on an existing, unpublished `v*` tag.) A release created with GITHUB_TOKEN
+# starts no workflow run at all. Nothing in this workflow ever creates or
+# edits a tag.
+#
+# If `verify` or `msrv` fails because the tagged commit is genuinely broken,
+# "re-run failed jobs" cannot help — it re-runs the same commit. Merge the
+# fix, then, as the owner, delete the release and its tag
+# (`gh release delete vX.Y.Z --cleanup-tag`) and create the release again at
+# the new commit. Nothing was uploaded, since `publish` needs both jobs.
+#
+# A prerelease is
 # handled like any other release: a version such as `0.2.0-rc.1` is
 # published to crates.io, where Cargo never picks a pre-release version
 # unless a consumer asks for it explicitly.
 #
 #   check    GitHub-hosted, read-only. Checks out the tagged commit and
-#            fails closed unless: the release's tag is `v<version>` for the
+#            fails closed unless: the release was published by the owner
+#            (`St0nefish`); the release's tag is `v<version>` for the
 #            Cargo.toml version at that commit; that commit is an ancestor of
 #            `master`; crates.io answers 404 for that version (200 fails the
 #            first attempt, since the release is for a version that is
@@ -37,7 +55,7 @@ name: Release
 #            checkout, toolchain, crates.io authentication and
 #            `cargo publish`.
 #   release-notes
-#            `contents: write` with GITHUB_TOKEN: replaces the release's
+#            `contents: write` with GITHUB_TOKEN. Replaces the release's
 #            notes with the version's CHANGELOG section (`gh release edit`).
 #            It never creates or moves a tag.
 #
@@ -54,8 +72,9 @@ name: Release
 # workflow file (`release.yml`) and the GitHub environment `release`, whose
 # deployment policy admits only `v*` tags. So this file must keep its name
 # and `publish` must keep `environment: release`: that environment policy,
-# together with the tag ruleset, is what stops anything but an
-# admin-created release tag from minting a publish token. No crates.io token
+# together with the tag ruleset and the sender check, is what stops anything
+# but an owner-created, owner-published release from minting a publish
+# token. No crates.io token
 # is stored in this repository: `rust-lang/crates-io-auth-action` exchanges
 # the job's OIDC token for a publish token valid for that one run.
 #
@@ -73,12 +92,13 @@ on:
   release:
     types: [published]
 
-# One release at a time, and never cancel one that has started: an upload to
-# crates.io cannot be taken back, so a run must always reach its release
-# notes. The group is constant, not keyed by tag, because what is being
-# serialized is publishing to the one crates.io crate.
+# Never cancel a release run: an upload to crates.io cannot be taken back, so
+# a run must always reach its release notes. The group is keyed by the
+# release's tag, so re-runs of one release serialize with each other, while a
+# newer release gets a group of its own and can never replace an older
+# release's pending run (which a single shared group would allow).
 concurrency:
-  group: release
+  group: release-${{ github.event.release.tag_name }}
   cancel-in-progress: false
 
 permissions:
@@ -92,6 +112,19 @@ jobs:
       version: ${{ steps.version.outputs.version }}
       tag: ${{ steps.version.outputs.tag }}
     steps:
+      - name: Require the release to be published by the owner
+        # The tag ruleset means only the owner can create a `v*` tag, but
+        # publishing a release on an existing tag is a separate act: a GitHub
+        # App installation token with `contents: write` can do it, and unlike
+        # GITHUB_TOKEN it does start workflow runs. Only the owner may.
+        env:
+          SENDER: ${{ github.event.sender.login }}
+        run: |
+          if [[ "$SENDER" != "St0nefish" ]]; then
+            echo "::error::this release was published by '${SENDER}'; only the repository owner may publish a release."
+            exit 1
+          fi
+
       - name: Checkout the tagged commit
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
@@ -147,6 +180,13 @@ jobs:
         run: |
           # Fetch master explicitly and fail closed: a failed fetch or a
           # commit master does not contain both stop the release.
+          #
+          # This catches mistakes; it is not a security boundary. The run
+          # uses the workflow file as it exists at the tagged commit, so a
+          # tag on an unmerged commit could carry a copy of this file
+          # without the check. The boundary is the owner-only `v*` tag
+          # ruleset, the `release` environment's `v*`-only deployment
+          # policy, and the owner sender check at the top of this job.
           git fetch --no-tags origin "+refs/heads/master:refs/remotes/origin/master"
           status=0
           git merge-base --is-ancestor "$GITHUB_SHA" origin/master || status=$?
