@@ -1,0 +1,10 @@
+# cargo-audit configuration (run by the `cargo audit` step in
+# .github/workflows/ci.yml's `checks` job).
+#
+# No advisories are ignored yet — this crate's dependency tree is new and
+# small. Add an entry here only for an advisory that is a genuine false
+# positive for this crate (the vulnerable code path is unreachable, or it's
+# a transitive dep we don't control and haven't yet had time to move off) —
+# and say why, and what would let the entry be removed.
+[advisories]
+ignore = []

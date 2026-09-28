@@ -1,0 +1,8 @@
+/target
+
+# Cargo.lock is tracked deliberately, even though this is a library crate:
+# a downstream consumer resolves against its OWN lock file, not this one, so
+# tracking it isn't about pinning what consumers get. It's tracked so CI
+# builds reproducibly (the msrv job runs `cargo build --locked`), and so
+# `cargo package`/`cargo publish` ship the exact dependency set that was
+# actually tested rather than whatever `cargo update` would pick that day.

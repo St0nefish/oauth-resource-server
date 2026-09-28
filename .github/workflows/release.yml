@@ -1,0 +1,115 @@
+name: Release
+
+# INERT until trusted publishing is configured on crates.io. The first
+# release (0.1.0) must be published manually with `cargo publish` and a
+# personal API token, because crates.io requires a crate to already exist
+# on the registry before a trusted publisher can be attached to it. Until
+# that manual publish happens, `rust-lang/crates-io-auth-action` below has
+# nothing to authenticate against and this workflow's `publish` job fails
+# at the "Authenticate with crates.io" step (after `verify` has passed).
+#
+# To turn this on after the manual 0.1.0 publish:
+#   1. On crates.io, open this crate's settings -> "Trusted Publishing" and
+#      add a GitHub publisher naming this repository (owner/repo), the
+#      workflow filename `release.yml`, and (optionally) a GitHub
+#      Environment name if you add `environment:` to the `publish` job
+#      below to match.
+#   2. From then on, pushing a tag `vX.Y.Z` that matches the version in
+#      Cargo.toml publishes that version automatically. No token secret is
+#      ever stored in this repo — `id-token: write` lets the job mint a
+#      short-lived OIDC token that crates.io exchanges for a publish token
+#      good for this one job run (see
+#      https://github.com/rust-lang/crates-io-auth-action).
+#
+# The v0.1.0 tag itself is expected to produce a RED run here, either way:
+# push it before configuring trusted publishing and this workflow fails at
+# "Authenticate with crates.io" (no publisher configured yet); push it after
+# and `cargo publish` fails with "already uploaded", since 0.1.0 was already
+# published manually. Tag v0.1.0 only to mark the release for `git describe`/
+# GitHub's release list, not to trigger this workflow, and don't chase that
+# first failure. Every tag from v0.1.1 on is the real, working path. Tag only
+# a commit that's already on `master`.
+
+on:
+  push:
+    tags:
+      - 'v*'
+
+# Never cancel a running release — the crates.io publish and the tag it
+# publishes from must be treated as one atomic step.
+concurrency:
+  group: release
+  cancel-in-progress: false
+
+# Two jobs, so the one that can mint a publish token runs as little code as
+# possible. Any step in a job with `id-token: write` can request the OIDC
+# token that crates-io-auth-action exchanges for a crates.io publish token,
+# and fmt/clippy/test execute every build script, proc macro and
+# dev-dependency. `verify` runs all of that with a read-only token and no
+# OIDC permission; `publish` runs only after it succeeds and does nothing but
+# authenticate and `cargo publish` (whose own verification build still runs
+# the normal dependencies' build scripts, but no dev-dependency).
+jobs:
+  verify:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v7
+
+      - name: Install pinned Rust toolchain
+        # See ci.yml's "Install pinned Rust toolchain" step comment: `rustup
+        # show` does not install the toolchain named in rust-toolchain.toml,
+        # `rustup toolchain install` (no argument) does.
+        run: rustup toolchain install
+
+      - name: Verify tag matches Cargo.toml version
+        run: |
+          set -euo pipefail
+          tag_version="${GITHUB_REF_NAME#v}"
+          cargo_version=$(cargo metadata --no-deps --format-version 1 | jq -r '.packages[0].version')
+          if [[ -z "$cargo_version" || "$cargo_version" == "null" ]]; then
+            echo "::error::could not resolve version from cargo metadata"
+            exit 1
+          fi
+          if [[ "$tag_version" != "$cargo_version" ]]; then
+            echo "::error::tag ${GITHUB_REF_NAME} does not match Cargo.toml version ${cargo_version}"
+            exit 1
+          fi
+          echo "tag ${GITHUB_REF_NAME} matches Cargo.toml version ${cargo_version}"
+
+      - name: Format check
+        run: cargo fmt --all -- --check
+
+      - name: Clippy (all features)
+        run: cargo clippy --all-targets --all-features -- -D warnings
+
+      - name: Tests (all features)
+        run: cargo test --all-features
+
+  publish:
+    needs: verify
+    runs-on: ubuntu-latest
+    permissions:
+      id-token: write
+      contents: read
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v7
+
+      - name: Install pinned Rust toolchain
+        run: rustup toolchain install
+
+      # Mints a short-lived crates.io token via GitHub OIDC. Requires a
+      # trusted publisher configured on crates.io for this repo + workflow
+      # (see the header comment) — until then this step fails, which is the
+      # intended "inert" behavior.
+      - name: Authenticate with crates.io
+        id: auth
+        uses: rust-lang/crates-io-auth-action@v1
+
+      - name: Publish to crates.io
+        env:
+          CARGO_REGISTRY_TOKEN: ${{ steps.auth.outputs.token }}
+        run: cargo publish

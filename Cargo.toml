@@ -1,0 +1,116 @@
+[package]
+name = "oauth-resource-server"
+version = "0.1.0"
+edition = "2024"
+# Keep in lockstep with `channel` in rust-toolchain.toml -- this makes cargo
+# itself refuse a too-old local toolchain with a clear "package requires rustc X
+# but Y is installed" message, instead of a confusing compile error deep in a
+# build log.
+rust-version = "1.89"
+license = "MIT"
+description = "OAuth 2.0 bearer-token resource server for Rust HTTP services: JWT access-token validation against a JWKS, RFC 9728 protected-resource metadata, RFC 6750 challenges, optional static API key, axum integration."
+repository = "https://github.com/St0nefish/oauth-resource-server"
+documentation = "https://docs.rs/oauth-resource-server"
+readme = "README.md"
+keywords = ["oauth", "jwt", "jwks", "axum", "authentication"]
+# Verified against crates.io's published category_slugs list.
+categories = ["authentication", "web-programming::http-server"]
+# What actually ships in the package tarball. Excludes CI config, issue/PR
+# templates, and agent-facing docs (CLAUDE.md) that a consumer of the crate
+# has no use for.
+include = ["src/**/*", "examples/**/*", "docs/**/*", "README.md", "LICENSE", "CHANGELOG.md"]
+
+[package.metadata.docs.rs]
+all-features = true
+rustdoc-args = ["--cfg", "docsrs"]
+
+[features]
+default = ["rustls-tls"]
+# TLS for the JWKS / discovery fetches. At least one of these MUST be enabled or
+# every HTTPS fetch would fail; `src/lib.rs` turns "none" into a compile error.
+# `rustls-tls` trusts only the Mozilla root set compiled into the binary
+# (webpki-roots): it ignores the OS trust store and SSL_CERT_FILE, so an
+# authorization server behind a private CA needs one of the other two.
+rustls-tls = ["reqwest/rustls-tls"]
+# rustls, trusting the operating system's certificate store instead.
+rustls-tls-native-roots = ["reqwest/rustls-tls-native-roots"]
+# The platform TLS library (OpenSSL on Linux), trusting the OS store.
+native-tls = ["reqwest/native-tls"]
+# `Deserialize`/`Serialize` on the config types (`OAuthConfig`).
+serde = ["dep:serde"]
+# `env` module: load the config from environment variables (with `VAR_FILE`).
+env = []
+# `axum` module: authentication middleware and the RFC 9728 metadata routes.
+axum = ["dep:axum", "dep:http", "dep:tower-layer", "dep:tower-service"]
+# `testing` module: throwaway keys, token minting and a fake JWKS server for
+# CONSUMERS' TESTS. Never enable this in a production build.
+testing = ["tokio/net", "tokio/io-util", "dep:serde"]
+
+[dependencies]
+# JWT verification: multi-algorithm signature checking (RSA PKCS#1 v1.5, RSA-PSS,
+# ECDSA P-256/P-384 and EdDSA, each key narrowed to the algorithms its own type
+# can produce) plus issuer/audience/expiry validation against a fetched JWKS.
+#
+# Pinned to 9.x, NOT the current 11.x, on purpose. 11.x dropped `ring` and requires
+# picking one of two crypto backends: `rust_crypto`, which pulls in the `rsa` crate
+# and with it RUSTSEC-2023-0071 (Marvin timing sidechannel, no fixed version) —
+# `cargo audit` runs in CI and there is no version of that we could upgrade to — or
+# `aws_lc_rs`, which needs cmake and a C toolchain in every consumer's builder. 9.x
+# uses `ring`, which a rustls-based HTTP stack already compiles, so this adds no new
+# crypto implementation there. Revisit when jsonwebtoken offers a backend that is
+# neither unpatched nor a new build-tooling requirement.
+jsonwebtoken = "9"
+# JWKS and discovery fetches. The TLS backend is chosen by this crate's features;
+# bodies are read under a size cap and parsed with serde_json, so no reqwest
+# feature beyond TLS is needed.
+reqwest = { version = "0.12", default-features = false }
+# Decodes the JWS protected header's raw JSON, to see members the JWT library's
+# `Header` type drops (`crit`). The major version jsonwebtoken 9 already
+# compiles, so it adds no crate to the build.
+base64 = "0.22"
+serde_json = "1"
+tokio = { version = "1", features = ["sync", "time", "rt"] }
+tracing = "0.1"
+subtle = "2"
+thiserror = "2"
+
+# Enabled by the `serde` feature (config derives) and by `testing` (its minting
+# helpers take any `Serialize` claims).
+serde = { version = "1", features = ["derive"], optional = true }
+
+axum = { version = "0.8", optional = true, default-features = false, features = ["json"] }
+http = { version = "1", optional = true }
+# `AuthLayer` implements `tower::Layer`; the same small trait crates axum builds on.
+tower-layer = { version = "0.3", optional = true }
+tower-service = { version = "0.3", optional = true }
+
+[dev-dependencies]
+tokio = { version = "1", features = ["macros", "rt", "rt-multi-thread", "net", "io-util", "time", "sync"] }
+serde_yaml_ng = "0.10"
+# The `testing` module (its minting helpers take `impl Serialize`) is compiled
+# for this crate's own unit tests whether or not a feature enables `serde`.
+serde = "1"
+tower = { version = "0.5", features = ["util"] }
+# `axum::serve` for the README quickstart doctest and the examples; the library
+# itself never serves, so its own `axum` dependency leaves these off.
+axum = { version = "0.8", default-features = false, features = ["tokio", "http1"] }
+# Prints the crate's log lines when an example runs.
+tracing-subscriber = "0.3"
+
+# Each example names the features it needs, so `cargo build --examples` with
+# fewer features skips it rather than failing to compile it.
+[[example]]
+name = "axum_basic"
+required-features = ["axum", "serde", "testing"]
+
+[[example]]
+name = "multiple_sources"
+required-features = ["axum", "testing"]
+
+[[example]]
+name = "standalone_validator"
+required-features = ["testing"]
+
+[[example]]
+name = "env_config"
+required-features = ["env", "axum"]

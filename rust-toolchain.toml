@@ -1,0 +1,22 @@
+# Single source of truth for oauth-resource-server's pinned Rust toolchain.
+#
+# rustup honors this file automatically for every `cargo`/`rustc` invocation
+# anywhere under this directory tree, so local dev needs nothing extra once
+# rustup is installed, and `.github/workflows/ci.yml` and `release.yml`'s
+# `rustup toolchain install` step (no argument) reads it the same way,
+# rather than naming a toolchain version separately, so the toolchain CI
+# compiles with cannot silently drift from the one declared here. (`rustup
+# show` does NOT install an uninstalled toolchain named here — tested
+# empirically — which is why the CI steps use `rustup toolchain install`
+# instead.) The `msrv` job in that workflow installs `rust-version` from
+# Cargo.toml explicitly instead, precisely so it stops tracking this file if
+# the two are ever allowed to diverge.
+#
+# MSRV: see `rust-version` in Cargo.toml, which makes a plain `cargo build`
+# under a too-old toolchain fail fast with a clear "package requires rustc X but
+# Y is installed" instead of an obscure error deep in a build log. The crate is
+# edition 2024 and uses let-chains; 1.89 also matches the toolchain its first
+# consumer (mcp-md-wiki) pins. Keep `channel` and `rust-version` in lockstep.
+[toolchain]
+channel = "1.89"
+components = ["clippy", "rustfmt"]

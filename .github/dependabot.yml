@@ -1,0 +1,19 @@
+version: 2
+updates:
+  - package-ecosystem: "cargo"
+    directory: "/"
+    schedule:
+      interval: "weekly"
+    open-pull-requests-limit: 10
+    ignore:
+      # jsonwebtoken stays on 9.x deliberately -- see the rationale on its
+      # dependency comment in Cargo.toml (RUSTSEC-2023-0071 on the 11.x
+      # rust_crypto backend, cmake/C toolchain requirement on aws_lc_rs).
+      # Minor/patch updates within 9.x are still welcome.
+      - dependency-name: "jsonwebtoken"
+        update-types: ["version-update:semver-major"]
+
+  - package-ecosystem: "github-actions"
+    directory: "/"
+    schedule:
+      interval: "weekly"

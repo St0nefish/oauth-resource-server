@@ -1,0 +1,10 @@
+blank_issues_enabled: false
+contact_links:
+  - name: Security vulnerability
+    url: https://github.com/St0nefish/oauth-resource-server/security/advisories/new
+    about: Please report suspected vulnerabilities privately instead of opening a public issue — see SECURITY.md.
+  # No "Question / usage help" contact link to GitHub Discussions here: this
+  # repo does not enable GitHub Discussions, and a link to a disabled
+  # Discussions tab 404s. Use the bug report template for usage questions
+  # that turn out to be a bug, or add a discussion link here if Discussions
+  # is ever enabled with `gh repo edit --enable-discussions`.

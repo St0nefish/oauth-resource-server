@@ -1,0 +1,179 @@
+name: CI
+
+# Pattern A gating: `ci-pass` is the one status check branch protection
+# requires. It runs no build steps of its own — it just fails unless every
+# job named in its `needs:` succeeded, so adding a job here only strengthens
+# the gate if it is added to both `needs:` and the explicit result check in
+# `ci-pass` below (a bare `needs:` with no `if: always()` would make GitHub
+# *skip*, not fail, `ci-pass` when an upstream job fails, and a skipped
+# required check is treated as passing — see `ci-pass`'s own comment).
+#
+# `checks` builds once with the toolchain pinned in `rust-toolchain.toml`
+# (via `rustup toolchain install`, which reads that file automatically
+# because it sits in the repo root) and runs everything that toolchain needs
+# to cover:
+# formatting, clippy across the feature combinations that matter (all
+# features together, the default feature set, and native-tls and
+# rustls-tls-native-roots each alone — those exist because `--all-features`
+# hides a `cfg` that only appears when `rustls-tls` is off, since the TLS
+# backends are additive, not mutually exclusive), tests, a `-D warnings` doc build (every public item
+# needs a doc comment — see `#![warn(missing_docs)]` in `src/lib.rs`),
+# `cargo audit`, and the packaging checks (`cargo package --list` and
+# `cargo publish --dry-run`) that catch a metadata mistake before a tag ever
+# reaches `release.yml`.
+#
+# `msrv` is a separate job on a separate, explicitly-installed toolchain
+# (read from `Cargo.toml`'s `rust-version`, not from `rust-toolchain.toml` —
+# see that file's header comment for why) so a change that only compiles on
+# a newer compiler than the crate's stated MSRV fails CI instead of shipping
+# quietly.
+
+on:
+  pull_request:
+    branches: [master]
+  push:
+    branches: [master]
+
+# Least-privilege default for every job; no job here needs to write anything.
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  checks:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v7
+
+      - name: Install pinned Rust toolchain
+        # `rustup toolchain install` with no argument installs (and adds the
+        # components for) the toolchain named in `rust-toolchain.toml`,
+        # reading that file automatically because it sits in the repo root.
+        # `rustup show` does NOT do this — tested empirically: with a
+        # rust-toolchain.toml naming an uninstalled toolchain, `rustup show`
+        # prints "no active toolchain" and installs nothing; only a later
+        # `cargo`/`rustc` invocation's proxy auto-install would pull it in,
+        # and relying on that silently depends on the runner having
+        # toolchain auto-install enabled.
+        run: rustup toolchain install
+
+      - name: Cache cargo registry and build artifacts
+        uses: Swatinem/rust-cache@v2
+
+      - name: Format check
+        run: cargo fmt --all -- --check
+
+      - name: Clippy (all features)
+        run: cargo clippy --all-targets --all-features -- -D warnings
+
+      - name: Clippy (default features)
+        run: cargo clippy --all-targets -- -D warnings
+
+      - name: Clippy (native-tls only)
+        # Catches a cfg that only exists with rustls-tls off; the two TLS
+        # backends are additive (a consumer can enable both), so
+        # --all-features alone would never exercise this combination.
+        run: cargo clippy --all-targets --no-default-features --features native-tls -- -D warnings
+
+      - name: Clippy (rustls-tls-native-roots only)
+        # The third TLS feature, alone, for the same reason.
+        run: cargo clippy --all-targets --no-default-features --features rustls-tls-native-roots -- -D warnings
+
+      - name: Tests (all features)
+        run: cargo test --all-features
+
+      - name: Tests (default features)
+        run: cargo test
+
+      - name: Build examples (all features)
+        # examples/ is documentation that must keep compiling; this is what
+        # "compiles in CI" means for it.
+        run: cargo build --examples --all-features
+
+      - name: Build docs (-D warnings)
+        # #![warn(missing_docs)] plus this: a missing doc comment on a new
+        # public item, or a broken rustdoc link, fails the same way a
+        # compile warning would.
+        env:
+          RUSTDOCFLAGS: -D warnings
+        run: cargo doc --no-deps --all-features
+
+      - name: Install cargo-audit
+        # Pinned action, not a `curl ... | bash` of a mutable branch — this is
+        # a security crate's CI, so the install step gets the same
+        # supply-chain treatment as everything else pinned by version here.
+        uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-audit
+
+      - name: Audit dependencies
+        # Reads .cargo/audit.toml automatically.
+        run: cargo audit
+
+      - name: cargo package --list
+        # Confirms the `include` list in Cargo.toml actually resolves to the
+        # files the package is meant to ship, without building a tarball.
+        run: cargo package --list
+
+      - name: cargo publish --dry-run
+        # Packages and verifies the crate (metadata, `include` list, doc
+        # build inside the package) without uploading anything. This never
+        # touches crates.io; only `release.yml`, on a pushed tag, does that.
+        run: cargo publish --dry-run
+
+  msrv:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v7
+
+      - name: Read MSRV from Cargo.toml
+        # Deliberately not `cargo metadata`: that needs a toolchain already
+        # installed to run, and this job hasn't installed one yet (unlike
+        # `checks`, which reads rust-toolchain.toml via `rustup toolchain
+        # install` before its first cargo call — see that job's comment on
+        # why `rustup show` alone doesn't do this). Reading the value out of
+        # the TOML directly with grep avoids relying on the runner's rustup
+        # proxy auto-installing some toolchain first.
+        id: msrv
+        run: |
+          version=$(grep -m1 '^rust-version' Cargo.toml | sed -E 's/^rust-version *= *"([^"]+)".*/\1/')
+          if [[ -z "$version" ]]; then
+            echo "::error::could not resolve rust-version from Cargo.toml"
+            exit 1
+          fi
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+
+      - name: Install MSRV toolchain
+        run: rustup toolchain install "${{ steps.msrv.outputs.version }}" --profile minimal
+
+      - name: Cache cargo registry and build artifacts
+        uses: Swatinem/rust-cache@v2
+        with:
+          key: msrv-${{ steps.msrv.outputs.version }}
+
+      - name: Build on MSRV (all features)
+        run: cargo "+${{ steps.msrv.outputs.version }}" build --all-features --locked
+
+  ci-pass:
+    needs: [checks, msrv]
+    if: always()
+    runs-on: ubuntu-latest
+    steps:
+      # `needs:` alone would make GitHub SKIP this job (not fail it) when
+      # `checks` or `msrv` fails, and branch protection / rulesets treat a
+      # skipped required check as passing — the ruleset's only required
+      # check is this job, so that would silently defeat it. `if: always()`
+      # above forces this job to run regardless of upstream outcome, and the
+      # explicit result check below is what actually fails it.
+      - name: Require every upstream job to have succeeded
+        run: |
+          if [[ "${{ needs.checks.result }}" != "success" || "${{ needs.msrv.result }}" != "success" ]]; then
+            echo "::error::one or more required jobs did not succeed (checks=${{ needs.checks.result }}, msrv=${{ needs.msrv.result }})"
+            exit 1
+          fi
+          echo "all required checks passed"
