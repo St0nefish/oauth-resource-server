@@ -41,9 +41,10 @@ jobs:
           private-key: ${{ secrets.APP_PRIVATE_KEY }}
           permission-contents: write
           permission-pull-requests: write
-          # GitHub refuses an App merge that creates or updates a file under
-          # .github/workflows/ without this.
-          permission-workflows: write
+          # No `workflows` permission: the installation does not grant it (asking
+          # for it fails token creation with a 422), and it is not needed —
+          # GitHub performs the auto-merge, and PRs that change workflow files
+          # merge fine this way.
 
       - name: Enable auto-merge
         run: gh pr merge "$PR_NUMBER" --auto --squash --repo "$REPO"
