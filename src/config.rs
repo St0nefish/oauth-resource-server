@@ -193,8 +193,13 @@ impl fmt::Display for ConfigError {
 /// username claim) is a field below rather than a code path.
 ///
 /// Every field is optional in serde input (feature `serde`); unknown keys are
-/// refused. Nothing here hot-reloads: a changed value takes effect only when a
-/// new validator is built from it, which in practice means a restart.
+/// refused. **Nest this in your own config; do not `#[serde(flatten)]` it** —
+/// flattening silently defeats the unknown-key check (a general serde
+/// limitation, not specific to this crate); see [Embedding `OAuthConfig` in
+/// your own
+/// config](https://github.com/St0nefish/oauth-resource-server#embedding-oauthconfig-in-your-own-config)
+/// in the README. Nothing here hot-reloads: a changed value takes effect only
+/// when a new validator is built from it, which in practice means a restart.
 ///
 /// Deliberately not `#[non_exhaustive]`, so applications can write
 /// `OAuthConfig { enabled: true, ..OAuthConfig::default() }` — a

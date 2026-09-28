@@ -469,6 +469,52 @@ an existing API's responses unchanged.
 [`examples/multiple_sources.rs`](https://github.com/St0nefish/oauth-resource-server/blob/master/examples/multiple_sources.rs)
 combines this with several sources and runs without network.
 
+### CORS for browser-based clients
+
+A browser-based client — a web app calling your API directly with `fetch`, or
+an MCP client running in a browser — needs two things this crate does not add
+for you:
+
+1. **CORS on every route the browser calls**, including the metadata route,
+   or the browser's preflight `OPTIONS` request fails before your handler
+   ever runs.
+2. **`Access-Control-Expose-Headers: WWW-Authenticate`**, or the browser
+   receives the header on the wire but hides it from JavaScript:
+   `Response.headers.get('WWW-Authenticate')` returns `null`, and the client
+   cannot read `resource_metadata` off a 401 to start its authorization flow.
+
+Add [`tower-http`](https://docs.rs/tower-http)'s `CorsLayer` as the outermost
+layer, so it also covers the metadata route and preflight requests to routes
+behind `AuthLayer`:
+
+```rust
+use axum::Router;
+use axum::http::header::{AUTHORIZATION, CONTENT_TYPE, InvalidHeaderValue, WWW_AUTHENTICATE};
+use axum::http::{HeaderValue, Method};
+use tower_http::cors::CorsLayer;
+
+fn cors_for(client_origin: &str) -> Result<CorsLayer, InvalidHeaderValue> {
+    Ok(CorsLayer::new()
+        .allow_origin(HeaderValue::from_str(client_origin)?)
+        .allow_methods([Method::GET, Method::POST, Method::OPTIONS])
+        .allow_headers([AUTHORIZATION, CONTENT_TYPE])
+        // Without this, `WWW-Authenticate` is invisible to the browser's
+        // JavaScript even though it is on the wire.
+        .expose_headers([WWW_AUTHENTICATE]))
+}
+
+fn with_cors(app: Router, client_origin: &str) -> Result<Router, InvalidHeaderValue> {
+    Ok(app.layer(cors_for(client_origin)?))
+}
+```
+
+`allow_credentials(true)` and a wildcard `allow_origin` are mutually
+exclusive under the Fetch spec. A bearer token your JavaScript sets in the
+`Authorization` header itself is not a CORS "credential" — that setting is
+for cookies and browser-managed HTTP auth — so a deployment sending the
+token that way needs neither `allow_credentials` nor a wildcard origin
+together.
+
 ### Without axum
 
 The validator and the credential logic have no web-framework dependency. They
@@ -533,7 +579,7 @@ error messages spell them (`KeyNaming::Dotted("oauth")` gives `oauth.issuer`,
 | `resource` | `String` | required | This API's public URL, e.g. `https://api.example.com/v1`. Published as `resource` in the metadata and used to build the metadata URL. Not compared with `aud` unless you also list it in `audience` or `audiences`. Same URL rules as `issuer` (`https` per RFC 9728 §1.2: clients send their bearer tokens to it). |
 | `required_scope` | `Option<String>` | `None` | A scope every token must carry, or it gets 403. One RFC 6749 §3.3 scope-token (printable ASCII, no space, `"` or `\`), matched exactly and case-sensitively. An explicit empty value is an error, not "no scope". |
 | `required_scopes` | `Vec<String>` | `[]` | More scopes every token must carry: all of them, together with `required_scope`. With neither set there is no scope check at all, which `resolve` accepts only with `require_at_jwt` or `allow_unscoped_tokens`; see [ID tokens](#id-tokens-and-the-lenient-typ-default). |
-| `scopes_supported` | `Option<Vec<String>>` | `None`, which resolves to the required scopes | The scopes advertised in the metadata document and in the 401 challenge. Declarative only; each entry a scope-token. **List every required scope here** if you set it: clients request what is advertised, and a required scope they are not told about means 403 on every call. An explicit `[]` advertises nothing: the metadata omits `scopes_supported` (RFC 9728 §3.2) and the 401 names the required scopes instead. |
+| `scopes_supported` | `Option<Vec<String>>` | `None`, which resolves to the required scopes | The scopes advertised in the metadata document and in the 401 challenge. Declarative only; each entry a scope-token. **List every required scope here** if you set it: clients request what is advertised, and a required scope they are not told about means 403 on every call. An explicit `[]` advertises nothing: the metadata omits `scopes_supported` (RFC 9728 §3.2) and the 401 names the required scopes instead. **This default is identical on the `serde` and `env` paths** — `resolve` applies it either way, so a serde user who sets only `required_scope` gets the same advertised scopes an env user does. The one path-specific difference is in [Environment variables](#environment-variables): the `env` loader cannot express an explicit empty list. |
 | `scope_claims` | `Vec<String>` | `["scope", "scp"]` | The claims scopes are read from. Each is read as a space-delimited string or an array of strings, and the results are combined. Must not be empty. |
 | `principal_claims` | `Vec<String>` | `["preferred_username", "sub"]` | Claims tried in order to name the caller in logs (`AuthorizedToken::principal`). `email` is left out so addresses do not reach logs unless you add it. |
 | `algorithms` | `Vec<String>` | `RS256 RS384 RS512 PS256 PS384 PS512 ES256 ES384 EdDSA` | The signature algorithms a token may use, as case-sensitive JWS names. `HS256`, `HS384`, `HS512` and `none` are always refused. |
@@ -560,6 +606,44 @@ carries `key_naming`, the owned copy of the `KeyNaming` it was resolved with,
 which the validator's log lines use; and its `required_scopes` holds the union
 of `required_scope` and `required_scopes`.)
 
+### Embedding `OAuthConfig` in your own config
+
+`OAuthConfig` derives `#[serde(deny_unknown_fields)]` (feature `serde`) so a
+typo'd or renamed setting fails at startup instead of being silently
+ignored. **Nest it under its own field in your application's config struct;
+do not `#[serde(flatten)]` it.**
+
+`#[serde(flatten)]` buffers the input through a generic value first, and
+that buffering is what makes `deny_unknown_fields` stop firing for the
+struct it is applied to: a field neither struct recognizes is silently
+dropped instead of producing a `ConfigError`, defeating the whole point of
+the attribute. This is a general serde limitation, not specific to this
+crate — see [serde's own `flatten` docs](https://serde.rs/attr-flatten.html).
+
+```rust
+use oauth_resource_server::OAuthConfig;
+use serde::Deserialize;
+
+#[derive(Deserialize, Default)]
+struct FlattenedConfig {
+    #[serde(flatten)]
+    oauth: OAuthConfig,
+}
+
+#[derive(Deserialize, Default)]
+struct NestedConfig {
+    #[serde(default)]
+    oauth: OAuthConfig,
+}
+
+// Flattened: a typo'd field (`isuer` for `issuer`) is silently accepted.
+// `deny_unknown_fields` does not fire through `#[serde(flatten)]`.
+assert!(serde_yaml_ng::from_str::<FlattenedConfig>("isuer: x\n").is_ok());
+
+// Nested instead of flattened: the same typo is refused, as intended.
+assert!(serde_yaml_ng::from_str::<NestedConfig>("oauth:\n  isuer: x\n").is_err());
+```
+
 ### Environment variables
 
 The `env` feature's `oauth_config_from_env(prefix)` reads each field from
@@ -572,8 +656,12 @@ ways:
   `AUDIENCE`, `AUDIENCES` or `RESOURCE` is set, and off (`Ok(None)`)
   otherwise.
 - **`SCOPES_SUPPORTED` cannot be explicitly empty.** An empty value reads as
-  unset, so it always resolves to the required scopes, as an omitted
-  `scopes_supported` does on the serde path.
+  unset, so it always resolves to the required scopes, exactly as an omitted
+  `scopes_supported` does on the serde path — `OAuthConfig::resolve` applies
+  that default the same way regardless of which path produced the config.
+  This is the only behavioral difference between the two paths for this
+  setting: neither defaults it to the required scopes "instead of" the
+  other leaving it empty.
 - **Lists** (`AUDIENCES`, `REQUIRED_SCOPES`, `SCOPES_SUPPORTED`,
   `SCOPE_CLAIMS`, `PRINCIPAL_CLAIMS`, `ALGORITHMS`) are split on whitespace.
 - **Booleans** accept exactly `true` or `false`. Anything else is an error, so
@@ -897,6 +985,39 @@ fits MCP's authorization model:
   call every tool. To require a write scope for some tools, check
   `AuthorizedToken::has_scope` from the request extensions when the tool is
   dispatched.
+
+### Reading the token inside a tool handler
+
+`AuthLayer` inserts `AuthorizedToken` (and `Credential`) into the HTTP
+request's `http::Extensions` — the same place [Reading the caller in a
+handler](#reading-the-caller-in-a-handler) reads `Credential` from in a plain
+axum handler. A tool handler runs one layer further in, inside the MCP SDK's
+JSON-RPC dispatch, so it has no `axum::Extension` extractor of its own; it
+needs the original `http::request::Parts` (extensions included), which is
+what carries the value here:
+
+```rust
+use http::request::Parts;
+use oauth_resource_server::AuthorizedToken;
+
+/// Read back what `AuthLayer` put on the request, given the `Parts` a tool
+/// handler's own extractor hands it.
+fn credential_from_parts(parts: &Parts) -> Option<&AuthorizedToken> {
+    parts.extensions.get::<AuthorizedToken>()
+}
+```
+
+With the [rmcp](https://docs.rs/rmcp) SDK, `StreamableHttpService` carries
+those `Parts` onto the request context a `#[tool]` handler receives (its own
+docs, "Accessing HTTP request data from tool handlers"): a handler taking
+`rmcp::handler::server::tool::Extension<http::request::Parts>` as a
+parameter gets exactly the `Parts` value `credential_from_parts` above
+expects, and `parts.extensions.get::<AuthorizedToken>()` inside the handler
+reaches the token this crate validated. `Extension<AuthorizedToken>` on its
+own does not do this: rmcp's `Extension<T>` extractor reads from its own
+request-scoped extension map, which holds the whole `Parts` value as one
+entry, not the individual values inside `Parts.extensions` — extract
+`Parts` first, as shown above, then read `AuthorizedToken` out of it.
 
 ## Provider guide
 
