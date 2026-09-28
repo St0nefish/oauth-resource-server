@@ -382,31 +382,92 @@ from, and never a local plan/review label ("chunk p2", "round one").
 ## Workflow
 
 **Pattern A (CI-gated)** on GitHub, `master` as the default branch. The
-repository ruleset below is configured in GitHub's repo settings, not tracked
-in this tree, so it is maintainer-owned configuration rather than something a
-change in this repo can alter directly — treat it as always-in-effect policy:
+repository settings below are configured on GitHub, not tracked in this tree,
+so they are maintainer-owned configuration rather than something a change in
+this repo can alter directly — treat them as always-in-effect policy:
 
 - `master` takes no direct pushes and is protected by a repository **ruleset**
   whose only required status check is `ci-pass` (never `checks`/`msrv`
-  individually), which requires squash merges (no merge or rebase commits),
-  and which auto-deletes a branch once its PR merges.
+  individually), which does **not** require a branch to be up to date with
+  `master` before merging, which allows squash merges only (no merge or
+  rebase commits), and which auto-deletes a branch once its PR merges.
+- Workflow runs for a pull request from a fork need a maintainer's approval
+  for every external contributor, not just first-time ones, because the
+  heavy jobs run on a self-hosted runner.
+- A GitHub App's id (`APP_ID` repo variable) and private key
+  (`APP_PRIVATE_KEY` repo secret) are what `auto-merge.yml` authenticates
+  with.
+
+The flow:
+
 - Work on a branch, open a PR against `master`. `.github/workflows/ci.yml`
   fans `checks` (fmt, four clippy runs, tests with all and with default
   features, `cargo build --examples --all-features`, a `-D warnings` doc
   build, `cargo audit`, `cargo package --list`, `cargo publish --dry-run`) and
   `msrv` (a separate build on the pinned `1.89` toolchain) into `ci-pass`.
+  `checks` and `msrv` run on the project's self-hosted runner (an ephemeral
+  container, labels `self-hosted`, `linux`, `x64`): each installs
+  `pkg-config`/`libssl-dev`, the toolchain named in `rust-toolchain.toml` via
+  `dtolnay/rust-toolchain`, and restores an `actions/cache` of the cargo
+  registry and `target/`. `ci-pass` runs on a GitHub-hosted runner.
 - `ci-pass` uses `if: always()` plus an explicit result check specifically so
-  that a failed upstream job fails `ci-pass` rather than being skipped and
-  read as passing — see the comment at the top of `ci.yml` before touching it.
-- Squash-merge once `ci-pass` is green and the change has been reviewed.
-- `post-merge.yml`-style re-checks are not currently configured for this repo
-  — if one is added later, it re-runs the cheap checks on `master` after
-  every push and is not itself a required check.
+  that a failed (or skipped, or cancelled) upstream job fails `ci-pass`
+  rather than being skipped and read as passing — see the comment at the top
+  of `ci.yml` before touching it.
+- `.github/workflows/auto-merge.yml` arms squash auto-merge on every PR
+  opened by `St0nefish`, so the owner's PRs land as soon as `ci-pass` is
+  green — that is the intended flow, not something to hold back. It must use
+  the GitHub App token: a merge made with `GITHUB_TOKEN` starts no workflow
+  runs, so neither the post-merge CI run nor `release.yml` would fire. Every
+  other contributor's PR runs the same CI and is merged by hand after
+  review; a fork PR never receives the App credentials, so it cannot
+  auto-merge.
+- `ci.yml` also runs on every push to `master`. That is the post-merge
+  re-check, catching two PRs that were each green against an older `master`
+  but break once combined; there is deliberately no separate
+  `post-merge.yml`. It is not a required check (it runs after the merge).
+- Don't rebase an open PR just because `master` moved; refresh a branch only
+  to resolve a real conflict.
 
 ## Release process
 
-- **Repo setup, before the manual 0.1.0 publish**: after creating the GitHub
-  repo, enable private vulnerability reporting —
+- **Publishing happens on merge, driven by the version in `Cargo.toml`.**
+  `.github/workflows/release.yml` runs on every push to `master` (and on
+  manual dispatch, which it refuses on any other branch). Its `check` job
+  asks the crates.io API whether `Cargo.toml`'s version exists: `200` means
+  already published, and the run finishes green with "nothing to publish";
+  `404` means publish it; any other answer fails the run rather than guess.
+  For a new version, `check` also requires a `## [X.Y.Z]` section in
+  `CHANGELOG.md` and refuses if a `vX.Y.Z` tag already exists. Then `verify`
+  (self-hosted, read-only, no OIDC permission) runs fmt/clippy/tests;
+  `publish` (self-hosted, the only job with `id-token: write`, running
+  nothing but checkout, toolchain, auth and publish, with no restored cache)
+  authenticates via `rust-lang/crates-io-auth-action` (a short-lived
+  OIDC-exchanged token; no long-lived token secret is ever stored in this
+  repo) and runs `cargo publish`; and `github-release` (`contents: write`
+  with `GITHUB_TOKEN`) creates the `vX.Y.Z` tag on the published commit and
+  a GitHub release whose notes are that CHANGELOG section. Keep build
+  scripts, proc macros and dev-dependencies out of the job that can mint the
+  token.
+- **To cut a release**, open a PR that bumps `version` in `Cargo.toml` and
+  moves `CHANGELOG.md`'s `[Unreleased]` entries under `## [X.Y.Z] - <date>`
+  (plus the link references at the bottom). Merging it publishes. Never push
+  a `v*` tag by hand — the workflow creates it, and a pre-existing tag for
+  an unpublished version stops the release.
+- If a run publishes but then fails (in `github-release`), re-run only the
+  failed job: it tags the same commit. A new run would see the version as
+  published and do nothing.
+- `release.yml` must keep its filename, and `publish` must not gain an
+  `environment:`: crates.io trusted publishing is registered for this
+  repository + `release.yml` + no environment.
+- There is no deploy-hold switch: an ordinary merge publishes nothing, so
+  batching changes into one release is only a matter of when the version is
+  bumped.
+- **0.1.0 was published manually** with a personal crates.io API token,
+  because crates.io only lets a trusted publisher be attached to a crate
+  that already exists. Trusted publishing was configured after that, and
+  every later release goes through `release.yml`.
+- **Repo setup**: private vulnerability reporting must be enabled —
   `gh api -X PUT repos/St0nefish/oauth-resource-server/private-vulnerability-reporting`
   (Settings → Code security → Private vulnerability reporting). It is off by
   default on a new repo, and `SECURITY.md` and
@@ -416,27 +477,6 @@ change in this repo can alter directly — treat it as always-in-effect policy:
   left. Confirm with
   `gh api repos/St0nefish/oauth-resource-server/private-vulnerability-reporting`
   returning `{"enabled":true}`.
-- **0.1.0 is published manually**: `cargo publish` with a personal crates.io
-  API token, from a clean checkout of the tagged commit. crates.io requires
-  the crate to already exist before a trusted publisher can be attached to it,
-  so this first release cannot go through CI.
-- **Every release after 0.1.0** is tag-driven trusted publishing:
-  `.github/workflows/release.yml` triggers on a pushed `v*` tag. Its `verify`
-  job (read-only, no OIDC permission) checks the tag matches `Cargo.toml`'s
-  version and re-runs fmt/clippy/tests; only then does the separate `publish`
-  job — the only one with `id-token: write`, running nothing but checkout,
-  toolchain, auth and publish — authenticate via
-  `rust-lang/crates-io-auth-action` (a short-lived OIDC-exchanged token; no
-  long-lived token secret is ever stored in this repo) and run
-  `cargo publish`. Keep build scripts, proc macros and dev-dependencies out of
-  the job that can mint the token. It is **inert** until a
-  trusted publisher naming this repo + `release.yml` is configured on
-  crates.io, which can only happen after the manual 0.1.0 publish — see the
-  workflow file's header comment for the exact steps and for why the `v0.1.0`
-  tag itself is expected to fail here either way (don't chase that failure).
-- Tag only a commit already on `master`. A version bump is its own commit
-  (`Cargo.toml` + `CHANGELOG.md`), reviewed through the normal PR flow before
-  the tag is pushed.
 
 ## Build & test
 

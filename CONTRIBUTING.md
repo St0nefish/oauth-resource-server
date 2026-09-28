@@ -87,16 +87,25 @@ have installed locally and CI will catch regardless.
 
 This repository follows a simple trunk-based flow on `master`:
 
-1. Branch from `master`, make your change, and make sure the check suite
-   above passes locally.
-2. Open a PR against `master`. `ci.yml` runs; `ci-pass` is the one required
-   status check.
-3. Once `ci-pass` is green and the change has been reviewed, it is
-   squash-merged. The branch is deleted after merge.
+1. Branch from `master` (or fork), make your change, and make sure the check
+   suite above passes locally.
+2. Open a PR against `master`. `ci.yml` runs on the project's self-hosted
+   runner; for a PR from a fork, a maintainer approves the workflow run
+   first, so expect a short wait before checks start. `ci-pass` is the one
+   required status check.
+3. Once `ci-pass` is green and the change has been reviewed, a maintainer
+   squash-merges it. The branch is deleted after merge. (The maintainer's
+   own PRs merge automatically once `ci-pass` is green.)
 
-Releases are cut from `master` by tagging `vX.Y.Z` — see
-`.github/workflows/release.yml`'s header comment for how publishing to
-crates.io works.
+You don't need to keep your branch up to date with `master` — CI re-runs on
+`master` after every merge. Rebase only if GitHub reports a conflict.
+
+Releases are published from `master` when a merged PR bumps `version` in
+`Cargo.toml` (with a matching `CHANGELOG.md` section): `release.yml` then
+publishes to crates.io and creates the `vX.Y.Z` tag and GitHub release.
+Contributors don't bump the version or push tags — put your entry under
+`CHANGELOG.md`'s `[Unreleased]` section. See
+`.github/workflows/release.yml`'s header comment for the details.
 
 ## Reporting a security issue
 

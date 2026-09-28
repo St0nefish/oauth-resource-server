@@ -1,0 +1,41 @@
+name: Auto-merge
+
+# Arms GitHub's auto-merge (squash) on the owner's PRs, so they land as soon
+# as `ci-pass` is green. The ruleset still enforces `ci-pass`; this only saves
+# the manual click.
+#
+# The merge must be enabled with a GitHub App token, never GITHUB_TOKEN:
+# GitHub starts no new workflow runs for events GITHUB_TOKEN causes, so a
+# merge made with it would trigger neither the post-merge CI run on `master`
+# (ci.yml's `push` trigger) nor `release.yml`. The App's id is the `APP_ID`
+# repo variable and its key the `APP_PRIVATE_KEY` repo secret. GitHub
+# withholds both from a run triggered by a fork's PR, so this job only works
+# for PRs from branches of this repository — which is the intent.
+
+on:
+  pull_request:
+    types: [opened, synchronize, reopened]
+
+permissions:
+  contents: read
+
+jobs:
+  auto-merge:
+    # Only the owner's PRs auto-merge. Other contributors' PRs still run CI
+    # and can be merged manually after review, but must never land unattended.
+    if: github.event.pull_request.user.login == 'St0nefish'
+    runs-on: ubuntu-latest
+    steps:
+      - name: Generate App token
+        id: app-token
+        uses: actions/create-github-app-token@v2
+        with:
+          app-id: ${{ vars.APP_ID }}
+          private-key: ${{ secrets.APP_PRIVATE_KEY }}
+
+      - name: Enable auto-merge
+        run: gh pr merge "$PR_NUMBER" --auto --squash --repo "$REPO"
+        env:
+          GH_TOKEN: ${{ steps.app-token.outputs.token }}
+          PR_NUMBER: ${{ github.event.pull_request.number }}
+          REPO: ${{ github.repository }}
