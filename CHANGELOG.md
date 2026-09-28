@@ -8,6 +8,18 @@ Before 1.0, a breaking change increments the minor version.
 
 ## [Unreleased]
 
+## [0.1.2] - 2026-09-28
+
+No library changes: the code, public API and behavior are identical to
+0.1.1, and upgrading needs nothing.
+
+### Changed
+
+- Release process (maintainer-facing): a new version is now published to
+  crates.io when the maintainer publishes a GitHub release for it, instead
+  of automatically when a version bump merges to `master`. Merging to
+  `master` now runs CI only. 0.1.2 is the first version released this way.
+
 ## [0.1.1] - 2026-09-28
 
 ### Documentation
@@ -195,6 +207,7 @@ MSRV: Rust 1.89. License: MIT.
   resource on a non-loopback host needs `<PREFIX>ALLOW_INSECURE_HTTP=true`
   (`allow_insecure_http`).
 
-[Unreleased]: https://github.com/St0nefish/oauth-resource-server/compare/v0.1.1...HEAD
+[Unreleased]: https://github.com/St0nefish/oauth-resource-server/compare/v0.1.2...HEAD
+[0.1.2]: https://github.com/St0nefish/oauth-resource-server/compare/v0.1.1...v0.1.2
 [0.1.1]: https://github.com/St0nefish/oauth-resource-server/compare/v0.1.0...v0.1.1
 [0.1.0]: https://github.com/St0nefish/oauth-resource-server/releases/tag/v0.1.0

@@ -405,9 +405,12 @@ this repo can alter directly — treat them as always-in-effect policy:
 - A GitHub App's id (`APP_ID` repo variable) and private key
   (`APP_PRIVATE_KEY` repo secret) are what `auto-merge.yml` authenticates
   with.
-- A GitHub environment named `release`, deployable only from `master`, which
-  `release.yml`'s `publish` job runs in; crates.io trusted publishing is
-  bound to it.
+- A GitHub environment named `release`, whose deployment policy admits only
+  `v*` tags, which `release.yml`'s `publish` job runs in; crates.io trusted
+  publishing is bound to it.
+- A tag ruleset on `refs/tags/v*` that lets only repository admins (the
+  owner) create, move or delete a release tag. `GITHUB_TOKEN` and the
+  auto-merge App cannot, so no workflow may ever create a tag.
 - Every action in `.github/workflows/` is pinned to a full commit SHA with
   its release in a trailing `# vX.Y.Z` comment (`dtolnay/rust-toolchain`,
   which has no releases, to a commit of its `master` branch). Keep it that
@@ -433,7 +436,7 @@ The flow:
   opened by `St0nefish`, so the owner's PRs land as soon as `ci-pass` is
   green — that is the intended flow, not something to hold back. It must use
   the GitHub App token: a merge made with `GITHUB_TOKEN` starts no workflow
-  runs, so neither the post-merge CI run nor `release.yml` would fire. Every
+  runs, so the post-merge CI run would not fire. Every
   other contributor's PR runs the same CI and is merged by hand after
   review; a fork PR never receives the App credentials, so it cannot
   auto-merge.
@@ -446,16 +449,19 @@ The flow:
 
 ## Release process
 
-- **Publishing happens on merge, driven by the version in `Cargo.toml`.**
-  `.github/workflows/release.yml` runs on every push to `master` (and on
-  manual dispatch; its `check` job fails on any other branch, which stops an
-  accidental dispatch — the `release` environment is what stops a modified
-  workflow on another ref). `check` asks the crates.io API whether
-  `Cargo.toml`'s version exists: `200` means already published, and the run
-  finishes green with "nothing to publish"; `404` means publish it; any
-  other answer fails the run rather than guess. For a new version, `check`
-  also requires a non-empty `## [X.Y.Z]` section in `CHANGELOG.md` and
-  refuses if a `vX.Y.Z` tag already exists. Then `verify` and `msrv`
+- **A merge never publishes.** Publishing happens only when the owner
+  publishes a GitHub release: `.github/workflows/release.yml` triggers on
+  `release: published` and nothing else (no push or manual trigger). A
+  release created with `GITHUB_TOKEN` starts no workflow, which is intended —
+  only a human-created release publishes; a prerelease publishes too (a
+  `X.Y.Z-rc.N` version, which Cargo never selects unless asked for).
+  `check` (GitHub-hosted, read-only) checks out the tagged commit (the
+  event's `github.sha`, confirmed against the tag) and fails closed unless
+  the tag is `v<version>` for `Cargo.toml`'s version at that commit, the
+  commit is an ancestor of `master`, crates.io answers `404` for the version
+  (`200` fails the first attempt — the release is for an already-published
+  version; any other answer always fails), and `CHANGELOG.md` has a
+  non-empty `## [X.Y.Z]` section. Then `verify` and `msrv`
   (self-hosted, read-only, no OIDC permission) repeat `ci.yml`'s `checks`
   and `msrv` jobs step for step — keep the lists in step; `publish`
   (GitHub-hosted, in the `release` environment, the only job with
@@ -463,33 +469,36 @@ The flow:
   publish, with no restored cache) re-checks crates.io, then authenticates
   via `rust-lang/crates-io-auth-action` (a short-lived OIDC-exchanged token;
   no long-lived token secret is ever stored in this repo) and runs
-  `cargo publish`; and `github-release` (`contents: write` with
-  `GITHUB_TOKEN`) creates the `vX.Y.Z` tag on the published commit and a
-  GitHub release whose notes are that CHANGELOG section. Keep build
+  `cargo publish`; and `release-notes` (`contents: write` with
+  `GITHUB_TOKEN`) replaces the release's notes with that CHANGELOG section
+  via `gh release edit`. No job creates or moves a tag. Keep build
   scripts, proc macros and dev-dependencies out of the job that can mint the
   token, and keep that job off the self-hosted runner, which has its host's
   Docker daemon socket mounted and runs unreviewed Dependabot code.
-- **To cut a release**, open a PR that bumps `version` in `Cargo.toml` and
-  moves `CHANGELOG.md`'s `[Unreleased]` entries under `## [X.Y.Z] - <date>`
-  (plus the link references at the bottom). Merging it publishes. Never push
-  a `v*` tag by hand — the workflow creates it, and a pre-existing tag for
-  an unpublished version stops the release.
-- A failed run is safe to re-run with "re-run failed jobs": `publish` skips
-  the upload and succeeds if the version is already on crates.io, and
-  `github-release` does nothing if the release exists. A fresh run would
-  instead see the version as published and stop at `check`.
+- **To cut a release**: (1) merge a PR that bumps `version` in `Cargo.toml`
+  (and `Cargo.lock`) and moves `CHANGELOG.md`'s `[Unreleased]` entries under
+  `## [X.Y.Z] - <date>` (plus the link references at the bottom) — merging
+  it publishes nothing; (2) the owner runs
+  `gh release create vX.Y.Z --target master --title vX.Y.Z --notes "..."`
+  (or uses the web UI), which creates the tag and starts `release.yml`.
+- A failed run is re-run with "re-run failed jobs" on that run: `publish`
+  skips the upload and succeeds if an earlier attempt already made it, and
+  `release-notes` just writes the same notes again.
 - `release.yml` must keep its filename, and `publish` must keep
   `environment: release`: crates.io trusted publishing is registered for
   this repository + `release.yml` + environment `release`, and that
-  environment only accepts deployments from `master`.
-- There is no deploy-hold switch: an ordinary merge publishes nothing, so
-  batching changes into one release is only a matter of when the version is
-  bumped.
+  environment's policy (only `v*` tags) together with the tag ruleset (only
+  admins create `v*` tags) is what limits minting a publish token to an
+  owner-created release.
+- There is no deploy-hold switch: nothing publishes until the owner
+  creates a release, so batching changes is only a matter of when to do
+  that.
 - **0.1.0 was published manually** with a personal crates.io API token,
   because crates.io only lets a trusted publisher be attached to a crate
   that already exists. Trusted publishing was configured after that (bound
-  to environment `release` on `master`), and every later release goes
-  through `release.yml`.
+  to environment `release`), and every later release goes through
+  `release.yml`. 0.1.1 was published on merge by an earlier version of that
+  workflow; releases from 0.1.2 on are published from GitHub releases.
 - **Repo setup**: private vulnerability reporting must be enabled —
   `gh api -X PUT repos/St0nefish/oauth-resource-server/private-vulnerability-reporting`
   (Settings → Code security → Private vulnerability reporting). It is off by

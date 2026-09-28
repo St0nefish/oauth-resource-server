@@ -1,33 +1,45 @@
 name: Release
 
-# Publishes to crates.io on merge, not on tag: every push to `master` runs
-# this workflow, and it publishes only when the version in Cargo.toml is not
-# on crates.io yet. Cutting a release is therefore just a PR that bumps
-# `version` in Cargo.toml and moves CHANGELOG.md's `[Unreleased]` entries
-# under a matching `## [X.Y.Z]` heading; when that PR merges, this workflow
-# publishes it. A merge that leaves the version alone finds it already
-# published and finishes green with "nothing to publish".
+# Publishes to crates.io when the maintainer publishes a GitHub release — and
+# only then. A merge to `master` runs CI and nothing else.
 #
-#   check    GitHub-hosted, read-only. Refuses any ref but `master`, reads the
-#            version from Cargo.toml and asks the crates.io API whether it
-#            exists (200 = published, 404 = not yet; any other answer fails
-#            the run, so it never publishes on an uncertain answer). For an
-#            unpublished version it also requires a non-empty CHANGELOG
-#            section (the release notes) and refuses if a `v<version>` tag
-#            already exists, before anything is uploaded.
+# Cutting a release:
+#   1. Merge a PR that bumps `version` in Cargo.toml (and Cargo.lock) and
+#      moves CHANGELOG.md's `[Unreleased]` entries under a matching
+#      `## [X.Y.Z] - <date>` heading, with its link reference at the bottom.
+#   2. The maintainer creates the release for that commit:
+#        gh release create vX.Y.Z --target master --title vX.Y.Z --notes "..."
+#      or the same through the web UI. Publishing the release creates the
+#      `vX.Y.Z` tag and starts this workflow. The notes given there are
+#      replaced by the CHANGELOG section once the crate is published.
+#
+# Only a release a human publishes triggers this. GitHub starts no workflow
+# run for a release created with GITHUB_TOKEN, and that is intended. A tag
+# ruleset lets only repository admins create, move or delete `v*` tags, so
+# neither GITHUB_TOKEN nor the auto-merge App can make a release tag, and
+# nothing in this workflow ever creates or edits a tag. A prerelease is
+# handled like any other release: a version such as `0.2.0-rc.1` is
+# published to crates.io, where Cargo never picks a pre-release version
+# unless a consumer asks for it explicitly.
+#
+#   check    GitHub-hosted, read-only. Checks out the tagged commit and
+#            fails closed unless: the release's tag is `v<version>` for the
+#            Cargo.toml version at that commit; that commit is an ancestor of
+#            `master`; crates.io answers 404 for that version (200 fails the
+#            first attempt, since the release is for a version that is
+#            already published; any other answer always fails, so it never
+#            publishes on an uncertain answer); and CHANGELOG.md has a
+#            non-empty section for it (the release notes).
 #   verify   Self-hosted, read-only, no OIDC permission: the same steps as
-#   msrv     ci.yml's `checks` and `msrv` jobs. They run only when there is
-#            something to publish — ci.yml's own `push` run already
-#            re-checks every merge.
-#   publish  The only job with `id-token: write`, bound to the `release`
+#   msrv     ci.yml's `checks` and `msrv` jobs, on the tagged commit.
+#   publish  The only job with `id-token: write`, in the `release`
 #            environment. Re-checks crates.io, then does nothing but
 #            checkout, toolchain, crates.io authentication and
 #            `cargo publish`.
-#   github-release
-#            `contents: write` with GITHUB_TOKEN: creates the `v<version>`
-#            tag on the published commit and a GitHub release whose notes
-#            are that version's CHANGELOG section. A tag GITHUB_TOKEN creates
-#            starts no workflow run, and nothing here triggers on tags anyway.
+#   release-notes
+#            `contents: write` with GITHUB_TOKEN: replaces the release's
+#            notes with the version's CHANGELOG section (`gh release edit`).
+#            It never creates or moves a tag.
 #
 # `publish` runs on a GitHub-hosted runner, not the self-hosted one. The
 # self-hosted runner has its host's Docker daemon socket mounted and runs
@@ -38,41 +50,33 @@ name: Release
 #
 # 0.1.0 was published manually with a personal API token, because crates.io
 # only lets a trusted publisher be attached to a crate that already exists.
-# Trusted publishing is now configured on crates.io for this repository, this
-# workflow file (`release.yml`) and the GitHub environment `release`, which
-# only `master` may deploy to. So this file must keep its name and `publish`
-# must keep `environment: release`: the environment's branch restriction is
-# what stops a modified copy of this workflow on another ref from minting a
-# token. No crates.io token is stored in this repository:
-# `rust-lang/crates-io-auth-action` exchanges the job's OIDC token for a
-# publish token valid for that one run.
+# Trusted publishing is configured on crates.io for this repository, this
+# workflow file (`release.yml`) and the GitHub environment `release`, whose
+# deployment policy admits only `v*` tags. So this file must keep its name
+# and `publish` must keep `environment: release`: that environment policy,
+# together with the tag ruleset, is what stops anything but an
+# admin-created release tag from minting a publish token. No crates.io token
+# is stored in this repository: `rust-lang/crates-io-auth-action` exchanges
+# the job's OIDC token for a publish token valid for that one run.
 #
-# Re-running a failed run is safe at every stage. `publish` re-checks
-# crates.io first and, if the version is already there, skips the upload and
-# succeeds, so `github-release` still runs; `github-release` does nothing if
-# the release already exists. Re-run the failed jobs of the original run —
-# a fresh run would find the version published and stop at `check`.
-#
-# There is no hold/batch switch (unlike a service that restarts on every
-# deploy): an ordinary merge publishes nothing, and a release happens only
-# when a merged PR bumps the version, which is already the batching decision.
-# `workflow_dispatch` is for re-running the check by hand — for example after
-# a crates.io outage failed the version lookup.
+# Re-running is done with "re-run failed jobs" on the release's run; there is
+# no manual trigger. Every stage is safe to repeat: `publish` re-checks
+# crates.io and, on a re-run, skips the upload and succeeds if an earlier
+# attempt already made it, so `release-notes` still runs; `release-notes`
+# only ever overwrites the notes with the same text.
 #
 # Every action is pinned to a full commit SHA, with the release it
 # corresponds to in a trailing comment (dtolnay/rust-toolchain publishes no
 # releases, so it is pinned to a commit of its `master` branch).
 
 on:
-  push:
-    branches: [master]
-  workflow_dispatch:
+  release:
+    types: [published]
 
 # One release at a time, and never cancel one that has started: an upload to
-# crates.io cannot be taken back, so a run must always reach its tag and
-# GitHub release. GitHub still replaces a *pending* (not yet started) run when
-# a newer one queues; that is safe, because every run decides from scratch,
-# against crates.io, whether master's current version still needs publishing.
+# crates.io cannot be taken back, so a run must always reach its release
+# notes. The group is constant, not keyed by tag, because what is being
+# serialized is publishing to the one crates.io crate.
 concurrency:
   group: release
   cancel-in-progress: false
@@ -86,41 +90,81 @@ jobs:
     timeout-minutes: 15
     outputs:
       version: ${{ steps.version.outputs.version }}
-      publish: ${{ steps.published.outputs.publish }}
+      tag: ${{ steps.version.outputs.tag }}
     steps:
-      - name: Refuse any ref but master
-        # Stops an accidental manual dispatch on another branch. It is not
-        # the security boundary — a modified workflow on another ref could
-        # delete this step. What stops that from publishing is the `release`
-        # environment's branch restriction on `publish`.
+      - name: Checkout the tagged commit
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ github.sha }}
+          # Full history, so the ancestry check below has the commits it needs.
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Match the release tag to the tagged commit's Cargo.toml version
+        id: version
+        env:
+          TAG: ${{ github.event.release.tag_name }}
         run: |
-          if [[ "${GITHUB_REF}" != "refs/heads/master" ]]; then
-            echo "::error::release.yml only publishes from master (this run is on ${GITHUB_REF})"
+          semver='[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z.-]+)?'
+          if [[ ! "$TAG" =~ ^v${semver}$ ]]; then
+            echo "::error::release tag '${TAG}' is not of the form vX.Y.Z[-pre]"
             exit 1
           fi
 
-      - name: Checkout code
-        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-        with:
-          persist-credentials: false
+          # For a release event GITHUB_SHA is the commit the tag named when
+          # the release was published. Confirm the tag still names it and
+          # that this checkout is that commit, rather than trust either.
+          if [[ "$GITHUB_REF" != "refs/tags/${TAG}" ]]; then
+            echo "::error::GITHUB_REF is ${GITHUB_REF}, expected refs/tags/${TAG}"
+            exit 1
+          fi
+          git fetch --no-tags origin "+refs/tags/${TAG}:refs/tags/${TAG}"
+          tag_commit=$(git rev-parse "refs/tags/${TAG}^{commit}")
+          head_commit=$(git rev-parse HEAD)
+          if [[ "$tag_commit" != "$GITHUB_SHA" || "$head_commit" != "$GITHUB_SHA" ]]; then
+            echo "::error::tag ${TAG} is at ${tag_commit} and the checkout at ${head_commit}, but the release event names ${GITHUB_SHA}"
+            exit 1
+          fi
 
-      - name: Read version from Cargo.toml
-        id: version
-        # The `version` key of the `[package]` table, without needing a Rust
-        # toolchain on this runner.
-        run: |
+          # The `version` key of the `[package]` table, without needing a
+          # Rust toolchain on this runner.
           version=$(awk '
             /^\[/ { in_package = ($0 == "[package]") }
             in_package && /^version *=/ { sub(/^version *= *"/, ""); sub(/".*$/, ""); print; exit }
           ' Cargo.toml)
-          if [[ ! "$version" =~ ^[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z.-]+)?$ ]]; then
-            echo "::error::could not read a valid version from Cargo.toml (got '${version}')"
+          if [[ ! "$version" =~ ^${semver}$ ]]; then
+            echo "::error::could not read a valid version from Cargo.toml at ${GITHUB_SHA} (got '${version}')"
+            exit 1
+          fi
+          if [[ "$TAG" != "v${version}" ]]; then
+            echo "::error::release tag ${TAG} does not match Cargo.toml's version ${version} at ${GITHUB_SHA}. Bump the version in a merged PR first, then release that commit."
             exit 1
           fi
           echo "version=$version" >> "$GITHUB_OUTPUT"
+          echo "tag=$TAG" >> "$GITHUB_OUTPUT"
 
-      - name: Is this version already on crates.io?
-        id: published
+      - name: Require the tagged commit to be on master
+        run: |
+          # Fetch master explicitly and fail closed: a failed fetch or a
+          # commit master does not contain both stop the release.
+          git fetch --no-tags origin "+refs/heads/master:refs/remotes/origin/master"
+          status=0
+          git merge-base --is-ancestor "$GITHUB_SHA" origin/master || status=$?
+          case "$status" in
+            0)
+              echo "${GITHUB_SHA} is on master"
+              ;;
+            1)
+              echo "::error::${GITHUB_SHA} is not an ancestor of master. Release only a commit that has merged to master."
+              exit 1
+              ;;
+            *)
+              echo "::error::git merge-base failed (exit ${status}); cannot tell whether ${GITHUB_SHA} is on master."
+              exit 1
+              ;;
+          esac
+
+      - name: Require the version to be unpublished on crates.io
         env:
           VERSION: ${{ steps.version.outputs.version }}
         run: |
@@ -133,30 +177,28 @@ jobs:
             -A "oauth-resource-server release workflow (https://github.com/${GITHUB_REPOSITORY})" \
             "$url") || code="curl exit $?"
           case "$code" in
-            200)
-              echo "publish=false" >> "$GITHUB_OUTPUT"
-              echo "::notice::oauth-resource-server ${VERSION} is already on crates.io — nothing to publish."
-              {
-                echo "### Nothing to publish"
-                echo ""
-                echo "\`oauth-resource-server ${VERSION}\` (the version in Cargo.toml) is already on crates.io."
-                echo "To release, merge a PR that bumps \`version\` in Cargo.toml and adds its CHANGELOG section."
-              } >> "$GITHUB_STEP_SUMMARY"
-              ;;
             404)
-              echo "publish=true" >> "$GITHUB_OUTPUT"
-              echo "::notice::oauth-resource-server ${VERSION} is not on crates.io yet — publishing it."
+              echo "oauth-resource-server ${VERSION} is not on crates.io yet — publishing it."
+              ;;
+            200)
+              # On a re-run, an earlier attempt of this run may be what
+              # uploaded it; `publish` then skips the upload and succeeds.
+              if [ "${GITHUB_RUN_ATTEMPT}" -gt 1 ]; then
+                echo "::notice::oauth-resource-server ${VERSION} is already on crates.io; this is a re-run, so continuing (publish will skip the upload)."
+              else
+                echo "::error::oauth-resource-server ${VERSION} is already on crates.io. This release is for a published version; bump the version and release that instead."
+                exit 1
+              fi
               ;;
             *)
-              echo "::error::crates.io answered ${code} for ${url}; expected 200 (published) or 404 (not yet). Not publishing on an uncertain answer — re-run once crates.io is healthy."
+              echo "::error::crates.io answered ${code} for ${url}; expected 404 (not yet published). Not publishing on an uncertain answer — re-run once crates.io is healthy."
               exit 1
               ;;
           esac
 
-      - name: Require a non-empty CHANGELOG section for the new version
-        # The same extraction `github-release` uses for the release notes, so
-        # a missing or empty section fails here, before anything is uploaded.
-        if: steps.published.outputs.publish == 'true'
+      - name: Require a non-empty CHANGELOG section for the version
+        # The same extraction `release-notes` uses, so a missing or empty
+        # section fails here, before anything is uploaded.
         env:
           VERSION: ${{ steps.version.outputs.version }}
         run: |
@@ -166,35 +208,9 @@ jobs:
             in_section { print }
           ' CHANGELOG.md > "${RUNNER_TEMP}/release-notes.md"
           if ! grep -q '[^[:space:]]' "${RUNNER_TEMP}/release-notes.md"; then
-            echo "::error::CHANGELOG.md's '## [${VERSION}]' section is missing or empty; the GitHub release notes are taken from it. Add it before releasing ${VERSION}."
+            echo "::error::CHANGELOG.md's '## [${VERSION}]' section is missing or empty; the release notes are taken from it."
             exit 1
           fi
-
-      - name: Refuse if the tag already exists
-        # A `v<version>` tag for a version crates.io does not have means
-        # something was tagged by hand; publishing this commit under it could
-        # ship code the tag does not point at. Sort it out manually.
-        if: steps.published.outputs.publish == 'true'
-        env:
-          VERSION: ${{ steps.version.outputs.version }}
-        run: |
-          # --exit-code: 0 = the ref exists, 2 = it does not, anything else
-          # is an error talking to the remote (never read as "absent").
-          status=0
-          git ls-remote --exit-code --tags origin "refs/tags/v${VERSION}" || status=$?
-          case "$status" in
-            0)
-              echo "::error::tag v${VERSION} already exists, but ${VERSION} is not on crates.io. Resolve by hand before releasing."
-              exit 1
-              ;;
-            2)
-              echo "no tag v${VERSION} yet"
-              ;;
-            *)
-              echo "::error::git ls-remote failed (exit ${status}); cannot tell whether tag v${VERSION} exists."
-              exit 1
-              ;;
-          esac
 
   # `verify` and `msrv` repeat ci.yml's `checks` and `msrv` jobs step for step
   # on the exact commit about to be published. They run every build script,
@@ -202,13 +218,13 @@ jobs:
   # permission — see `publish`.
   verify:
     needs: check
-    if: needs.check.outputs.publish == 'true'
     runs-on: [self-hosted, linux, x64]
     timeout-minutes: 60
     steps:
-      - name: Checkout code
+      - name: Checkout the tagged commit
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
+          ref: ${{ github.sha }}
           persist-credentials: false
 
       - name: Install system dependencies
@@ -289,13 +305,13 @@ jobs:
 
   msrv:
     needs: check
-    if: needs.check.outputs.publish == 'true'
     runs-on: [self-hosted, linux, x64]
     timeout-minutes: 30
     steps:
-      - name: Checkout code
+      - name: Checkout the tagged commit
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
+          ref: ${{ github.sha }}
           persist-credentials: false
 
       - name: Install system dependencies
@@ -343,7 +359,6 @@ jobs:
   # scripts. GitHub-hosted, and in the `release` environment — see the header.
   publish:
     needs: [check, verify, msrv]
-    if: needs.check.outputs.publish == 'true'
     runs-on: ubuntu-latest
     timeout-minutes: 30
     environment: release
@@ -352,9 +367,9 @@ jobs:
       id-token: write
     steps:
       - name: Is this version still unpublished?
-        # Makes a re-run safe: if an earlier attempt of this job already
+        # Makes a re-run safe: if an earlier attempt of this run already
         # uploaded the crate, skip the upload and succeed, so
-        # `github-release` still runs. Same 200/404/anything-else rule as
+        # `release-notes` still runs. Same 200/404/anything-else rule as
         # `check`.
         id: recheck
         env:
@@ -369,9 +384,10 @@ jobs:
             200)
               # Only a re-run may find its own upload. On the first attempt a
               # 200 means someone else published this version between `check`
-              # and now, and tagging GITHUB_SHA for it would be wrong.
+              # and now, and claiming this release's commit for it would be
+              # wrong.
               if [ "${GITHUB_RUN_ATTEMPT}" -le 1 ]; then
-                echo "::error::oauth-resource-server ${VERSION} appeared on crates.io after the check job ran, from outside this run. Not tagging a release for an upload this workflow did not make."
+                echo "::error::oauth-resource-server ${VERSION} appeared on crates.io after the check job ran, from outside this run. Not attributing an upload this workflow did not make to this release."
                 exit 1
               fi
               echo "upload=false" >> "$GITHUB_OUTPUT"
@@ -386,10 +402,11 @@ jobs:
               ;;
           esac
 
-      - name: Checkout code
+      - name: Checkout the tagged commit
         if: steps.recheck.outputs.upload == 'true'
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
+          ref: ${{ github.sha }}
           persist-credentials: false
 
       - name: Read pinned Rust toolchain version
@@ -426,57 +443,31 @@ jobs:
           cargo publish
           echo "### Published oauth-resource-server ${VERSION} to crates.io" >> "$GITHUB_STEP_SUMMARY"
 
-  github-release:
+  # Sets the release's notes to the CHANGELOG section once the crate is on
+  # crates.io. Edits the existing release only — never creates a release or
+  # a tag (the tag ruleset would refuse GITHUB_TOKEN anyway). Re-running it
+  # writes the same notes again.
+  release-notes:
     needs: [check, publish]
-    if: needs.check.outputs.publish == 'true'
     runs-on: ubuntu-latest
     timeout-minutes: 15
     permissions:
       contents: write
     steps:
-      - name: Checkout code
-        # Only CHANGELOG.md is read; the tag and release are created through
-        # the API, so the checkout needs no stored credentials.
+      - name: Checkout the tagged commit
+        # Only CHANGELOG.md is read; the release is edited through the API,
+        # so the checkout needs no stored credentials.
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
+          ref: ${{ github.sha }}
           persist-credentials: false
 
-      - name: Tag and create the GitHub release
+      - name: Replace the release notes with the CHANGELOG section
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          TAG: ${{ needs.check.outputs.tag }}
           VERSION: ${{ needs.check.outputs.version }}
         run: |
-          tag="v${VERSION}"
-
-          # Safe to re-run: an existing release for this tag means an earlier
-          # attempt already got this far.
-          if gh release view "$tag" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
-            echo "::notice::release ${tag} already exists — nothing to do."
-            exit 0
-          fi
-
-          # A tag without a release (an earlier attempt that died in between)
-          # is only reusable if it points at the commit that was published.
-          # Resolve it through the git refs API, dereferencing an annotated
-          # tag object to the commit it names.
-          if ref=$(gh api "repos/${GITHUB_REPOSITORY}/git/ref/tags/${tag}" 2>&1); then
-            obj_type=$(jq -r '.object.type' <<<"$ref")
-            tag_sha=$(jq -r '.object.sha' <<<"$ref")
-            if [[ "$obj_type" == "tag" ]]; then
-              tag_sha=$(gh api "repos/${GITHUB_REPOSITORY}/git/tags/${tag_sha}" --jq '.object.sha')
-            fi
-            if [[ "$tag_sha" != "$GITHUB_SHA" ]]; then
-              echo "::error::tag ${tag} points at ${tag_sha}, not the published commit ${GITHUB_SHA}. Fix the tag by hand."
-              exit 1
-            fi
-            echo "tag ${tag} already exists at ${GITHUB_SHA}; reusing it"
-          elif grep -q 'HTTP 404' <<<"$ref"; then
-            echo "no tag ${tag} yet; the release will create it at ${GITHUB_SHA}"
-          else
-            echo "::error::could not look up tag ${tag}: ${ref}"
-            exit 1
-          fi
-
           # The `## [X.Y.Z]` section, up to the next version heading or the
           # link-reference block at the end of the file. `check` already ran
           # this same extraction and required it to be non-empty.
@@ -490,9 +481,7 @@ jobs:
             exit 1
           fi
 
-          gh release create "$tag" \
+          gh release edit "$TAG" \
             --repo "$GITHUB_REPOSITORY" \
-            --target "$GITHUB_SHA" \
-            --title "$tag" \
             --notes-file "${RUNNER_TEMP}/release-notes.md"
-          echo "### Tagged ${tag} and created its GitHub release" >> "$GITHUB_STEP_SUMMARY"
+          echo "### Set the ${TAG} release notes from CHANGELOG.md" >> "$GITHUB_STEP_SUMMARY"
