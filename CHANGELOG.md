@@ -8,9 +8,7 @@ Before 1.0, a breaking change increments the minor version.
 
 ## [Unreleased]
 
-## [0.1.0] - Unreleased
-
-<!-- Set the date when 0.1.0 is published to crates.io. -->
+## [0.1.0] - 2026-09-28
 
 The first release. The validator was extracted from mcp-md-wiki's OAuth
 support
