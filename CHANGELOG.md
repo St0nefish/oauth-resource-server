@@ -8,6 +8,35 @@ Before 1.0, a breaking change increments the minor version.
 
 ## [Unreleased]
 
+## [0.1.1] - 2026-09-28
+
+### Documentation
+
+- README: a new "CORS for browser-based clients" section, showing a
+  `tower-http` `CorsLayer` on the protected and metadata routes, the
+  Streamable HTTP headers/methods (`Mcp-Session-Id`, `Mcp-Protocol-Version`,
+  `Last-Event-Id`, `DELETE`) a browser-based MCP client additionally needs
+  allowed, and why `Access-Control-Expose-Headers: WWW-Authenticate` and
+  `Mcp-Session-Id` are needed for a browser's JavaScript to read them. The
+  doctest drives an actual preflight `OPTIONS` request (and a follow-up
+  request) through the layered router with `tower::ServiceExt::oneshot` and
+  asserts on the response headers, so it is exercised, not just compiled
+  (#19).
+- README: a new "Embedding `OAuthConfig` in your own config" section
+  explaining that `OAuthConfig`'s `#[serde(deny_unknown_fields)]` is
+  silently defeated by `#[serde(flatten)]` in an application's own config
+  struct (a general serde limitation) and that the field should be nested
+  instead (#19).
+- README: clarified that an omitted `scopes_supported` resolves to the
+  required scopes identically on the `serde` and `env` paths — the only
+  path-specific difference is that the `env` loader cannot express an
+  explicit empty list, which was already documented separately (#19).
+- README: a new "Reading the token inside a tool handler" section under
+  "Using with MCP", showing how `AuthorizedToken` reaches an MCP tool
+  handler through `http::request::Parts` and describing how the rmcp SDK's
+  `Extension<T>` extractor surfaces it (#19).
+- No library behavior or public API change.
+
 ## [0.1.0] - 2026-09-28
 
 The first release. The validator was extracted from mcp-md-wiki's OAuth
@@ -166,5 +195,6 @@ MSRV: Rust 1.89. License: MIT.
   resource on a non-loopback host needs `<PREFIX>ALLOW_INSECURE_HTTP=true`
   (`allow_insecure_http`).
 
-[Unreleased]: https://github.com/St0nefish/oauth-resource-server/compare/v0.1.0...HEAD
+[Unreleased]: https://github.com/St0nefish/oauth-resource-server/compare/v0.1.1...HEAD
+[0.1.1]: https://github.com/St0nefish/oauth-resource-server/compare/v0.1.0...v0.1.1
 [0.1.0]: https://github.com/St0nefish/oauth-resource-server/releases/tag/v0.1.0

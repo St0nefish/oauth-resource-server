@@ -1,6 +1,6 @@
 [package]
 name = "oauth-resource-server"
-version = "0.1.0"
+version = "0.1.1"
 edition = "2024"
 # Keep in lockstep with `channel` in rust-toolchain.toml -- this makes cargo
 # itself refuse a too-old local toolchain with a clear "package requires rustc X
@@ -96,6 +96,9 @@ tower = { version = "0.5", features = ["util"] }
 axum = { version = "0.8", default-features = false, features = ["tokio", "http1"] }
 # Prints the crate's log lines when an example runs.
 tracing-subscriber = "0.3"
+# The README's CORS doctest (`Access-Control-Expose-Headers` for
+# `WWW-Authenticate`); the library itself has no CORS opinion of its own.
+tower-http = { version = "0.6", features = ["cors"] }
 
 # Each example names the features it needs, so `cargo build --examples` with
 # fewer features skips it rather than failing to compile it.
