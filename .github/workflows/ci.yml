@@ -1,6 +1,6 @@
 name: CI
 
-# Pattern A gating: `ci-pass` is the one status check branch protection
+# Pattern A gating: `ci-pass` is the one status check the repository ruleset
 # requires. It runs no build steps of its own — it just fails unless every
 # job named in its `needs:` succeeded, so adding a job here only strengthens
 # the gate if it is added to both `needs:` and the explicit result check in
@@ -8,10 +8,22 @@ name: CI
 # *skip*, not fail, `ci-pass` when an upstream job fails, and a skipped
 # required check is treated as passing — see `ci-pass`'s own comment).
 #
+# The heavy jobs (`checks`, `msrv`) run on the project's self-hosted runner,
+# an ephemeral container: every job starts from a clean image, so nothing
+# carries over between runs except what `actions/cache` restores. A pull
+# request from a fork only runs after a maintainer approves the run. That
+# gate does not cover every change nobody has reviewed yet: Dependabot opens
+# its PRs from branches of this repository, so they run here without
+# approval, and a dependency bump executes the new upstream version's build
+# scripts (and proc macros, and tests) on the self-hosted runner. That is
+# accepted, knowing the runner mounts the host docker socket, so such code
+# can reach the host beyond its own ephemeral container. The mitigation is
+# that nothing secret lives on that runner: these jobs hold only a read-only
+# token, and release.yml's publish job runs on a GitHub-hosted runner.
+# `ci-pass` is a pure result check and stays on a GitHub-hosted runner.
+#
 # `checks` builds once with the toolchain pinned in `rust-toolchain.toml`
-# (via `rustup toolchain install`, which reads that file automatically
-# because it sits in the repo root) and runs everything that toolchain needs
-# to cover:
+# and runs everything that toolchain needs to cover:
 # formatting, clippy across the feature combinations that matter (all
 # features together, the default feature set, and native-tls and
 # rustls-tls-native-roots each alone — those exist because `--all-features`
@@ -19,14 +31,26 @@ name: CI
 # backends are additive, not mutually exclusive), tests, a `-D warnings` doc build (every public item
 # needs a doc comment — see `#![warn(missing_docs)]` in `src/lib.rs`),
 # `cargo audit`, and the packaging checks (`cargo package --list` and
-# `cargo publish --dry-run`) that catch a metadata mistake before a tag ever
-# reaches `release.yml`.
+# `cargo publish --dry-run`) that catch a metadata mistake before a version
+# bump ever reaches `release.yml`. `release.yml`'s `verify` and `msrv` jobs
+# repeat these steps before a publish; keep the two lists in step.
 #
 # `msrv` is a separate job on a separate, explicitly-installed toolchain
 # (read from `Cargo.toml`'s `rust-version`, not from `rust-toolchain.toml` —
 # see that file's header comment for why) so a change that only compiles on
 # a newer compiler than the crate's stated MSRV fails CI instead of shipping
 # quietly.
+#
+# The `push` trigger on `master` is the post-merge re-run. The ruleset does
+# not require a PR branch to be up to date with `master` before it merges, so
+# two PRs each green against an older base can still combine into a broken
+# `master`; re-running the full gate on every push to `master` catches that
+# immediately. There is deliberately no separate `post-merge.yml` — this
+# workflow already is one, and a second would only duplicate the build.
+#
+# Every action is pinned to a full commit SHA, with the release it
+# corresponds to in a trailing comment (dtolnay/rust-toolchain publishes no
+# releases, so it is pinned to a commit of its `master` branch).
 
 on:
   pull_request:
@@ -38,31 +62,60 @@ on:
 permissions:
   contents: read
 
+# PR runs and post-merge runs live in separate groups. A PR's group is keyed
+# by its number and cancels a superseded run of the same PR. Post-merge runs
+# share one constant group and never cancel a run that has started. GitHub
+# still replaces a *pending* post-merge run when a newer push queues behind
+# it; the newer run checks a tree that contains the replaced one's commit.
 concurrency:
-  group: ci-${{ github.workflow }}-${{ github.ref }}
-  cancel-in-progress: true
+  group: ${{ github.event_name == 'pull_request' && format('ci-pr-{0}', github.event.pull_request.number) || 'ci-master' }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
 jobs:
   checks:
-    runs-on: ubuntu-latest
+    runs-on: [self-hosted, linux, x64]
+    timeout-minutes: 60
     steps:
       - name: Checkout code
-        uses: actions/checkout@v7
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
 
-      - name: Install pinned Rust toolchain
-        # `rustup toolchain install` with no argument installs (and adds the
-        # components for) the toolchain named in `rust-toolchain.toml`,
-        # reading that file automatically because it sits in the repo root.
-        # `rustup show` does NOT do this — tested empirically: with a
-        # rust-toolchain.toml naming an uninstalled toolchain, `rustup show`
-        # prints "no active toolchain" and installs nothing; only a later
-        # `cargo`/`rustc` invocation's proxy auto-install would pull it in,
-        # and relying on that silently depends on the runner having
-        # toolchain auto-install enabled.
-        run: rustup toolchain install
+      - name: Install system dependencies
+        # The `native-tls` feature builds against OpenSSL.
+        run: |
+          sudo apt-get update && sudo apt-get install -y --no-install-recommends \
+            pkg-config libssl-dev
+
+      - name: Read pinned Rust toolchain version
+        # Single source of truth is rust-toolchain.toml's `channel`.
+        # dtolnay/rust-toolchain doesn't parse that file itself, so extract it
+        # here and hand it to the toolchain action below (which also installs
+        # rustup itself if the runner image has none).
+        id: rust_version
+        run: |
+          version=$(grep -m1 '^channel' rust-toolchain.toml | sed -E 's/channel *= *"([^"]+)"/\1/')
+          if [[ -z "$version" ]]; then
+            echo "::error::could not parse channel from rust-toolchain.toml"
+            exit 1
+          fi
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@02cb101ec7c40f2c49e1d9714d64511d8e1b74de # master, 2026-09-12
+        with:
+          toolchain: ${{ steps.rust_version.outputs.version }}
+          components: clippy, rustfmt
 
       - name: Cache cargo registry and build artifacts
-        uses: Swatinem/rust-cache@v2
+        uses: actions/cache@caa296126883cff596d87d8935842f9db880ef25 # v5.1.0
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: cargo-checks-${{ steps.rust_version.outputs.version }}-${{ hashFiles('Cargo.lock') }}
+          restore-keys: cargo-checks-${{ steps.rust_version.outputs.version }}-
 
       - name: Format check
         run: cargo fmt --all -- --check
@@ -103,10 +156,10 @@ jobs:
         run: cargo doc --no-deps --all-features
 
       - name: Install cargo-audit
-        # Pinned action, not a `curl ... | bash` of a mutable branch — this is
-        # a security crate's CI, so the install step gets the same
-        # supply-chain treatment as everything else pinned by version here.
-        uses: taiki-e/install-action@v2
+        # A SHA-pinned action, not a `curl ... | bash` of a mutable branch —
+        # this is a security crate's CI, so the install step gets the same
+        # supply-chain treatment as every other action here.
+        uses: taiki-e/install-action@4cef1412cce204788f482e778a0b9187f9626a29 # v2.87.21
         with:
           tool: cargo-audit
 
@@ -122,23 +175,30 @@ jobs:
       - name: cargo publish --dry-run
         # Packages and verifies the crate (metadata, `include` list, doc
         # build inside the package) without uploading anything. This never
-        # touches crates.io; only `release.yml`, on a pushed tag, does that.
+        # touches crates.io; only `release.yml`, on a push to `master` whose
+        # Cargo.toml version is not yet published, does that.
         run: cargo publish --dry-run
 
   msrv:
-    runs-on: ubuntu-latest
+    runs-on: [self-hosted, linux, x64]
+    timeout-minutes: 30
     steps:
       - name: Checkout code
-        uses: actions/checkout@v7
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Install system dependencies
+        # `--all-features` below includes `native-tls` (OpenSSL).
+        run: |
+          sudo apt-get update && sudo apt-get install -y --no-install-recommends \
+            pkg-config libssl-dev
 
       - name: Read MSRV from Cargo.toml
         # Deliberately not `cargo metadata`: that needs a toolchain already
-        # installed to run, and this job hasn't installed one yet (unlike
-        # `checks`, which reads rust-toolchain.toml via `rustup toolchain
-        # install` before its first cargo call — see that job's comment on
-        # why `rustup show` alone doesn't do this). Reading the value out of
-        # the TOML directly with grep avoids relying on the runner's rustup
-        # proxy auto-installing some toolchain first.
+        # installed to run, and this job hasn't installed one yet. Reading the
+        # value out of the TOML directly with grep avoids depending on
+        # whatever toolchain, if any, the runner image already has.
         id: msrv
         run: |
           version=$(grep -m1 '^rust-version' Cargo.toml | sed -E 's/^rust-version *= *"([^"]+)".*/\1/')
@@ -149,31 +209,48 @@ jobs:
           echo "version=$version" >> "$GITHUB_OUTPUT"
 
       - name: Install MSRV toolchain
-        run: rustup toolchain install "${{ steps.msrv.outputs.version }}" --profile minimal
+        uses: dtolnay/rust-toolchain@02cb101ec7c40f2c49e1d9714d64511d8e1b74de # master, 2026-09-12
+        with:
+          toolchain: ${{ steps.msrv.outputs.version }}
 
       - name: Cache cargo registry and build artifacts
-        uses: Swatinem/rust-cache@v2
+        uses: actions/cache@caa296126883cff596d87d8935842f9db880ef25 # v5.1.0
         with:
-          key: msrv-${{ steps.msrv.outputs.version }}
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: cargo-msrv-${{ steps.msrv.outputs.version }}-${{ hashFiles('Cargo.lock') }}
+          restore-keys: cargo-msrv-${{ steps.msrv.outputs.version }}-
 
       - name: Build on MSRV (all features)
-        run: cargo "+${{ steps.msrv.outputs.version }}" build --all-features --locked
+        # The explicit `+<version>` overrides rust-toolchain.toml, which would
+        # otherwise select the pinned development toolchain in this directory.
+        env:
+          MSRV: ${{ steps.msrv.outputs.version }}
+        run: cargo "+${MSRV}" build --all-features --locked
 
   ci-pass:
     needs: [checks, msrv]
     if: always()
     runs-on: ubuntu-latest
+    timeout-minutes: 5
     steps:
       # `needs:` alone would make GitHub SKIP this job (not fail it) when
-      # `checks` or `msrv` fails, and branch protection / rulesets treat a
-      # skipped required check as passing — the ruleset's only required
-      # check is this job, so that would silently defeat it. `if: always()`
-      # above forces this job to run regardless of upstream outcome, and the
-      # explicit result check below is what actually fails it.
+      # `checks` or `msrv` fails, and rulesets treat a skipped required check
+      # as passing — the ruleset's only required check is this job, so that
+      # would silently defeat it. `if: always()` above forces this job to run
+      # regardless of upstream outcome, and the explicit result check below
+      # is what actually fails it. Neither upstream job is ever legitimately
+      # skipped, so anything but `success` (failure, cancelled, skipped)
+      # fails the gate.
       - name: Require every upstream job to have succeeded
+        env:
+          CHECKS: ${{ needs.checks.result }}
+          MSRV: ${{ needs.msrv.result }}
         run: |
-          if [[ "${{ needs.checks.result }}" != "success" || "${{ needs.msrv.result }}" != "success" ]]; then
-            echo "::error::one or more required jobs did not succeed (checks=${{ needs.checks.result }}, msrv=${{ needs.msrv.result }})"
+          if [[ "$CHECKS" != "success" || "$MSRV" != "success" ]]; then
+            echo "::error::one or more required jobs did not succeed (checks=${CHECKS}, msrv=${MSRV})"
             exit 1
           fi
           echo "all required checks passed"
