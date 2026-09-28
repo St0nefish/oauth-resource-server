@@ -11,9 +11,13 @@ name: CI
 # The heavy jobs (`checks`, `msrv`) run on the project's self-hosted runner,
 # an ephemeral container: every job starts from a clean image, so nothing
 # carries over between runs except what `actions/cache` restores. A pull
-# request from a fork only runs after a maintainer approves the run, which is
-# what keeps an unreviewed external change off that runner. `ci-pass` is a
-# pure result check and stays on a GitHub-hosted runner.
+# request from a fork only runs after a maintainer approves the run. That
+# gate does not cover every change nobody has reviewed yet: Dependabot opens
+# its PRs from branches of this repository, so they run here without
+# approval, and a dependency bump executes the new upstream version's build
+# scripts (and proc macros, and tests) on the self-hosted runner. That is
+# accepted — the runner is ephemeral and these jobs hold only a read-only
+# token. `ci-pass` is a pure result check and stays on a GitHub-hosted runner.
 #
 # `checks` builds once with the toolchain pinned in `rust-toolchain.toml`
 # and runs everything that toolchain needs to cover:
@@ -25,7 +29,8 @@ name: CI
 # needs a doc comment — see `#![warn(missing_docs)]` in `src/lib.rs`),
 # `cargo audit`, and the packaging checks (`cargo package --list` and
 # `cargo publish --dry-run`) that catch a metadata mistake before a version
-# bump ever reaches `release.yml`.
+# bump ever reaches `release.yml`. `release.yml`'s `verify` and `msrv` jobs
+# repeat these steps before a publish; keep the two lists in step.
 #
 # `msrv` is a separate job on a separate, explicitly-installed toolchain
 # (read from `Cargo.toml`'s `rust-version`, not from `rust-toolchain.toml` —
@@ -39,6 +44,10 @@ name: CI
 # `master`; re-running the full gate on every push to `master` catches that
 # immediately. There is deliberately no separate `post-merge.yml` — this
 # workflow already is one, and a second would only duplicate the build.
+#
+# Every action is pinned to a full commit SHA, with the release it
+# corresponds to in a trailing comment (dtolnay/rust-toolchain publishes no
+# releases, so it is pinned to a commit of its `master` branch).
 
 on:
   pull_request:
@@ -52,18 +61,22 @@ permissions:
 
 # PR runs and post-merge runs live in separate groups. A PR's group is keyed
 # by its number and cancels a superseded run of the same PR. Post-merge runs
-# share one constant group and never cancel a run in progress: each one is the
-# check that a combined tree still builds.
+# share one constant group and never cancel a run that has started. GitHub
+# still replaces a *pending* post-merge run when a newer push queues behind
+# it; the newer run checks a tree that contains the replaced one's commit.
 concurrency:
   group: ${{ github.event_name == 'pull_request' && format('ci-pr-{0}', github.event.pull_request.number) || 'ci-master' }}
   cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
 jobs:
   checks:
-    runs-on: self-hosted
+    runs-on: [self-hosted, linux, x64]
+    timeout-minutes: 60
     steps:
       - name: Checkout code
-        uses: actions/checkout@v7
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
 
       - name: Install system dependencies
         # The `native-tls` feature builds against OpenSSL.
@@ -86,13 +99,13 @@ jobs:
           echo "version=$version" >> "$GITHUB_OUTPUT"
 
       - name: Install Rust toolchain
-        uses: dtolnay/rust-toolchain@master
+        uses: dtolnay/rust-toolchain@02cb101ec7c40f2c49e1d9714d64511d8e1b74de # master, 2026-09-12
         with:
           toolchain: ${{ steps.rust_version.outputs.version }}
           components: clippy, rustfmt
 
       - name: Cache cargo registry and build artifacts
-        uses: actions/cache@v5
+        uses: actions/cache@caa296126883cff596d87d8935842f9db880ef25 # v5.1.0
         with:
           path: |
             ~/.cargo/registry
@@ -140,10 +153,10 @@ jobs:
         run: cargo doc --no-deps --all-features
 
       - name: Install cargo-audit
-        # Pinned action, not a `curl ... | bash` of a mutable branch — this is
-        # a security crate's CI, so the install step gets the same
-        # supply-chain treatment as everything else pinned by version here.
-        uses: taiki-e/install-action@v2
+        # A SHA-pinned action, not a `curl ... | bash` of a mutable branch —
+        # this is a security crate's CI, so the install step gets the same
+        # supply-chain treatment as every other action here.
+        uses: taiki-e/install-action@4cef1412cce204788f482e778a0b9187f9626a29 # v2.87.21
         with:
           tool: cargo-audit
 
@@ -164,10 +177,13 @@ jobs:
         run: cargo publish --dry-run
 
   msrv:
-    runs-on: self-hosted
+    runs-on: [self-hosted, linux, x64]
+    timeout-minutes: 30
     steps:
       - name: Checkout code
-        uses: actions/checkout@v7
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
 
       - name: Install system dependencies
         # `--all-features` below includes `native-tls` (OpenSSL).
@@ -190,12 +206,12 @@ jobs:
           echo "version=$version" >> "$GITHUB_OUTPUT"
 
       - name: Install MSRV toolchain
-        uses: dtolnay/rust-toolchain@master
+        uses: dtolnay/rust-toolchain@02cb101ec7c40f2c49e1d9714d64511d8e1b74de # master, 2026-09-12
         with:
           toolchain: ${{ steps.msrv.outputs.version }}
 
       - name: Cache cargo registry and build artifacts
-        uses: actions/cache@v5
+        uses: actions/cache@caa296126883cff596d87d8935842f9db880ef25 # v5.1.0
         with:
           path: |
             ~/.cargo/registry
@@ -207,12 +223,15 @@ jobs:
       - name: Build on MSRV (all features)
         # The explicit `+<version>` overrides rust-toolchain.toml, which would
         # otherwise select the pinned development toolchain in this directory.
-        run: cargo "+${{ steps.msrv.outputs.version }}" build --all-features --locked
+        env:
+          MSRV: ${{ steps.msrv.outputs.version }}
+        run: cargo "+${MSRV}" build --all-features --locked
 
   ci-pass:
     needs: [checks, msrv]
     if: always()
     runs-on: ubuntu-latest
+    timeout-minutes: 5
     steps:
       # `needs:` alone would make GitHub SKIP this job (not fail it) when
       # `checks` or `msrv` fails, and rulesets treat a skipped required check
@@ -223,9 +242,12 @@ jobs:
       # skipped, so anything but `success` (failure, cancelled, skipped)
       # fails the gate.
       - name: Require every upstream job to have succeeded
+        env:
+          CHECKS: ${{ needs.checks.result }}
+          MSRV: ${{ needs.msrv.result }}
         run: |
-          if [[ "${{ needs.checks.result }}" != "success" || "${{ needs.msrv.result }}" != "success" ]]; then
-            echo "::error::one or more required jobs did not succeed (checks=${{ needs.checks.result }}, msrv=${{ needs.msrv.result }})"
+          if [[ "$CHECKS" != "success" || "$MSRV" != "success" ]]; then
+            echo "::error::one or more required jobs did not succeed (checks=${CHECKS}, msrv=${MSRV})"
             exit 1
           fi
           echo "all required checks passed"

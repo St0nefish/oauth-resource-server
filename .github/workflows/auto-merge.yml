@@ -8,12 +8,16 @@ name: Auto-merge
 # GitHub starts no new workflow runs for events GITHUB_TOKEN causes, so a
 # merge made with it would trigger neither the post-merge CI run on `master`
 # (ci.yml's `push` trigger) nor `release.yml`. The App's id is the `APP_ID`
-# repo variable and its key the `APP_PRIVATE_KEY` repo secret. GitHub
-# withholds both from a run triggered by a fork's PR, so this job only works
-# for PRs from branches of this repository — which is the intent.
+# repo variable and its key the `APP_PRIVATE_KEY` repo secret; the token is
+# narrowed to the two permissions merging needs. GitHub withholds both from
+# a run triggered by a fork's PR, so this job only works for PRs from
+# branches of this repository — which is the intent.
+#
+# Actions are pinned to full commit SHAs, release in the trailing comment.
 
 on:
   pull_request:
+    branches: [master]
     types: [opened, synchronize, reopened]
 
 permissions:
@@ -25,13 +29,18 @@ jobs:
     # and can be merged manually after review, but must never land unattended.
     if: github.event.pull_request.user.login == 'St0nefish'
     runs-on: ubuntu-latest
+    timeout-minutes: 10
     steps:
       - name: Generate App token
         id: app-token
-        uses: actions/create-github-app-token@v2
+        uses: actions/create-github-app-token@bcd2ba49218906704ab6c1aa796996da409d3eb1 # v3.2.0
         with:
+          # `app-id` is deprecated in v3 in favor of `client-id`, but still
+          # accepted; the repo stores the App's numeric id as APP_ID.
           app-id: ${{ vars.APP_ID }}
           private-key: ${{ secrets.APP_PRIVATE_KEY }}
+          permission-contents: write
+          permission-pull-requests: write
 
       - name: Enable auto-merge
         run: gh pr merge "$PR_NUMBER" --auto --squash --repo "$REPO"

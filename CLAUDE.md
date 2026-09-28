@@ -393,10 +393,23 @@ this repo can alter directly — treat them as always-in-effect policy:
   rebase commits), and which auto-deletes a branch once its PR merges.
 - Workflow runs for a pull request from a fork need a maintainer's approval
   for every external contributor, not just first-time ones, because the
-  heavy jobs run on a self-hosted runner.
+  heavy jobs run on a self-hosted runner. That gate covers forks only:
+  Dependabot opens its PRs from branches of this repository, so they run on
+  the self-hosted runner without approval, and a dependency bump executes
+  the new upstream version's build scripts (and proc macros and tests)
+  there. That is accepted — the runner is ephemeral and CI jobs hold only a
+  read-only token — and it is why the job that can mint a crates.io token
+  never runs on that runner (see Release process).
 - A GitHub App's id (`APP_ID` repo variable) and private key
   (`APP_PRIVATE_KEY` repo secret) are what `auto-merge.yml` authenticates
   with.
+- A GitHub environment named `release`, deployable only from `master`, which
+  `release.yml`'s `publish` job runs in; crates.io trusted publishing is
+  bound to it.
+- Every action in `.github/workflows/` is pinned to a full commit SHA with
+  its release in a trailing `# vX.Y.Z` comment (`dtolnay/rust-toolchain`,
+  which has no releases, to a commit of its `master` branch). Keep it that
+  way when adding or bumping one.
 
 The flow:
 
@@ -433,40 +446,48 @@ The flow:
 
 - **Publishing happens on merge, driven by the version in `Cargo.toml`.**
   `.github/workflows/release.yml` runs on every push to `master` (and on
-  manual dispatch, which it refuses on any other branch). Its `check` job
-  asks the crates.io API whether `Cargo.toml`'s version exists: `200` means
-  already published, and the run finishes green with "nothing to publish";
-  `404` means publish it; any other answer fails the run rather than guess.
-  For a new version, `check` also requires a `## [X.Y.Z]` section in
-  `CHANGELOG.md` and refuses if a `vX.Y.Z` tag already exists. Then `verify`
-  (self-hosted, read-only, no OIDC permission) runs fmt/clippy/tests;
-  `publish` (self-hosted, the only job with `id-token: write`, running
-  nothing but checkout, toolchain, auth and publish, with no restored cache)
-  authenticates via `rust-lang/crates-io-auth-action` (a short-lived
-  OIDC-exchanged token; no long-lived token secret is ever stored in this
-  repo) and runs `cargo publish`; and `github-release` (`contents: write`
-  with `GITHUB_TOKEN`) creates the `vX.Y.Z` tag on the published commit and
-  a GitHub release whose notes are that CHANGELOG section. Keep build
+  manual dispatch; its `check` job fails on any other branch, which stops an
+  accidental dispatch — the `release` environment is what stops a modified
+  workflow on another ref). `check` asks the crates.io API whether
+  `Cargo.toml`'s version exists: `200` means already published, and the run
+  finishes green with "nothing to publish"; `404` means publish it; any
+  other answer fails the run rather than guess. For a new version, `check`
+  also requires a non-empty `## [X.Y.Z]` section in `CHANGELOG.md` and
+  refuses if a `vX.Y.Z` tag already exists. Then `verify` and `msrv`
+  (self-hosted, read-only, no OIDC permission) repeat `ci.yml`'s `checks`
+  and `msrv` jobs step for step — keep the lists in step; `publish`
+  (GitHub-hosted, in the `release` environment, the only job with
+  `id-token: write`, running nothing but checkout, toolchain, auth and
+  publish, with no restored cache) re-checks crates.io, then authenticates
+  via `rust-lang/crates-io-auth-action` (a short-lived OIDC-exchanged token;
+  no long-lived token secret is ever stored in this repo) and runs
+  `cargo publish`; and `github-release` (`contents: write` with
+  `GITHUB_TOKEN`) creates the `vX.Y.Z` tag on the published commit and a
+  GitHub release whose notes are that CHANGELOG section. Keep build
   scripts, proc macros and dev-dependencies out of the job that can mint the
-  token.
+  token, and keep that job off the self-hosted runner, which has its host's
+  Docker daemon socket mounted and runs unreviewed Dependabot code.
 - **To cut a release**, open a PR that bumps `version` in `Cargo.toml` and
   moves `CHANGELOG.md`'s `[Unreleased]` entries under `## [X.Y.Z] - <date>`
   (plus the link references at the bottom). Merging it publishes. Never push
   a `v*` tag by hand — the workflow creates it, and a pre-existing tag for
   an unpublished version stops the release.
-- If a run publishes but then fails (in `github-release`), re-run only the
-  failed job: it tags the same commit. A new run would see the version as
-  published and do nothing.
-- `release.yml` must keep its filename, and `publish` must not gain an
-  `environment:`: crates.io trusted publishing is registered for this
-  repository + `release.yml` + no environment.
+- A failed run is safe to re-run with "re-run failed jobs": `publish` skips
+  the upload and succeeds if the version is already on crates.io, and
+  `github-release` does nothing if the release exists. A fresh run would
+  instead see the version as published and stop at `check`.
+- `release.yml` must keep its filename, and `publish` must keep
+  `environment: release`: crates.io trusted publishing is registered for
+  this repository + `release.yml` + environment `release`, and that
+  environment only accepts deployments from `master`.
 - There is no deploy-hold switch: an ordinary merge publishes nothing, so
   batching changes into one release is only a matter of when the version is
   bumped.
 - **0.1.0 was published manually** with a personal crates.io API token,
   because crates.io only lets a trusted publisher be attached to a crate
-  that already exists. Trusted publishing was configured after that, and
-  every later release goes through `release.yml`.
+  that already exists. Trusted publishing was configured after that (bound
+  to environment `release` on `master`), and every later release goes
+  through `release.yml`.
 - **Repo setup**: private vulnerability reporting must be enabled —
   `gh api -X PUT repos/St0nefish/oauth-resource-server/private-vulnerability-reporting`
   (Settings → Code security → Private vulnerability reporting). It is off by

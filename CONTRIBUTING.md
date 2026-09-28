@@ -103,6 +103,9 @@ You don't need to keep your branch up to date with `master` — CI re-runs on
 Releases are published from `master` when a merged PR bumps `version` in
 `Cargo.toml` (with a matching `CHANGELOG.md` section): `release.yml` then
 publishes to crates.io and creates the `vX.Y.Z` tag and GitHub release.
+Publishing uses crates.io trusted publishing, bound to this repository's
+`release` GitHub environment, which only `master` can deploy to; no
+crates.io token is stored anywhere in the repository.
 Contributors don't bump the version or push tags — put your entry under
 `CHANGELOG.md`'s `[Unreleased]` section. See
 `.github/workflows/release.yml`'s header comment for the details.
