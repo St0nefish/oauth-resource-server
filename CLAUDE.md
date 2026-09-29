@@ -459,9 +459,12 @@ this repo can alter directly — treat them as always-in-effect policy:
   there (see Release process).
 - A GitHub App's Client ID (`APP_CLIENT_ID` repo variable) and private key
   (`APP_PRIVATE_KEY` repo secret) are what `auto-merge.yml` authenticates
-  with. The App deliberately lacks the `workflows` permission, so a PR that
-  changes a file under `.github/workflows/` fails the auto-merge job and is
-  merged by hand once `ci-pass` is green.
+  with. The App deliberately lacks the `workflows` permission. A PR that
+  changes a file under `.github/workflows/` still auto-merges when its
+  branch contains master's current version of those files; when master has
+  changed one of them since the branch was cut, the auto-merge job fails
+  (GitHub treats the squash as the App writing workflow content) and the PR
+  is refreshed from `master` or merged by hand once `ci-pass` is green.
 - A GitHub environment named `release`, whose deployment policy admits only
   `v*` tags, which `release.yml`'s `publish` job runs in; crates.io trusted
   publishing is bound to it.
