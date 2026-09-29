@@ -18,6 +18,7 @@
 |---|---|
 | [`OAuthConfig`], [`OAuthConfig::resolve`] | The unvalidated settings, and their all-or-nothing validation into a [`ResolvedOAuthConfig`] or a [`ConfigError`]. [`KeyNaming`] decides how problems name settings. |
 | [`OAuthValidator`] | Validates one token ([`OAuthValidator::validate`]), renders the challenges and the metadata document, and keeps the signing keys fresh ([`OAuthValidator::spawn_background_refresh`]). |
+| [`OAuthValidator::key_set_status`], [`KeySetStatus`], [`RefreshError`] | A passive, no-I/O view of the signing keys held, for readiness probes and status pages ([`OAuthValidator::is_ready`]). |
 | [`AuthorizedToken`], [`TokenRejection`] | The two outcomes of a validation. |
 | [`authenticate`], [`Credential`] | Framework-free checking of several candidate credentials against a static token and OAuth. |
 | [`Algorithm`], [`parse_algorithm`], [`AlgorithmError`] | The JWS algorithms a config may allow (never HMAC or `none`). |
@@ -116,7 +117,7 @@ pub use config::{
     ConfigError, DEFAULT_LEEWAY_SECS, DEFAULT_PRINCIPAL_CLAIMS, DEFAULT_SCOPE_CLAIMS, KeyNaming,
     KeyNamingBuf, MAX_LEEWAY_SECS, OAuthConfig, ResolvedOAuthConfig,
 };
-pub use jwks::RefreshError;
+pub use jwks::{KeySetStatus, RefreshError, RefreshErrorKind};
 pub use policy::{NoAuthConfigured, StaticTokenDecision, static_token_policy};
 pub use token::{AuthorizedToken, TokenRejection};
 pub use validator::{OAuthValidator, ValidatorError};

@@ -46,7 +46,7 @@
 //! ```
 
 use std::collections::HashMap;
-use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 
 use jsonwebtoken::{EncodingKey, Header, encode};
@@ -359,6 +359,15 @@ pub struct FakeJwksServer {
     /// Milliseconds to stall before answering — a slow IdP. Read when a
     /// connection is accepted, so a change applies to the next request.
     pub delay_ms: Arc<AtomicU64>,
+    /// While set, a request is counted in `hits` and then held until
+    /// `release` is notified (once per held request) — lets this crate's own
+    /// tests keep a fetch in flight for exactly as long as they need. Read
+    /// only by those tests, hence unused in a `testing`-feature build.
+    #[cfg_attr(not(test), allow(dead_code))]
+    pub(crate) hold: Arc<AtomicBool>,
+    /// See `hold`.
+    #[cfg_attr(not(test), allow(dead_code))]
+    pub(crate) release: Arc<tokio::sync::Notify>,
 }
 
 /// Answer every request, whatever its path, with one canned response.
@@ -391,6 +400,10 @@ pub async fn spawn_http_server(
     let fallback = Arc::new(fallback);
     let delay_ms = Arc::new(AtomicU64::new(0));
     let shared_delay = Arc::clone(&delay_ms);
+    let hold = Arc::new(AtomicBool::new(false));
+    let shared_hold = Arc::clone(&hold);
+    let release = Arc::new(tokio::sync::Notify::new());
+    let shared_release = Arc::clone(&release);
 
     tokio::spawn(async move {
         while let Ok((mut sock, _)) = listener.accept().await {
@@ -398,6 +411,8 @@ pub async fn spawn_http_server(
             let routes = Arc::clone(&shared_routes);
             let fallback = Arc::clone(&fallback);
             let delay = shared_delay.load(Ordering::SeqCst);
+            let hold = shared_hold.load(Ordering::SeqCst);
+            let release = Arc::clone(&shared_release);
             tokio::spawn(async move {
                 if delay > 0 {
                     tokio::time::sleep(std::time::Duration::from_millis(delay)).await;
@@ -415,6 +430,9 @@ pub async fn spawn_http_server(
                     }
                 }
                 counter.fetch_add(1, Ordering::SeqCst);
+                if hold {
+                    release.notified().await;
+                }
                 let request = String::from_utf8_lossy(&buf);
                 let path = request
                     .lines()
@@ -446,5 +464,7 @@ pub async fn spawn_http_server(
         hits,
         routes,
         delay_ms,
+        hold,
+        release,
     }
 }

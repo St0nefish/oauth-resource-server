@@ -768,6 +768,73 @@ the variant and in `Debug`, for your log.
 [`examples/standalone_validator.rs`](https://github.com/St0nefish/oauth-resource-server/blob/master/examples/standalone_validator.rs)
 walks through accepted and refused tokens against a fake authorization server.
 
+### Readiness and liveness probes
+
+`OAuthValidator::is_ready()` is true once at least one signing key is held;
+`OAuthValidator::key_set_status()` returns the detail (key count, the JWKS URL
+in use, when a refresh was last attempted and last succeeded, and the last
+refresh error). Neither does any I/O or waits on a refresh in flight, so a
+probe can poll them as often as it likes. `refresh_now()`, by contrast,
+fetches every time: keep it out of probes.
+
+```rust
+use std::sync::Arc;
+
+use axum::{Router, extract::State, http::StatusCode, routing::get};
+use oauth_resource_server::OAuthValidator;
+
+/// Readiness: this process can validate a token, because it holds at least
+/// one signing key.
+async fn ready(State(oauth): State<Arc<OAuthValidator>>) -> StatusCode {
+    if oauth.is_ready() {
+        StatusCode::OK
+    } else {
+        StatusCode::SERVICE_UNAVAILABLE
+    }
+}
+
+/// Liveness: the process is up and answering. Nothing about the
+/// authorization server belongs here.
+async fn live() -> StatusCode {
+    StatusCode::OK
+}
+
+/// Merge these OUTSIDE the auth layer, like `metadata_router`: a probe
+/// carries no token. For the same reason the handlers take no `Credential`
+/// or `AuthorizedToken` extractor, which answers 500 on a route no
+/// `AuthLayer` covers.
+fn probes(oauth: Arc<OAuthValidator>) -> Router {
+    Router::new()
+        .route("/readyz", get(ready))
+        .route("/livez", get(live))
+        .with_state(oauth)
+}
+```
+
+- **Readiness means keys are held.** A process with no key refuses every token
+  with a 401, so it should not be sent traffic yet. Once ready, it stays
+  ready: a failed refresh keeps the keys already held, so an identity-provider
+  outage after startup does not flip it back (tokens signed by those keys
+  still validate). If the first load fails, the background task retries after
+  5 s, doubling to at most 5 minutes, until keys load; that schedule, not
+  request traffic, is what makes the process ready once the identity provider
+  is reachable.
+- **Gating on `/readyz` needs `spawn_background_refresh()`** (or at the very
+  least a `refresh_now()` at startup). Without it keys are loaded only when a
+  request brings a token, and a process that is not ready receives no
+  requests: it would stay not-ready forever.
+- **Liveness must not depend on the identity provider.** A liveness failure
+  restarts the process, and a restart cannot fix an unreachable identity
+  provider: it throws away keys that were still good, and every replica
+  restarting at once during an outage turns the provider's problem into a
+  full outage of your service too, followed by a burst of key fetches as they
+  all come back.
+- `KeySetStatus::last_error`'s `Display` names the issuer and JWKS URLs
+  (with any userinfo or query redacted, as in `KeySetStatus::jwks_uri`) and
+  repeats upstream error text: fine for logs and an internal status page. On
+  a public endpoint, report `RefreshError::kind()` (`discovery`, `fetch`,
+  `parse`, `no_usable_keys`) instead.
+
 ## Configuration reference
 
 `OAuthConfig` is the unvalidated input. `OAuthConfig::resolve` checks it and
@@ -1155,8 +1222,12 @@ To switch from one audience to another without downtime, list both in
   the authorization server, its outage would take this service down too. Keys
   are loaded as soon as the refresh task starts and re-read hourly; a re-read
   that succeeds is what drops a key the server has withdrawn. A failed pass
-  is retried after a minute, backing off to an hour. The task stops when the
-  last `Arc` of the validator is dropped.
+  is retried after a minute, backing off to an hour — or, while no key is
+  held at all, after 5 s, backing off to 5 minutes, since a keyless process
+  refuses every token and a readiness probe keeps away the traffic that would
+  otherwise trigger a refetch. These retries are timer-driven; no request can
+  schedule one. The task stops when the last `Arc` of the validator is
+  dropped.
 - **An unknown `kid` refetches at most once a minute.** `kid` comes from an
   unverified header, so without a limit a stream of junk tokens would turn
   your service into an amplifier aimed at your identity provider.
@@ -1321,7 +1392,7 @@ no reason. The validator and key-set messages come from the targets
 | Startup error: `... uses plain http on a non-loopback host` | Use `https`, or set `allow_insecure_http` for an address on a trusted network (which then logs the same line as a startup `warn`). |
 | `JWKS refresh failed: ... jwks_uri "http://..." uses plain http on a non-loopback host` or `redirect to plain http on a non-loopback host ... refused` | A loopback `http` issuer's metadata, or a redirect during a key fetch, points at a cleartext non-loopback URL. Serve it over `https`, or set `allow_insecure_http` if that network is trusted (each use is then logged at `warn`). |
 | Startup error: `... is not a valid scope` | A scope with a space, `"`, `\` or non-printable character. Scopes are RFC 6749 scope-tokens. |
-| Startup `warn`: `OAuth: could not load the authorization server's signing keys` | The first background key load failed (unreachable issuer, discovery mismatch, TLS). Requests fail closed until a later attempt succeeds; the task retries after a minute, backing off to an hour. |
+| Startup `warn`: `OAuth: could not load the authorization server's signing keys` | The first background key load failed (unreachable issuer, discovery mismatch, TLS). Requests fail closed until a later attempt succeeds; with no key held the task retries after 5 s, backing off to 5 minutes (`retry_in_secs` in the log line). `key_set_status()` shows the last error; see [Readiness and liveness probes](#readiness-and-liveness-probes). |
 | `warn`: `JWKS key declares no alg, so it may verify any of ...` | A key in the set has no `alg`. Narrow `algorithms` to the algorithm your server signs with. |
 | A client never starts the login flow | The 401 lacks `WWW-Authenticate`, or the metadata is unreachable. Check that `metadata_router` is merged outside the auth layer, that no proxy strips the header, and that `resource` is the URL clients actually use. |
 | The metadata document is 404 | OAuth is off (`metadata_router(None)` answers 404), or the path does not match the path of `resource`. `OAuthValidator::metadata_path()` returns the path served. |

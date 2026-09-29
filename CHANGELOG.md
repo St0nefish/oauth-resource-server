@@ -49,6 +49,32 @@ Before 1.0, a breaking change increments the minor version.
   still refuses a layer with no static token and no validator.
 - A typed per-handler scope extractor is not included; it waits on
   per-request 403 challenges (oauth-resource-server#4).
+- `OAuthValidator::key_set_status()` returns a `KeySetStatus`
+  (`#[non_exhaustive]`): the number of usable signing keys held, the JWKS URL
+  in use (configured or discovered), when a refresh was last attempted and
+  last succeeded, and the last refresh error. `OAuthValidator::is_ready()` is
+  true once at least one key is held. Both are synchronous and passive — no
+  I/O, and they never wait on a refresh in flight — so a readiness probe, a
+  status page or a metrics scrape can poll them; `refresh_now()` fetches
+  every time and does not belong in a probe. The README has a
+  readiness/liveness probe recipe
+  (oauth-resource-server#9).
+- `RefreshError::kind()` and the `#[non_exhaustive]` `RefreshErrorKind`
+  (`Discovery`, `Fetch`, `Parse`, `NoUsableKeys`, with `as_str()` labels): the
+  stage a key refresh failed at, safe to show where the full error message
+  (which names URLs and repeats upstream error text) is not.
+
+### Security
+
+- Log lines and key-refresh errors (`RefreshError`'s `Display`/`Debug`) now
+  redact any userinfo (`https://user:pass@…` → `https://***@…`), query
+  (`?***`) and fragment (`#***`) in the issuer, JWKS and discovery URLs they
+  name, and quote upstream HTTP errors without the URL they would otherwise
+  repeat. `resolve` accepts userinfo in `issuer`/`jwks_uri`, and the fetch
+  sends it as HTTP Basic auth, so earlier releases could write that
+  credential (or a secret query parameter) to the log. The fetch still uses
+  the URL unchanged. The new `KeySetStatus::jwks_uri` is redacted the same
+  way.
 
 ### Changed
 
@@ -59,6 +85,15 @@ Before 1.0, a breaking change increments the minor version.
   `serde::de::DeserializeOwned`);
   the `serde` feature still exists and now only enables its derive macros. The
   `testing` feature no longer names `serde`.
+- After a failed background key refresh while **no** key is held (the first
+  load failed and none has succeeded since), `spawn_background_refresh` now
+  retries after 5 s, doubling to at most 5 minutes, instead of after a minute
+  doubling to an hour. A keyless validator refuses every token, and a
+  readiness probe keeps away the traffic that would otherwise trigger a
+  refetch, so it previously could stay keyless for up to an hour after the
+  identity provider recovered. Once any key is held the schedule is
+  unchanged (an hour between passes; a failed pass retried after a minute,
+  doubling to an hour), as is the once-a-minute unknown-`kid` refetch limit.
 - Minimum versions of direct dependencies raised, checked with `cargo
   update -Z direct-minimal-versions`: `jsonwebtoken` 9 -> 9.2 and `tokio`
   1 -> 1.15 (the next-older releases tried do not compile), plus `tracing`
