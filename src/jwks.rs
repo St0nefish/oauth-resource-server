@@ -247,36 +247,48 @@ impl KeySetStatus {
 }
 
 /// `raw` with any credential it may carry masked, for a log line, an error
-/// message or [`KeySetStatus::jwks_uri`]: userinfo (user, or user and
-/// password) becomes `***@`, a query `?***` and a fragment `#***`. Scheme,
-/// host, port and path are kept, so the endpoint stays identifiable. A URL
-/// with none of the three comes back exactly as given; one that does not
+/// message, a `Debug` impl or [`KeySetStatus::jwks_uri`]: userinfo (user, or
+/// user and password) becomes `***@`, a query `?***` and a fragment `#***`.
+/// Scheme, host, port and path are kept, so the endpoint stays identifiable. A
+/// URL with none of the three comes back exactly as given; one that does not
 /// parse as a URL with a host comes back as a fixed placeholder, since there
 /// is then no telling where a credential in it might be. Never panics.
 pub(crate) fn redact_url(raw: &str) -> String {
-    const UNPARSEABLE: &str = "<unparseable URL, redacted>";
+    try_redact_url(raw).unwrap_or_else(|| "<unparseable URL, redacted>".to_string())
+}
+
+/// A URL for a `Debug` impl: blank stays as given (an unset field), anything
+/// else goes through [`redact_url`].
+pub(crate) fn debug_url(raw: &str) -> String {
+    if raw.trim().is_empty() {
+        raw.to_string()
+    } else {
+        redact_url(raw)
+    }
+}
+
+/// [`redact_url`], but `None` where it would return its placeholder — for a
+/// message that can say something more useful than the placeholder (that the
+/// value is not an absolute URL with a host) without echoing the value.
+pub(crate) fn try_redact_url(raw: &str) -> Option<String> {
     // No host means no telling userinfo from path: `alice:s3cret@idp/jwks`
     // parses as scheme `alice` with an opaque path.
-    let Ok(mut url) = reqwest::Url::parse(raw) else {
-        return UNPARSEABLE.to_string();
-    };
-    if url.host_str().is_none() {
-        return UNPARSEABLE.to_string();
-    }
+    let mut url = reqwest::Url::parse(raw).ok()?;
+    url.host_str()?;
     // An `@` the parser did not read as the userinfo separator means the
     // input is not the URL it looks like — `http://alice:1234/s3cret@host`
     // is host `alice`, port `1234`, path `/s3cret@host` — and a credential
     // may sit in what parsed as host, port or path. (One in the query or
     // fragment is masked below anyway.)
     if url.path().contains('@') {
-        return UNPARSEABLE.to_string();
+        return None;
     }
     let userinfo = !url.username().is_empty() || url.password().is_some();
     if !userinfo && url.query().is_none() && url.fragment().is_none() {
-        return raw.to_string();
+        return Some(raw.to_string());
     }
     if userinfo && (url.set_password(None).is_err() || url.set_username("***").is_err()) {
-        return UNPARSEABLE.to_string();
+        return None;
     }
     if url.query().is_some() {
         url.set_query(Some("***"));
@@ -284,7 +296,7 @@ pub(crate) fn redact_url(raw: &str) -> String {
     if url.fragment().is_some() {
         url.set_fragment(Some("***"));
     }
-    url.to_string()
+    Some(url.to_string())
 }
 
 /// `err` and every `source()` below it, joined with `": "`.

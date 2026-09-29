@@ -217,11 +217,13 @@ pub struct OAuthValidator {
     alive: tokio::sync::watch::Sender<()>,
 }
 
+/// Hand-written: prints the issuer and resource through `redact_url`, so a
+/// credential in either never reaches a log line through `{:?}`.
 impl std::fmt::Debug for OAuthValidator {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("OAuthValidator")
-            .field("issuer", &self.config.issuer)
-            .field("resource", &self.config.resource)
+            .field("issuer", &redact_url(&self.config.issuer))
+            .field("resource", &redact_url(&self.config.resource))
             .field("required_scopes", &self.config.required_scopes)
             .finish_non_exhaustive()
     }
