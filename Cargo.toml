@@ -86,8 +86,9 @@ jsonwebtoken = "9.2"
 # feature beyond TLS is needed.
 reqwest = { version = "0.12", default-features = false }
 # Decodes the JWS protected header's raw JSON, to see members the JWT library's
-# `Header` type drops (`crit`). The major version jsonwebtoken 9 already
-# compiles, so it adds no crate to the build.
+# `Header` type drops (`crit`). Two base64 versions are in the build either
+# way — jsonwebtoken 9 uses 0.22, reqwest's hyper-util 0.23 — so this tracks
+# the newer one; it adds no crate. Never part of the public API.
 base64 = "0.23"
 serde_json = "1.0.64"
 tokio = { version = "1.15", features = ["sync", "time", "rt"] }
