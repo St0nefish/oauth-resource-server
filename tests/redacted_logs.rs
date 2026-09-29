@@ -211,6 +211,33 @@ async fn a_credential_in_a_url_never_reaches_a_log_line() {
         assert!(text.contains(setting), "{setting}: {text}");
     }
 
+    // 7. An explicit proxy carrying a credential: the build-time cleartext
+    //    warning for a plain-http, non-loopback proxy, then a background
+    //    refresh failing through it (nothing listens there). A refused proxy
+    //    URL's error and the builder's `Debug` are checked too.
+    let mut cfg = testing::resolved_config("https://idp.example.test/jwks");
+    cfg.allow_insecure_http = true;
+    let builder = OAuthValidator::builder(&cfg).proxy("http://alice:s3cret@0.0.0.0:1");
+    let shown = format!("{builder:?}");
+    let v = Arc::new(builder.build().unwrap());
+    let task = v.spawn_background_refresh();
+    failures += 1;
+    logs.wait_for(FAILED, failures).await;
+    task.abort();
+    assert!(
+        logs.text().contains("the proxy URL carries a credential"),
+        "{}",
+        logs.text()
+    );
+    let err = OAuthValidator::builder(&cfg)
+        .proxy("http://alice:s3cret@proxy.example.test/p?key=t0ken")
+        .build()
+        .unwrap_err();
+    let shown = format!("{shown} {err} {err:?} {:?}", v.key_set_status());
+    for secret in SECRETS {
+        assert!(!shown.contains(secret), "{secret} leaked into: {shown}");
+    }
+
     let logged = logs.text();
     for secret in SECRETS {
         assert!(!logged.contains(secret), "{secret} leaked into: {logged}");
