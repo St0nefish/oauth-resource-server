@@ -268,6 +268,51 @@ write check. You can also put a second layer with its own validator on those
 routes. Scopes are matched exactly, with no hierarchy: if your authorization
 server means `api:write` to imply `api:read`, check for either here.
 
+### Reading the verified claims
+
+Beyond `subject`, `principal` and `scopes`, an `AuthorizedToken` carries what
+the signature covered, so a handler never decodes the JWT a second time:
+`issuer`, `audiences` (a single-string `aud` normalized to a list),
+`expires_at`, `issued_at`, `client_id` (RFC 9068 `client_id`, else `azp`) and
+`jti`. Everything else, such as `groups`, `roles`, `email` or a tenant id, is
+in the claim set: `claims()` returns it raw, and `claims_as::<T>()`
+deserializes it into your own type.
+
+```rust
+use std::time::SystemTime;
+
+use axum::Extension;
+use oauth_resource_server::AuthorizedToken;
+use serde::Deserialize;
+
+#[derive(Deserialize)]
+struct MyClaims {
+    #[serde(default)]
+    groups: Vec<String>,
+}
+
+async fn admin_only(Extension(token): Extension<AuthorizedToken>) -> String {
+    let groups = token.claims_as::<MyClaims>().map(|c| c.groups).unwrap_or_default();
+    if !groups.iter().any(|g| g == "admins") {
+        return "not an admin".to_string();
+    }
+    // Close a long-lived stream when the token behind it expires.
+    let left = token.expires_at.duration_since(SystemTime::now()).unwrap_or_default();
+    format!(
+        "client {:?}, token valid for another {}s",
+        token.client_id,
+        left.as_secs()
+    )
+}
+```
+
+The claims are exactly what the signature covered, and they are bounded by the
+16 KiB credential cap. They can hold personal data, so `Debug` on an
+`AuthorizedToken` prints claim *names* only, never values. In a test, build a
+token with `AuthorizedToken::new(..)` and the `with_claims` / `with_client_id`
+/ `with_expires_at` (and so on) builders; `new` leaves `expires_at` at the year
+2100 so a fixture is never already expired.
+
 ## More quickstarts
 
 ### Configuration from environment variables
@@ -791,7 +836,8 @@ For each candidate credential, `OAuthValidator::validate`:
 5. **Checks scopes.** The token must carry every required scope, or it is
    refused with `InsufficientScope` (403), not 401.
 
-The result is an `AuthorizedToken` (`subject`, `principal`, `scopes`) or a
+The result is an `AuthorizedToken` (`subject`, `principal`, `scopes`, plus the
+verified claims and token metadata) or a
 `TokenRejection` (`Missing`, `Invalid(reason)` or `InsufficientScope`).
 
 ### Guarantees

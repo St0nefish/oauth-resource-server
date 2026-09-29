@@ -8,10 +8,32 @@ Before 1.0, a breaking change increments the minor version.
 
 ## [Unreleased]
 
-No public API or behavior changes.
+### Added
+
+- `AuthorizedToken` now carries the verified claims and token metadata, so a
+  handler no longer decodes the JWT a second time: `issuer`, `audiences` (a
+  string `aud` normalized to a list), `expires_at`, `issued_at`, `client_id`
+  (`client_id`, else `azp`) and `jti`, plus `claims()` (the raw claim map) and
+  `claims_as::<T>()` (deserialize it into your own type). They are filled from
+  the claims the single signature-verifying decode already produced; no
+  validation check changed. The struct is `#[non_exhaustive]`, so this is not
+  a breaking change. `AuthorizedToken::new` is unchanged and defaults the new
+  fields (empty issuer, audiences and claims; `expires_at` 2100-01-01), and
+  `with_claims`, `with_issuer`, `with_audiences`, `with_expires_at`,
+  `with_issued_at`, `with_client_id` and `with_jti` set them for handler tests.
+  A fractional `exp`/`iat` is rounded as `jsonwebtoken` rounds it, and one beyond
+  9999-12-31T23:59:59Z saturates to that instant.
+  Closes #6.
 
 ### Changed
 
+- `AuthorizedToken`'s `Debug` no longer derives: it prints every field but shows
+  the verified claims as names only, since claim values can be personal data.
+- The `serde` crate is now always compiled (it was already in every build,
+  through `jsonwebtoken` and `reqwest`, and `claims_as` is bounded by
+  `serde::de::DeserializeOwned`);
+  the `serde` feature still exists and now only enables its derive macros. The
+  `testing` feature no longer names `serde`.
 - Minimum versions of direct dependencies raised, checked with `cargo
   update -Z direct-minimal-versions`: `jsonwebtoken` 9 -> 9.2 and `tokio`
   1 -> 1.15 (the next-older releases tried do not compile), plus `tracing`

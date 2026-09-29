@@ -67,6 +67,8 @@ pub enum ValidatorError {
 }
 
 /// The outcome of a cache-only validation attempt (`OAuthValidator::validate_cached`).
+// One value per request, moved straight out: boxing the token buys nothing.
+#[allow(clippy::large_enum_variant)]
 pub(crate) enum CachedAttempt {
     /// Decided without any key fetch: accepted, or refused for a reason a
     /// fetch could not change.
@@ -710,11 +712,9 @@ impl OAuthValidator {
             return Err(TokenRejection::InsufficientScope);
         }
 
-        Ok(AuthorizedToken {
-            subject,
-            principal,
-            scopes,
-        })
+        Ok(AuthorizedToken::from_verified_claims(
+            claims, subject, principal, scopes,
+        ))
     }
 
     /// Load (or reload) the key set now, discovering the JWKS URI first if needed.
@@ -2831,5 +2831,180 @@ mod tests {
         )
         .await;
         assert!(t.has_scope("mcp:read"));
+    }
+
+    // ── verified claims and token metadata ───────────────────────────────────
+
+    fn at(secs: u64) -> std::time::SystemTime {
+        std::time::UNIX_EPOCH + std::time::Duration::from_secs(secs)
+    }
+
+    #[tokio::test]
+    async fn issuer_expiry_and_audience_string_are_filled_from_the_token() {
+        let exp = now() + 1800;
+        let t = scopes_of(serde_json::json!({"scope": "mcp:read", "exp": exp}))
+            .await
+            .unwrap();
+        assert_eq!(t.issuer, ISSUER);
+        assert_eq!(t.audiences, [AUDIENCE]);
+        assert_eq!(t.expires_at, at(exp));
+    }
+
+    #[tokio::test]
+    async fn audience_array_is_normalized_to_a_list() {
+        let t = scopes_of(serde_json::json!({
+            "scope": "mcp:read", "aud": ["https://other.example.test", AUDIENCE],
+        }))
+        .await
+        .unwrap();
+        assert_eq!(t.audiences, ["https://other.example.test", AUDIENCE]);
+    }
+
+    #[tokio::test]
+    async fn client_id_claim_wins_over_azp() {
+        let t = scopes_of(serde_json::json!({
+            "scope": "mcp:read", "client_id": "client-1", "azp": "client-2",
+        }))
+        .await
+        .unwrap();
+        assert_eq!(t.client_id.as_deref(), Some("client-1"));
+    }
+
+    #[tokio::test]
+    async fn client_id_falls_back_to_azp() {
+        let t = scopes_of(serde_json::json!({"scope": "mcp:read", "azp": "client-2"}))
+            .await
+            .unwrap();
+        assert_eq!(t.client_id.as_deref(), Some("client-2"));
+    }
+
+    #[tokio::test]
+    async fn client_id_is_none_without_client_id_or_azp() {
+        let t = scopes_of(serde_json::json!({"scope": "mcp:read"}))
+            .await
+            .unwrap();
+        assert_eq!(t.client_id, None);
+        // An empty or non-string value is not a client id either.
+        let t = scopes_of(serde_json::json!({"scope": "mcp:read", "client_id": "", "azp": 7}))
+            .await
+            .unwrap();
+        assert_eq!(t.client_id, None);
+    }
+
+    #[tokio::test]
+    async fn issued_at_is_read_when_present_and_none_when_absent() {
+        let iat = now() - 60;
+        let t = scopes_of(serde_json::json!({"scope": "mcp:read", "iat": iat}))
+            .await
+            .unwrap();
+        assert_eq!(t.issued_at, Some(at(iat)));
+        let t = scopes_of(serde_json::json!({"scope": "mcp:read"}))
+            .await
+            .unwrap();
+        assert_eq!(t.issued_at, None);
+    }
+
+    #[tokio::test]
+    async fn jti_is_read_when_present_and_none_when_absent() {
+        let t = scopes_of(serde_json::json!({"scope": "mcp:read", "jti": "id-42"}))
+            .await
+            .unwrap();
+        assert_eq!(t.jti.as_deref(), Some("id-42"));
+        let t = scopes_of(serde_json::json!({"scope": "mcp:read"}))
+            .await
+            .unwrap();
+        assert_eq!(t.jti, None);
+    }
+
+    #[tokio::test]
+    async fn claims_returns_custom_claims_and_claims_as_round_trips() {
+        #[derive(serde::Deserialize, Debug, PartialEq)]
+        struct AppClaims {
+            sub: String,
+            email: String,
+            groups: Vec<String>,
+            #[serde(default)]
+            tenant: Option<String>,
+        }
+        let t = scopes_of(serde_json::json!({
+            "scope": "mcp:read",
+            "email": "ada@example.com",
+            "groups": ["admins", "dev"],
+        }))
+        .await
+        .unwrap();
+        assert_eq!(t.claims()["groups"], serde_json::json!(["admins", "dev"]));
+        assert_eq!(t.claims()["iss"], ISSUER);
+        let typed: AppClaims = t.claims_as().unwrap();
+        assert_eq!(
+            typed,
+            AppClaims {
+                sub: "user-1".into(),
+                email: "ada@example.com".into(),
+                groups: vec!["admins".into(), "dev".into()],
+                tenant: None,
+            }
+        );
+        // A shape mismatch is an error, not a panic.
+        #[derive(serde::Deserialize, Debug)]
+        struct NeedsTenant {
+            #[allow(dead_code)]
+            tenant: String,
+        }
+        assert!(t.claims_as::<NeedsTenant>().is_err());
+    }
+
+    #[tokio::test]
+    async fn debug_shows_claim_names_but_never_claim_values() {
+        let t = scopes_of(serde_json::json!({
+            "scope": "mcp:read", "email": "private-address@example.com",
+        }))
+        .await
+        .unwrap();
+        let shown = format!("{t:?}");
+        assert!(shown.contains("\"email\""));
+        assert!(!shown.contains("private-address@example.com"));
+    }
+
+    #[tokio::test]
+    async fn an_out_of_range_exp_and_iat_saturate_instead_of_reading_as_expired() {
+        // jsonwebtoken accepts an `exp` up to u64::MAX; SystemTime cannot hold it.
+        let t = scopes_of(serde_json::json!({
+            "scope": "mcp:read",
+            "exp": 10_000_000_000_000_000_000u64,
+            "iat": 10_000_000_000_000_000_000u64,
+        }))
+        .await
+        .unwrap();
+        let max = at(253_402_300_799);
+        assert_eq!(t.expires_at, max);
+        assert_eq!(t.issued_at, Some(max));
+    }
+
+    #[tokio::test]
+    async fn fractional_exp_and_iat_are_rounded_like_jsonwebtoken_rounds_them() {
+        // jsonwebtoken (`numeric_type`) does `value.round() as u64` before it
+        // checks `exp`, so `base + 0.5` reads as `base + 1` (half away from zero).
+        let base = now() + 1000;
+        let iat = now() - 100;
+        let t = scopes_of(serde_json::json!({
+            "scope": "mcp:read",
+            "exp": base as f64 + 0.5,
+            "iat": iat as f64 + 0.4,
+        }))
+        .await
+        .unwrap();
+        assert_eq!(t.expires_at, at(base + 1));
+        assert_eq!(t.issued_at, Some(at(iat)));
+    }
+
+    #[tokio::test]
+    async fn a_string_iat_is_ignored_and_the_token_is_still_accepted() {
+        // jsonwebtoken never reads `iat`, so a token with a junk one validates
+        // today; issued_at is just None.
+        let t = scopes_of(serde_json::json!({"scope": "mcp:read", "iat": "yesterday"}))
+            .await
+            .unwrap();
+        assert_eq!(t.issued_at, None);
     }
 }

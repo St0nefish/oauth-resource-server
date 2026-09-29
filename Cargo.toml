@@ -42,14 +42,14 @@ rustls-tls-native-roots = ["reqwest/rustls-tls-native-roots"]
 # The platform TLS library (OpenSSL on Linux), trusting the OS store.
 native-tls = ["reqwest/native-tls"]
 # `Deserialize`/`Serialize` on the config types (`OAuthConfig`).
-serde = ["dep:serde"]
+serde = ["serde/derive"]
 # `env` module: load the config from environment variables (with `VAR_FILE`).
 env = []
 # `axum` module: authentication middleware and the RFC 9728 metadata routes.
 axum = ["dep:axum", "dep:http", "dep:tower-layer", "dep:tower-service"]
 # `testing` module: throwaway keys, token minting and a fake JWKS server for
 # CONSUMERS' TESTS. Never enable this in a production build.
-testing = ["tokio/net", "tokio/io-util", "dep:serde"]
+testing = ["tokio/net", "tokio/io-util"]
 
 # Lower bounds are checked by CI's `minimal-versions` job (`cargo update -Z
 # direct-minimal-versions`, then a build with dev-dependencies removed). A
@@ -95,9 +95,12 @@ tracing = "0.1.29"
 subtle = "2.5"
 thiserror = "2"
 
-# Enabled by the `serde` feature (config derives) and by `testing` (its minting
-# helpers take any `Serialize` claims).
-serde = { version = "1.0.152", features = ["derive"], optional = true }
+# Always built: `AuthorizedToken::claims_as` is bounded by `serde::de::DeserializeOwned`,
+# and `serde` is already in every build of this crate, through `jsonwebtoken` and
+# `reqwest` (`serde_json` itself now builds on `serde_core`), so it adds no crate.
+# The `serde` feature only switches on the `derive` macros (config derives); the
+# `testing` minting helpers take any `Serialize` claims.
+serde = "1.0.152"
 
 axum = { version = "0.8", optional = true, default-features = false, features = ["json"] }
 http = { version = "1", optional = true }
