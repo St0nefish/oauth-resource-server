@@ -110,6 +110,13 @@ response body are byte-for-byte what 0.1 sent.
     `ClaimMismatch`; new `ProblemKind` variants `TokenAgeOutOfRange`,
     `InvalidRequiredClaim` (a blank `allowed_client_ids` entry is
     `EmptyListEntry`); new constant `MAX_TOKEN_AGE_SECS`.
+- **Problem text can show a URL redacted.** A downstream test that pins
+  `ConfigError` message text may see a URL value that carried a credential
+  (userinfo, or a `jwks_uri` query) redacted and normalized, with
+  `(shown normalized, credential masked)` appended, instead of the raw
+  value it quoted before (oauth-resource-server#38, described under Security
+  below). Message text was never a stable API; match
+  `ConfigProblem::kind()` and `keys()` instead.
 - `Cargo.toml`'s version is `0.2.0`.
 
 ### Added
@@ -347,6 +354,32 @@ response body are byte-for-byte what 0.1 sent.
   credential (or a secret query parameter) to the log. The fetch still uses
   the URL unchanged. The new `KeySetStatus::jwks_uri` is redacted the same
   way.
+- The `Debug` output of `OAuthConfig`, `ResolvedOAuthConfig`,
+  `OAuthValidator` and `AuthorizedToken` (its `issuer`), and so of
+  `EnvOAuthConfig`, `AuthLayer`, `HttpAuthLayer` and their builders, which
+  print them, now redacts the `issuer`, `jwks_uri` and `resource` URLs the
+  same way (oauth-resource-server#38). `OAuthConfig`
+  and `ResolvedOAuthConfig` had derived `Debug`, and the validator printed
+  its issuer and resource raw, so `debug!(?config)` or `?layer` could write
+  a URL's credential to the log. Every other field prints as before, and
+  both types still implement `Debug`, `Clone`, `PartialEq` and (with
+  `serde`) `Deserialize`/`Serialize`.
+- `ConfigError` problems about a URL setting (`ProblemKind::InvalidUrl`,
+  `InsecureHttp`) now quote the redacted URL instead of the raw value, in
+  `Display`, `problems` and `problem_details()` alike, followed by
+  "(shown normalized, credential masked)" when masking changed it. A value
+  that does not parse as an absolute URL, one with no host, or one with an
+  `@` inside what parsed as its path (`http://alice:1234/s3cret@host`) is
+  quoted only when it cannot hold a credential (no `@`, `?` or `#`, and only
+  visible ASCII, truncated to 128 characters); otherwise the problem names
+  the setting and what is wrong with it, without the value. Only the message
+  text changes, which is not part of the semver contract; the kinds and keys
+  are unchanged, and no input is newly refused.
+- `RejectContext`'s `Debug` (both layers' `on_reject` callback argument) now
+  prints the request's path, with `?***` in place of any query, instead of
+  the full URI: a client may send its bearer token as an `access_token`
+  query parameter (RFC 6750 §2.3). The layers' own log lines already
+  printed the path only.
 - A plain-`http` `issuer`, `jwks_uri` or `resource` on a non-loopback host
   now needs `allow_insecure_http` however it is spelled. The check tested
   whether the raw string began with `http://`, while the URL parser, and

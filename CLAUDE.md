@@ -315,7 +315,10 @@ piece of code so a change to any of them is a deliberate, reviewable act:
   token, and `StaticTokens` hand-writes `Debug` to print its count and labels
   only (the layers print their `Gate`'s set that way) — it has no
   `PartialEq`, which would compare secrets in variable time; `RejectContext` (defined in `http_layer.rs`, re-exported from `axum`)
-  hand-writes `Debug` to print header names only, and `http_layer::Gate::admit`
+  hand-writes `Debug` to print header names only and the request path with
+  any query as `?***` (`redacted_request_uri`; RFC 6750 §2.3 lets a client
+  send `access_token` there — `tests/redacted_request_uri.rs` pins both
+  layers' callback and logs), and `http_layer::Gate::admit`
   (both layers) marks every configured credential header
   `set_sensitive(true)` before the callback or the inner service sees it;
   `env::EnvError`'s `Display`/`Debug` never include a secret's value (only
@@ -330,9 +333,21 @@ piece of code so a change to any of them is a deliberate, reviewable act:
   and so do both layers' own refusal logs (`uri.path()`, no query, so no URL
   there needs `redact_url`). `resolve` accepts userinfo in `issuer`/`jwks_uri` (sent as Basic auth) and
   a query in `jwks_uri`, so every URL this crate displays — in a log line,
-  a `RefreshError` message, `KeySetStatus::jwks_uri` — goes through
+  a `RefreshError` message, `KeySetStatus::jwks_uri`, a `check_url` or
+  plain-http `ConfigError` problem, and the `Debug` of `OAuthConfig`,
+  `ResolvedOAuthConfig` (both hand-written, destructuring every field so a
+  new one cannot be skipped), `OAuthValidator` (which `EnvOAuthConfig`,
+  both layers and their builders print through) and `AuthorizedToken`'s
+  `issuer` (`jwks::debug_url`: blank stays blank) — goes through
   `jwks::redact_url` (`***@`, `?***`, `#***`; a placeholder for anything
-  unparseable), and a quoted `reqwest` error has its URL stripped
+  unparseable; `tests/redacted_debug.rs` pins the `Debug` and problem
+  sides). A problem message (`config::shown`) quotes `try_redact_url`'s
+  result, marked "(shown normalized, credential masked)" when that differs
+  from the raw value; where it is `None` (no parse, no host, an `@` in the
+  path), `shown_unparsed` quotes the raw value (truncated by `for_log`)
+  only if it has no `@`, `?` or `#` and is all visible ASCII — no
+  userinfo, query or fragment is then possible — and otherwise names the
+  setting alone. A quoted `reqwest` error has its URL stripped
   (`without_url`). The URL actually fetched is never altered. The
   `OAuthValidatorBuilder::proxy` URL may carry a credential too: its
   hand-written `Debug` prints only whether one is set,

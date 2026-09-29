@@ -210,6 +210,24 @@ async fn a_credential_in_a_url_never_reaches_a_log_line() {
     ] {
         assert!(text.contains(setting), "{setting}: {text}");
     }
+    //    The non-canonical-spelling warning, for a jwks_uri the parser has to
+    //    repair, carrying both secrets; and the validator's own `Debug`.
+    let mut cfg = testing::resolved_config("https:/alice:s3cret@idp.example.test/keys?key=t0ken");
+    cfg.issuer = "https://alice:s3cret@idp.example.test/app/".into();
+    let v = OAuthValidator::new(&cfg).unwrap();
+    let text = logs.text();
+    assert!(
+        text.contains("jwks_uri \"https://***@idp.example.test/keys?***\" is not canonically"),
+        "{text}"
+    );
+    let shown = format!("{v:?} {cfg:?}");
+    assert!(
+        shown.contains("https://***@idp.example.test/app/"),
+        "{shown}"
+    );
+    for secret in SECRETS {
+        assert!(!shown.contains(secret), "{secret} leaked into: {shown}");
+    }
 
     // 7. An explicit proxy carrying a credential: the build-time cleartext
     //    warning for a plain-http, non-loopback proxy, then a background

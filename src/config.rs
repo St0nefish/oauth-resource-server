@@ -14,6 +14,8 @@ use std::fmt;
 use serde_json::Value;
 
 use crate::algorithms::{Algorithm, DEFAULT_ALGORITHMS, parse_algorithm};
+use crate::jwks::{debug_url, try_redact_url};
+use crate::token::for_log;
 use crate::validator::plain_http_non_loopback;
 
 /// Default [`OAuthConfig::scope_claims`]. `scope` is RFC 9068 §2.2.3's
@@ -469,7 +471,11 @@ impl fmt::Display for ConfigError {
 /// `#[non_exhaustive]`; adding a field is still a breaking change under
 /// `0.x` (a new minor release, which Cargo treats as incompatible), just not
 /// for the functional-record-update form above.
-#[derive(Debug, Clone, PartialEq, Eq)]
+///
+/// `Debug` is hand-written: `issuer`, `jwks_uri` and `resource` are shown with
+/// any userinfo, query or fragment masked (`***@`, `?***`, `#***`), since a
+/// URL may carry a credential; every other field prints as a derive would.
+#[derive(Clone, PartialEq, Eq)]
 #[cfg_attr(feature = "serde", derive(serde::Deserialize, serde::Serialize))]
 #[cfg_attr(feature = "serde", serde(deny_unknown_fields))]
 pub struct OAuthConfig {
@@ -495,7 +501,9 @@ pub struct OAuthConfig {
     ///
     /// Userinfo (`https://user:pass@…`) is accepted, and sent as HTTP Basic
     /// auth on the discovery fetches; this crate redacts it wherever it
-    /// displays the URL (log lines, [`crate::RefreshError`]). The issuer is
+    /// displays the URL (log lines, [`crate::RefreshError`], configuration
+    /// problems, the `Debug` output of the config types, the validator and the
+    /// layers). The issuer is
     /// also published verbatim in the RFC 9728 metadata document, though, so
     /// a credential does not belong in it.
     #[cfg_attr(feature = "serde", serde(default))]
@@ -511,7 +519,9 @@ pub struct OAuthConfig {
     /// Userinfo (`https://user:pass@…`, sent as HTTP Basic auth) and a query
     /// (`…/jwks?key=…`) are accepted and used unchanged for the fetch; this
     /// crate redacts both wherever it displays the URL (log lines,
-    /// [`crate::RefreshError`], [`crate::KeySetStatus::jwks_uri`]).
+    /// [`crate::RefreshError`], [`crate::KeySetStatus::jwks_uri`],
+    /// configuration problems, the `Debug` output of the config types, the
+    /// validator and the layers).
     #[cfg_attr(
         feature = "serde",
         serde(default, skip_serializing_if = "Option::is_none")
@@ -560,7 +570,9 @@ pub struct OAuthConfig {
     /// It is published verbatim in the RFC 9728 metadata document and in the
     /// `resource_metadata` of every `WWW-Authenticate` challenge, so it must
     /// never carry a credential (userinfo is not refused, but has no place
-    /// here).
+    /// here). This crate's own displays of it — log lines, configuration
+    /// problems, `Debug` — redact any userinfo, query or fragment all the
+    /// same; the published document and challenges cannot.
     #[cfg_attr(feature = "serde", serde(default))]
     pub resource: String,
     /// A scope every token must carry. A valid token missing it gets 403
@@ -835,6 +847,58 @@ pub struct OAuthConfig {
     pub required_claims: BTreeMap<String, Value>,
 }
 
+/// Hand-written so a credential in a URL setting never reaches a log line
+/// through `{:?}`.
+impl fmt::Debug for OAuthConfig {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        // Destructured so a new field cannot be left out by accident.
+        let Self {
+            enabled,
+            issuer,
+            jwks_uri,
+            audience,
+            audiences,
+            resource,
+            required_scope,
+            required_scopes,
+            scopes_supported,
+            scope_claims,
+            principal_claims,
+            algorithms,
+            leeway_secs,
+            require_at_jwt,
+            allow_unscoped_tokens,
+            allow_insecure_http,
+            accept_static_bearer,
+            allowed_client_ids,
+            max_token_age_secs,
+            required_claims,
+        } = self;
+        f.debug_struct("OAuthConfig")
+            .field("enabled", enabled)
+            .field("issuer", &debug_url(issuer))
+            .field("jwks_uri", &jwks_uri.as_deref().map(debug_url))
+            .field("audience", audience)
+            .field("audiences", audiences)
+            .field("resource", &debug_url(resource))
+            .field("required_scope", required_scope)
+            .field("required_scopes", required_scopes)
+            .field("scopes_supported", scopes_supported)
+            .field("scope_claims", scope_claims)
+            .field("principal_claims", principal_claims)
+            .field("algorithms", algorithms)
+            .field("leeway_secs", leeway_secs)
+            .field("require_at_jwt", require_at_jwt)
+            .field("allow_unscoped_tokens", allow_unscoped_tokens)
+            .field("allow_insecure_http", allow_insecure_http)
+            .field("accept_static_bearer", accept_static_bearer)
+            .field("allowed_client_ids", allowed_client_ids)
+            .field("max_token_age_secs", max_token_age_secs)
+            .field("required_claims", required_claims)
+            .finish()
+    }
+}
+
 impl Default for OAuthConfig {
     fn default() -> Self {
         Self {
@@ -1017,9 +1081,9 @@ impl OAuthConfig {
                         ProblemKind::InsecureHttp,
                         [key(name), key("allow_insecure_http")],
                         format!(
-                            "{} {value:?} uses plain http on a non-loopback host — {}. Use \
+                            "{} uses plain http on a non-loopback host — {}. Use \
                              https, or set {} if this address is on a network you trust",
-                            key(name),
+                            shown(&key(name), value),
                             if name == "resource" {
                                 "bearer tokens sent to it can be read in transit (RFC 9728 \
                                  §1.2 requires https)"
@@ -1325,29 +1389,66 @@ impl OAuthConfig {
 /// plain-http check in `resolve` decides on the parsed URL, so no spelling
 /// avoids it.
 fn check_url(key: &str, value: &str, identifier: bool) -> Result<(), String> {
-    let parsed = reqwest::Url::parse(value.trim())
-        .map_err(|e| format!("{key} {value:?} is not an absolute URL ({e})"))?;
+    // The value is never echoed raw: it may carry a credential (userinfo, or a
+    // `jwks_uri` query), and a `ConfigError` is normally logged at startup.
+    let parsed = reqwest::Url::parse(value.trim()).map_err(|e| {
+        format!(
+            "{} is not an absolute URL ({e})",
+            shown_unparsed(key, value)
+        )
+    })?;
     if !matches!(parsed.scheme(), "https" | "http") {
-        return Err(format!("{key} {value:?} must be an http(s) URL"));
+        return Err(format!("{} must be an http(s) URL", shown(key, value)));
     }
     if identifier && (parsed.fragment().is_some() || parsed.query().is_some()) {
         return Err(format!(
-            "{key} {value:?} must not contain a query or fragment"
+            "{} must not contain a query or fragment",
+            shown(key, value)
         ));
     }
     if value != value.trim() {
         return Err(format!(
-            "{key} {value:?} has leading/trailing whitespace — it is compared byte-for-byte"
+            "{} has leading/trailing whitespace — it is compared byte-for-byte",
+            shown(key, value)
         ));
     }
     if value.chars().any(|c| !c.is_ascii_graphic()) {
         return Err(format!(
-            "{key} {value:?} contains a space, a control character or a non-ASCII \
-             character — write it percent-encoded (and an internationalized host in its \
-             punycode form)"
+            "{} contains a space, a control character or a non-ASCII character — write it \
+             percent-encoded (and an internationalized host in its punycode form)",
+            shown(key, value)
         ));
     }
     Ok(())
+}
+
+/// `key` and the URL `value` for a problem message, the value through
+/// [`try_redact_url`] (quoted, userinfo/query/fragment masked, and marked as
+/// such when that changed it, so a whitespace or non-ASCII diagnosis never
+/// quotes a value that looks clean). A value that has no host, or hides an
+/// `@` in its path, falls back to [`shown_unparsed`].
+fn shown(key: &str, value: &str) -> String {
+    match try_redact_url(value) {
+        Some(redacted) if redacted == value => format!("{key} {redacted:?}"),
+        Some(redacted) => format!("{key} {redacted:?} (shown normalized, credential masked)"),
+        None => shown_unparsed(key, value),
+    }
+}
+
+/// `key` and a `value` that is not a URL [`try_redact_url`] can mask: quoted
+/// (and truncated) only when it cannot hold a credential — no `@` (so no
+/// userinfo), no `?` or `#` (so no query or fragment), and nothing but visible
+/// ASCII. Otherwise the setting alone; the message says what is wrong.
+fn shown_unparsed(key: &str, value: &str) -> String {
+    let safe = !value.is_empty()
+        && value
+            .chars()
+            .all(|c| c.is_ascii_graphic() && !matches!(c, '@' | '?' | '#'));
+    if safe {
+        format!("{key} {:?}", for_log(value))
+    } else {
+        key.to_string()
+    }
 }
 
 /// RFC 6749 §3.3 `scope-token = 1*( %x21 / %x23-5B / %x5D-7E )`: printable
@@ -1382,7 +1483,10 @@ fn scope_token_problem(what: &str, scope: &str) -> String {
 /// [`OAuthConfig::resolve`] (or, in tests, `testing::resolved_config`) and is
 /// then adjusted field by field, never built with a struct literal — which is
 /// what lets a new resolved setting be added without a breaking change.
-#[derive(Debug, Clone, PartialEq, Eq)]
+///
+/// `Debug` is hand-written and masks a credential in `issuer`, `jwks_uri` and
+/// `resource` the way [`OAuthConfig`]'s does.
+#[derive(Clone, PartialEq, Eq)]
 #[non_exhaustive]
 pub struct ResolvedOAuthConfig {
     /// See [`OAuthConfig::issuer`]; byte-exact.
@@ -1439,6 +1543,58 @@ pub struct ResolvedOAuthConfig {
     /// How the validator's log lines and errors name settings; what `resolve`
     /// was given.
     pub key_naming: KeyNamingBuf,
+}
+
+/// Hand-written so a credential in a URL setting never reaches a log line
+/// through `{:?}`.
+impl fmt::Debug for ResolvedOAuthConfig {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        // Destructured so a new field cannot be left out by accident.
+        let Self {
+            issuer,
+            jwks_uri,
+            audience,
+            audiences,
+            resource,
+            required_scopes,
+            scopes_supported,
+            scope_claims,
+            principal_claims,
+            algorithms,
+            leeway_secs,
+            require_at_jwt,
+            allow_unscoped_tokens,
+            allow_insecure_http,
+            accept_static_bearer,
+            allowed_client_ids,
+            max_token_age_secs,
+            required_claims,
+            resource_name,
+            key_naming,
+        } = self;
+        f.debug_struct("ResolvedOAuthConfig")
+            .field("issuer", &debug_url(issuer))
+            .field("jwks_uri", &jwks_uri.as_deref().map(debug_url))
+            .field("audience", audience)
+            .field("audiences", audiences)
+            .field("resource", &debug_url(resource))
+            .field("required_scopes", required_scopes)
+            .field("scopes_supported", scopes_supported)
+            .field("scope_claims", scope_claims)
+            .field("principal_claims", principal_claims)
+            .field("algorithms", algorithms)
+            .field("leeway_secs", leeway_secs)
+            .field("require_at_jwt", require_at_jwt)
+            .field("allow_unscoped_tokens", allow_unscoped_tokens)
+            .field("allow_insecure_http", allow_insecure_http)
+            .field("accept_static_bearer", accept_static_bearer)
+            .field("allowed_client_ids", allowed_client_ids)
+            .field("max_token_age_secs", max_token_age_secs)
+            .field("required_claims", required_claims)
+            .field("resource_name", resource_name)
+            .field("key_naming", key_naming)
+            .finish()
+    }
 }
 
 impl ResolvedOAuthConfig {
