@@ -16,10 +16,10 @@
 use std::collections::HashMap;
 use std::sync::Arc;
 
+use axum::Router;
 use axum::body::Body;
 use axum::http::{Request, header};
 use axum::routing::get;
-use axum::{Extension, Router};
 use oauth_resource_server::axum::{AuthLayer, metadata_router};
 use oauth_resource_server::testing;
 use oauth_resource_server::{
@@ -129,8 +129,8 @@ scopes_supported: ["api:read", "api:write"]
     Ok(())
 }
 
-/// Who called, read from the `Credential` the layer inserts.
-async fn whoami(Extension(credential): Extension<Credential>) -> String {
+/// Who called: the `Credential` extractor reads what the layer inserted.
+async fn whoami(credential: Credential) -> String {
     match credential {
         Credential::OAuth(token) => format!(
             "hello {} (scopes: {})",

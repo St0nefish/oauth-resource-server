@@ -44,14 +44,104 @@
 //! (RFC 6750 §3.1's SHOULD for a malformed request): a request is authenticated
 //! or it is not, and anything unreadable is simply no credential.
 //!
+//! # Extractors
+//!
+//! [`AuthorizedToken`] and [`Credential`] are axum extractors (`FromRequestParts`),
+//! and so are `Option<AuthorizedToken>` and `Option<Credential>`
+//! (`OptionalFromRequestParts`). They read what the layer inserted, and refuse
+//! fail-closed when it is not there:
+//!
+//! | The request… | `T` | `Option<T>` |
+//! |---|---|---|
+//! | carries the value (the layer accepted it) | the value | `Some(value)` |
+//! | passed an [`optional`](AuthLayerBuilder::optional) layer with no credential, or an [`allow_unauthenticated`](AuthLayer::allow_unauthenticated) layer | the layer's own 401 and challenge | `None` |
+//! | was accepted with the static token (`T` = [`AuthorizedToken`] only, and no outer layer inserted one — see [nested layers](self#nested-layers)) | the layer's own 401 and challenge | `None` |
+//! | never went through an [`AuthLayer`] (a route mounted outside it) | 500, logged at `error` | 500, logged at `error` |
+//!
+//! "The layer's own 401" is built by the same code that builds the layer's
+//! refusals ([`AuthLayerBuilder::on_reject`] included), so its status and
+//! `WWW-Authenticate` challenge are exactly the ones the layer would have sent
+//! for a request with no credential. An [`allow_unauthenticated`](AuthLayer::allow_unauthenticated)
+//! layer has no challenge of its own and answers with
+//! [`DEFAULT_STATIC_CHALLENGE`].
+//!
+//! A route outside every layer is a wiring mistake in the server, not something
+//! the caller can fix by authenticating, so it gets 500 (empty body) rather than
+//! a 401 that would send an OAuth client into an authorization flow that can
+//! never succeed there. It never grants access, and it never reads as "anonymous":
+//! `Option<T>` fails the same way.
+//!
+//! ```
+//! use axum::{Router, routing::get};
+//! use oauth_resource_server::axum::AuthLayer;
+//! use oauth_resource_server::{AuthorizedToken, Credential};
+//!
+//! async fn whoami(credential: Credential) -> String {
+//!     match credential {
+//!         Credential::OAuth(token) => format!("subject {:?}", token.subject),
+//!         Credential::StaticToken => "the static API key".to_string(),
+//!         // `Credential` is `#[non_exhaustive]`.
+//!         _ => "some other credential".to_string(),
+//!     }
+//! }
+//!
+//! // Needs an OAuth token: a static-token request is refused with the
+//! // layer's 401.
+//! async fn subject(token: AuthorizedToken) -> String {
+//!     token.subject.unwrap_or_default()
+//! }
+//!
+//! let auth = AuthLayer::builder().static_token("example-static-key").build().unwrap();
+//! let app: Router = Router::new()
+//!     .route("/whoami", get(whoami))
+//!     .route("/subject", get(subject))
+//!     .route_layer(auth);
+//! # let _ = app;
+//! ```
+//!
+//! # Optional authentication
+//!
+//! [`AuthLayerBuilder::optional`] builds a layer for routes that serve everyone
+//! but personalize for (or unlock more to) an authenticated caller: a valid
+//! credential is inserted as usual, a request that presents NO credential
+//! passes through with nothing inserted, and a credential that is presented
+//! but refused — invalid, expired, or valid without the required scopes — is
+//! refused exactly as by a non-optional layer. See that method for what counts
+//! as "no credential". A `DPoP`-scheme `Authorization` value (a
+//! sender-constrained token this crate cannot accept) and a `Bearer` value
+//! separated from its token by a tab are counted as presented, and refused
+//! exactly as a non-optional layer refuses them, never passed through.
+//!
+//! # Nested layers
+//!
+//! An optional layer first removes any [`Credential`] and [`AuthorizedToken`]
+//! an outer layer inserted, so what its handlers extract is only ever what IT
+//! accepted: `None` after its pass-through, even when an outer layer accepted
+//! a token.
+//!
+//! Strict (non-optional) layers never remove anything; the extensions
+//! accumulate, as they always have. [`Credential`] reflects the innermost
+//! layer that accepted the request, while an [`AuthorizedToken`] may have been
+//! inserted by an OUTER layer: behind an outer OAuth layer, an inner
+//! static-only layer that accepts its static token leaves the outer layer's
+//! [`AuthorizedToken`] in place, and an `AuthorizedToken` extractor returns it.
+//! When that matters, read [`Credential`] (the innermost decision) instead.
+//!
 //! # Logging
 //!
 //! The layer logs every outcome itself, so applications need not (target
 //! `oauth_resource_server::axum`): an accepted OAuth token at `debug` (principal,
 //! subject, scopes — never the token); a request with no credential at `debug`
 //! when OAuth is configured, since every OAuth client's first request looks like
-//! that; any other refusal at `warn`, with the reason when OAuth is configured.
-//! The reason goes to the log only, never to the caller.
+//! that; a request with no credential passed through by an
+//! [`optional`](AuthLayerBuilder::optional) layer at `debug`; any other refusal
+//! at `warn`, with the reason when OAuth is configured. The reason goes to the
+//! log only, never to the caller. The extractors log their refusals the same
+//! way. Three wiring mistakes are logged at `error`: an extractor on a route no
+//! [`AuthLayer`] covers (500), a required extractor behind an
+//! [`allow_unauthenticated`](AuthLayer::allow_unauthenticated) layer, and an
+//! [`AuthorizedToken`] extractor behind a layer with no OAuth validator (both
+//! a 401 no credential can ever satisfy).
 
 use std::future::Future;
 use std::pin::Pin;
@@ -61,19 +151,19 @@ use std::task::{Context, Poll};
 use ::axum::Json;
 use ::axum::Router;
 use ::axum::body::Body;
-use ::axum::extract::{Request, State};
+use ::axum::extract::{FromRequestParts, OptionalFromRequestParts, Request, State};
 use ::axum::middleware::Next;
 use ::axum::response::{IntoResponse, Response};
 use ::axum::routing::{any, get};
 use http::header::{AUTHORIZATION, WWW_AUTHENTICATE};
 use http::request::Parts;
 use http::{HeaderMap, HeaderName, HeaderValue, Method, StatusCode};
-use tracing::{debug, warn};
+use tracing::{debug, error, warn};
 
 use crate::authenticate::{Credential, authenticate};
 use crate::challenge::PROTECTED_RESOURCE_METADATA_PREFIX;
 use crate::policy::StaticTokenDecision;
-use crate::token::{TokenRejection, for_log};
+use crate::token::{AuthorizedToken, TokenRejection, for_log};
 use crate::validator::OAuthValidator;
 
 /// Where a request may carry a credential. Each configured source contributes
@@ -111,13 +201,37 @@ impl CredentialSource {
     /// visible ASCII and (for [`CredentialSource::Bearer`]) uses the `Bearer`
     /// scheme. May be blank; [`crate::authenticate()`] treats blank as absent.
     fn candidate<'h>(&self, headers: &'h HeaderMap) -> Option<&'h str> {
-        match self {
-            Self::Bearer(name) => headers
-                .get(name)
-                .and_then(|v| v.to_str().ok())
-                .map(bearer_credential),
-            Self::Raw(name) => headers.get(name).and_then(|v| v.to_str().ok()),
-        }
+        headers.get(self.header_name()).and_then(|v| self.parse(v))
+    }
+
+    /// The candidate one value of this source's header carries: `None` when
+    /// the value is not visible ASCII, otherwise the (possibly blank) token.
+    fn parse<'h>(&self, value: &'h HeaderValue) -> Option<&'h str> {
+        let value = value.to_str().ok()?;
+        Some(match self {
+            Self::Bearer(_) => bearer_credential(value),
+            Self::Raw(_) => value,
+        })
+    }
+
+    /// Whether EVERY value of this source's header — not just the first, which
+    /// is the only one ever authenticated — is readable and blank. Used only by
+    /// an [`AuthLayerBuilder::optional`] layer, and deliberately stricter than
+    /// the candidate parsing ([`bearer_credential`], unchanged): an unreadable
+    /// (non-visible-ASCII) value, and for a [`CredentialSource::Bearer`] source
+    /// any value [`names_a_token`] says carries a token, count as presented.
+    fn presents_nothing(&self, headers: &HeaderMap) -> bool {
+        headers.get_all(self.header_name()).iter().all(|v| {
+            let Ok(value) = v.to_str() else {
+                return false;
+            };
+            match self {
+                Self::Raw(_) => value.trim().is_empty(),
+                Self::Bearer(_) => {
+                    !names_a_token(value) && bearer_credential(value).trim().is_empty()
+                }
+            }
+        })
     }
 
     /// The header this source reads.
@@ -126,6 +240,28 @@ impl CredentialSource {
             Self::Bearer(name) | Self::Raw(name) => name,
         }
     }
+}
+
+/// Whether a `Bearer`-source header value carries a token that an
+/// [`AuthLayerBuilder::optional`] layer must not read as "no credential", even
+/// though [`bearer_credential`] yields no candidate from it:
+///
+/// - any value whose auth-scheme is `DPoP` (case-insensitive) — a
+///   sender-constrained token this crate cannot accept (RFC 9449), which must
+///   be refused rather than served as anonymous;
+/// - a `Bearer` scheme separated from a non-blank rest by SP **or HTAB** (RFC
+///   9110 §11.4 allows only SP; the strict parsing is not widened, the value
+///   is only counted as presented).
+///
+/// Leading SP/HTAB is skipped. Every other scheme (`Basic`, …) still counts as
+/// no bearer credential.
+fn names_a_token(value: &str) -> bool {
+    let value = value.trim_start_matches([' ', '\t']);
+    let (scheme, rest) = value
+        .find([' ', '\t'])
+        .map_or((value, ""), |i| value.split_at(i));
+    scheme.eq_ignore_ascii_case("dpop")
+        || (scheme.eq_ignore_ascii_case("bearer") && !rest.trim().is_empty())
 }
 
 /// The credential from a `Bearer <token>` header value, or `""`.
@@ -279,6 +415,9 @@ struct Enforce {
     /// The challenge for a 401 when OAuth is off; `None` when the application
     /// opted out with `static_challenge(None)`.
     static_challenge: Option<HeaderValue>,
+    /// [`AuthLayerBuilder::optional`]: pass a request that presents no
+    /// credential through instead of refusing it.
+    optional: bool,
 }
 
 /// Hand-written so the static token never reaches a log line through `{:?}`.
@@ -299,6 +438,7 @@ impl std::fmt::Debug for AuthLayer {
                 .field("sources", &e.sources)
                 .field("on_reject", &e.on_reject.as_ref().map(|_| "<fn>"))
                 .field("static_challenge", &e.static_challenge)
+                .field("optional", &e.optional)
                 .finish(),
         }
     }
@@ -343,8 +483,11 @@ impl AuthLayer {
         AuthLayerBuilder::default()
     }
 
-    /// A layer that lets EVERY request through, unauthenticated, and inserts
-    /// nothing into request extensions.
+    /// A layer that lets EVERY request through, unauthenticated, and inserts no
+    /// credential into request extensions (so `Option<Credential>` and
+    /// `Option<AuthorizedToken>` extract `None`, and the non-`Option`
+    /// extractors refuse with a 401 carrying [`DEFAULT_STATIC_CHALLENGE`]; see
+    /// the [module docs](self#extractors)).
     ///
     /// The explicit opt-out. The only other pass-through is a
     /// [`crate::StaticTokenDecision::Unauthenticated`] handed to
@@ -404,6 +547,7 @@ pub struct AuthLayerBuilder {
     on_reject: Option<RejectFn>,
     /// `None`: not set, so [`DEFAULT_STATIC_CHALLENGE`].
     static_challenge: Option<Option<HeaderValue>>,
+    optional: bool,
 }
 
 impl std::fmt::Debug for AuthLayerBuilder {
@@ -417,6 +561,7 @@ impl std::fmt::Debug for AuthLayerBuilder {
             .field("sources", &self.sources)
             .field("on_reject", &self.on_reject.as_ref().map(|_| "<fn>"))
             .field("static_challenge", &self.static_challenge)
+            .field("optional", &self.optional)
             .finish()
     }
 }
@@ -487,6 +632,79 @@ impl AuthLayerBuilder {
     /// ```
     pub fn static_challenge(mut self, challenge: Option<HeaderValue>) -> Self {
         self.static_challenge = Some(challenge);
+        self
+    }
+
+    /// Let a request that presents NO credential through, unauthenticated, with
+    /// nothing inserted into its extensions; everything else is decided exactly
+    /// as without this. For routes that serve everyone but personalize for an
+    /// authenticated caller, or read-open/write-authenticated APIs.
+    ///
+    /// - A credential that is accepted is inserted as usual.
+    /// - A credential that is presented but refused — invalid, expired, signed
+    ///   by an unknown key, not the static token, or a valid token without the
+    ///   required scopes — gets the same 401 or 403, with the same
+    ///   `WWW-Authenticate` challenge and [`on_reject`](Self::on_reject) body,
+    ///   as without `optional()`. A client with a bad token learns so, rather
+    ///   than being served silently as anonymous.
+    /// - A request presents no credential when EVERY value of EVERY configured
+    ///   [`CredentialSource`] header is absent or blank: empty or whitespace
+    ///   for a [`CredentialSource::Raw`] header; for a
+    ///   [`CredentialSource::Bearer`] header, empty or whitespace after
+    ///   `Bearer`, or a value using some other scheme (which carries no bearer
+    ///   credential to check). This is the same classification
+    ///   [`crate::authenticate()`] reports as [`TokenRejection::Missing`],
+    ///   with two stricter edges: a header value that is not visible ASCII
+    ///   counts as a presented credential, not as a blank one, and so does a
+    ///   non-blank LATER value of a repeated header (only the first is ever
+    ///   authenticated). Both are refused with the layer's 401. So are a
+    ///   `Bearer` value that uses a tab instead of a space before a non-blank
+    ///   token, and any `DPoP`-scheme value (RFC 9449; a sender-constrained
+    ///   token this crate cannot verify must be refused, not served as
+    ///   anonymous). The strict parsing of those values is unchanged: they get
+    ///   exactly the refusal a non-optional layer sends.
+    /// - Any [`Credential`]/[`AuthorizedToken`] an outer layer inserted is
+    ///   removed first, so a pass-through always extracts as `None` (see
+    ///   [nested layers](self#nested-layers)).
+    ///
+    /// Handlers read the outcome with `Option<Credential>` or
+    /// `Option<AuthorizedToken>` (see the [module docs](self#extractors)); a
+    /// handler that takes a plain `Credential` or `AuthorizedToken` refuses a
+    /// passed-through request with the layer's own 401 and challenge.
+    ///
+    /// # Security
+    ///
+    /// This is not a way around the fail-closed build: [`build`](Self::build)
+    /// still requires a static token or an OAuth validator, and a credential
+    /// the layer cannot accept is still refused. What passes through is only
+    /// what any caller could send by leaving the credential headers off, so
+    /// every handler behind an optional layer must treat `None` as
+    /// unauthenticated. The pass-through is logged at `debug`.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use axum::{Router, routing::get};
+    /// use oauth_resource_server::Credential;
+    /// use oauth_resource_server::axum::AuthLayer;
+    ///
+    /// async fn greeting(credential: Option<Credential>) -> &'static str {
+    ///     match credential {
+    ///         Some(_) => "hello, authenticated caller",
+    ///         None => "hello, anonymous caller",
+    ///     }
+    /// }
+    ///
+    /// let auth = AuthLayer::builder()
+    ///     .static_token("example-static-key")
+    ///     .optional()
+    ///     .build()
+    ///     .unwrap();
+    /// let app: Router = Router::new().route("/", get(greeting)).route_layer(auth);
+    /// # let _ = app;
+    /// ```
+    pub fn optional(mut self) -> Self {
+        self.optional = true;
         self
     }
 
@@ -596,6 +814,7 @@ impl AuthLayerBuilder {
                 on_reject: self.on_reject,
                 oauth_challenges,
                 static_challenge,
+                optional: self.optional,
             })),
         })
     }
@@ -649,20 +868,59 @@ impl Enforce {
         }
         response
     }
+
+    /// Log a refusal at the level the [module docs](self#logging) give, then
+    /// build its response with [`Enforce::reject`]. Every refusal — the
+    /// layer's own and an extractor's — goes through here.
+    fn refuse(&self, rejection: &TokenRejection, request: &Parts) -> Response {
+        let path = request.uri.path();
+        match (&self.oauth, rejection) {
+            (None, _) => warn!(path = %path, "Bearer auth rejected"),
+            // Every OAuth client's first request carries no credential
+            // (401 → read `resource_metadata` → authorize), so it is not
+            // worth a warning.
+            (Some(_), TokenRejection::Missing) => {
+                debug!(path = %path, "No bearer credential presented");
+            }
+            (Some(_), _) => {
+                warn!(path = %path, reason = ?rejection, "OAuth bearer auth rejected");
+            }
+        }
+        self.reject(rejection, request)
+    }
 }
+
+/// Inserted into a request's extensions by every [`AuthLayer`] it passes, so
+/// the extractors can tell "the layer ran and inserted no credential" (answer
+/// with that layer's own refusal) from "no layer ran" (a server
+/// misconfiguration). The type is private, so nothing outside this module can
+/// insert, read or forge it.
+#[derive(Clone)]
+struct LayerRan(AuthLayer);
 
 impl AuthLayer {
     /// Authenticate `request`: the request to pass on (with the credential in
     /// its extensions), or the refusal to answer with. The one implementation
     /// behind both [`require_auth`] and the `tower::Layer` service, so the two
     /// cannot drift apart.
-    async fn check(&self, request: Request) -> Result<Request, Response> {
+    async fn check(&self, mut request: Request) -> Result<Request, Response> {
         let enforce = match &*self.inner {
-            Mode::AllowUnauthenticated => return Ok(request),
+            Mode::AllowUnauthenticated => {
+                request.extensions_mut().insert(LayerRan(self.clone()));
+                return Ok(request);
+            }
             Mode::Enforce(enforce) => enforce,
         };
 
         let (mut parts, body) = request.into_parts();
+        // An optional layer's pass-through must mean "this layer accepted
+        // nothing": drop whatever an outer layer inserted, so `Option<..>`
+        // never hands the handler a credential this layer did not validate.
+        // Strict layers keep accumulating, as they always have (module docs).
+        if enforce.optional {
+            parts.extensions.remove::<Credential>();
+            parts.extensions.remove::<AuthorizedToken>();
+        }
         // The credential must not reach a `Debug` of the request — ours
         // (`RejectContext`), a tracing layer's, or a handler's.
         for (name, value) in parts.headers.iter_mut() {
@@ -696,24 +954,228 @@ impl AuthLayer {
                 parts.extensions.insert(token.clone());
                 parts.extensions.insert(Credential::OAuth(token));
             }
-            Err(rejection) => {
-                let path = parts.uri.path();
-                match (&enforce.oauth, &rejection) {
-                    (None, _) => warn!(path = %path, "Bearer auth rejected"),
-                    // Every OAuth client's first request carries no credential
-                    // (401 → read `resource_metadata` → authorize), so it is not
-                    // worth a warning.
-                    (Some(_), TokenRejection::Missing) => {
-                        debug!(path = %path, "No bearer credential presented");
-                    }
-                    (Some(_), _) => {
-                        warn!(path = %path, reason = ?rejection, "OAuth bearer auth rejected");
-                    }
-                }
-                return Err(enforce.reject(&rejection, &parts));
+            // `optional()`: pass through only what `authenticate` found no
+            // credential in AND where no source header holds anything at all
+            // beyond blanks — an unreadable value, or a non-blank later value
+            // of a repeated header, is refused below like any other `Missing`.
+            // An invalid or insufficient credential never reaches this arm:
+            // `authenticate` reports `Missing` only with no non-blank candidate.
+            Err(TokenRejection::Missing)
+                if enforce.optional
+                    && enforce
+                        .sources
+                        .iter()
+                        .all(|s| s.presents_nothing(&parts.headers)) =>
+            {
+                debug!(
+                    path = %parts.uri.path(),
+                    "No credential presented; optional auth passes the request through"
+                );
+            }
+            Err(rejection) => return Err(enforce.refuse(&rejection, &parts)),
+        }
+        parts.extensions.insert(LayerRan(self.clone()));
+        Ok(Request::from_parts(parts, body))
+    }
+
+    /// The refusal for an extractor whose value the layer did not insert: the
+    /// same response the layer itself gives a request with no acceptable
+    /// credential, built by the same [`Enforce::reject`]. `wants_oauth_token`
+    /// is set for an [`AuthorizedToken`] extractor.
+    ///
+    /// Two wirings give a 401 no credential can ever satisfy — a required
+    /// extractor behind [`AuthLayer::allow_unauthenticated`], and an
+    /// [`AuthorizedToken`] extractor behind a layer with no OAuth validator —
+    /// so, like the no-layer 500, they are logged at `error` rather than as an
+    /// ordinary refusal.
+    fn refuse_extraction(
+        &self,
+        rejection: &TokenRejection,
+        parts: &Parts,
+        wants_oauth_token: bool,
+    ) -> Response {
+        match &*self.inner {
+            Mode::Enforce(enforce) if wants_oauth_token && enforce.oauth.is_none() => {
+                error!(
+                    path = %parts.uri.path(),
+                    "Server misconfiguration: the handler requires an OAuth access token, but \
+                     its AuthLayer has no OAuth validator; refusing the request"
+                );
+                enforce.reject(rejection, parts)
+            }
+            Mode::Enforce(enforce) => enforce.refuse(rejection, parts),
+            // No challenge of its own to send: the default one, as a
+            // static-only layer would (RFC 9110 §15.5.2).
+            Mode::AllowUnauthenticated => {
+                error!(
+                    path = %parts.uri.path(),
+                    "Server misconfiguration: the handler requires a credential, but its \
+                     AuthLayer allows unauthenticated requests; refusing the request"
+                );
+                (
+                    StatusCode::UNAUTHORIZED,
+                    [(
+                        WWW_AUTHENTICATE,
+                        HeaderValue::from_static(DEFAULT_STATIC_CHALLENGE),
+                    )],
+                )
+                    .into_response()
             }
         }
-        Ok(Request::from_parts(parts, body))
+    }
+}
+
+/// What the extractors find on a request.
+enum Found<T> {
+    /// The layer inserted it.
+    Present(T),
+    /// An [`AuthLayer`] ran but inserted no `T`.
+    Absent(AuthLayer),
+    /// No [`AuthLayer`] ran.
+    NoLayer,
+}
+
+fn find<T: Clone + Send + Sync + 'static>(parts: &Parts) -> Found<T> {
+    match (
+        parts.extensions.get::<T>(),
+        parts.extensions.get::<LayerRan>(),
+    ) {
+        (Some(value), _) => Found::Present(value.clone()),
+        (None, Some(LayerRan(layer))) => Found::Absent(layer.clone()),
+        (None, None) => Found::NoLayer,
+    }
+}
+
+/// The response for an extractor on a route no [`AuthLayer`] covers: 500, and
+/// an `error` log naming the mistake. Never access, never "anonymous".
+fn no_layer(parts: &Parts, extractor: &'static str) -> Response {
+    error!(
+        path = %parts.uri.path(),
+        extractor,
+        "Server misconfiguration: an authentication extractor ran on a route no AuthLayer \
+         covers; refusing the request"
+    );
+    StatusCode::INTERNAL_SERVER_ERROR.into_response()
+}
+
+/// The [`AuthLayer`]'s refusal for a required extractor with nothing to
+/// extract. A static-token request asking for an [`AuthorizedToken`] is a
+/// presented credential of the wrong kind, so it is `Invalid`, not `Missing`.
+fn refuse_absent(layer: &AuthLayer, parts: &Parts, wants_oauth_token: bool) -> Response {
+    let rejection = match parts.extensions.get::<Credential>() {
+        Some(_) => TokenRejection::Invalid(
+            "a credential was accepted, but the handler requires an OAuth access token".into(),
+        ),
+        None => TokenRejection::Missing,
+    };
+    layer.refuse_extraction(&rejection, parts, wants_oauth_token)
+}
+
+/// Extracts the OAuth token an [`AuthLayer`] accepted.
+///
+/// Refuses with the layer's own 401 and `WWW-Authenticate` challenge when no
+/// token is in the extensions — an [`optional`](AuthLayerBuilder::optional) or
+/// [`allow_unauthenticated`](AuthLayer::allow_unauthenticated) layer passed the
+/// request through, or the static token was accepted — and with 500 (logged at
+/// `error`) on a route no [`AuthLayer`] covers. Behind nested strict layers the
+/// token may have been inserted by an OUTER layer even when the innermost one
+/// accepted the static token; see the [module docs](self#nested-layers).
+///
+/// # Examples
+///
+/// ```
+/// use axum::{Router, routing::get};
+/// use oauth_resource_server::AuthorizedToken;
+///
+/// async fn subject(token: AuthorizedToken) -> String {
+///     token.subject.unwrap_or_default()
+/// }
+/// # let _: Router = Router::new().route("/", get(subject));
+/// ```
+#[cfg_attr(docsrs, doc(cfg(feature = "axum")))]
+impl<S: Send + Sync> FromRequestParts<S> for AuthorizedToken {
+    type Rejection = Response;
+
+    async fn from_request_parts(parts: &mut Parts, _state: &S) -> Result<Self, Response> {
+        match find::<AuthorizedToken>(parts) {
+            Found::Present(token) => Ok(token),
+            Found::Absent(layer) => Err(refuse_absent(&layer, parts, true)),
+            Found::NoLayer => Err(no_layer(parts, "AuthorizedToken")),
+        }
+    }
+}
+
+/// `Option<AuthorizedToken>`: `None` when an [`AuthLayer`] ran and no OAuth
+/// token is in the extensions (no credential under an
+/// [`optional`](AuthLayerBuilder::optional) or
+/// [`allow_unauthenticated`](AuthLayer::allow_unauthenticated) layer, or the
+/// static token was accepted and no outer strict layer inserted a token — see
+/// [nested layers](self#nested-layers)). On a route no [`AuthLayer`] covers it
+/// still refuses with 500, logged at `error`, rather than reading as anonymous.
+#[cfg_attr(docsrs, doc(cfg(feature = "axum")))]
+impl<S: Send + Sync> OptionalFromRequestParts<S> for AuthorizedToken {
+    type Rejection = Response;
+
+    async fn from_request_parts(parts: &mut Parts, _state: &S) -> Result<Option<Self>, Response> {
+        match find::<AuthorizedToken>(parts) {
+            Found::Present(token) => Ok(Some(token)),
+            Found::Absent(_) => Ok(None),
+            Found::NoLayer => Err(no_layer(parts, "Option<AuthorizedToken>")),
+        }
+    }
+}
+
+/// Extracts the credential an [`AuthLayer`] accepted.
+///
+/// Refuses with the layer's own 401 and `WWW-Authenticate` challenge when the
+/// layer inserted none (an [`optional`](AuthLayerBuilder::optional) or
+/// [`allow_unauthenticated`](AuthLayer::allow_unauthenticated) layer passed the
+/// request through), and with 500 (logged at `error`) on a route no
+/// [`AuthLayer`] covers. See the [module docs](self#extractors).
+///
+/// # Examples
+///
+/// ```
+/// use axum::{Router, routing::get};
+/// use oauth_resource_server::Credential;
+///
+/// async fn whoami(credential: Credential) -> String {
+///     match credential {
+///         Credential::OAuth(token) => format!("subject {:?}", token.subject),
+///         Credential::StaticToken => "the static API key".to_string(),
+///         _ => "some other credential".to_string(),
+///     }
+/// }
+/// # let _: Router = Router::new().route("/", get(whoami));
+/// ```
+#[cfg_attr(docsrs, doc(cfg(feature = "axum")))]
+impl<S: Send + Sync> FromRequestParts<S> for Credential {
+    type Rejection = Response;
+
+    async fn from_request_parts(parts: &mut Parts, _state: &S) -> Result<Self, Response> {
+        match find::<Credential>(parts) {
+            Found::Present(credential) => Ok(credential),
+            Found::Absent(layer) => Err(refuse_absent(&layer, parts, false)),
+            Found::NoLayer => Err(no_layer(parts, "Credential")),
+        }
+    }
+}
+
+/// `Option<Credential>`: `None` when an [`AuthLayer`] ran and inserted no
+/// credential (no credential under an [`optional`](AuthLayerBuilder::optional)
+/// or [`allow_unauthenticated`](AuthLayer::allow_unauthenticated) layer). On a
+/// route no [`AuthLayer`] covers it still refuses with 500, logged at `error`,
+/// rather than reading as anonymous.
+#[cfg_attr(docsrs, doc(cfg(feature = "axum")))]
+impl<S: Send + Sync> OptionalFromRequestParts<S> for Credential {
+    type Rejection = Response;
+
+    async fn from_request_parts(parts: &mut Parts, _state: &S) -> Result<Option<Self>, Response> {
+        match find::<Credential>(parts) {
+            Found::Present(credential) => Ok(Some(credential)),
+            Found::Absent(_) => Ok(None),
+            Found::NoLayer => Err(no_layer(parts, "Option<Credential>")),
+        }
     }
 }
 
@@ -726,7 +1188,7 @@ impl AuthLayer {
 /// or validating as an OAuth token with every required scope is accepted.
 ///
 /// On success it inserts the [`Credential`] into request extensions and, for an
-/// OAuth token, the [`AuthorizedToken`](crate::AuthorizedToken) too, so a
+/// OAuth token, the [`AuthorizedToken`] too, so a
 /// handler can enforce a finer-grained scope or attribute the request. On
 /// refusal it answers 401 (missing or invalid credential) or 403 (valid token,
 /// insufficient scope) itself; see [`AuthLayerBuilder::on_reject`] for the
@@ -2170,5 +2632,721 @@ mod tests {
             get_path(&app, MCP_METADATA_PATH).await.status(),
             StatusCode::OK
         );
+    }
+
+    // --- Extractors and optional authentication ---
+
+    /// Everything about a response a caller can observe, for byte-for-byte
+    /// comparisons: status, every header (in order), body.
+    async fn observed(resp: Response) -> (StatusCode, Vec<(String, Vec<u8>)>, Vec<u8>) {
+        let status = resp.status();
+        let headers = resp
+            .headers()
+            .iter()
+            .map(|(k, v)| (k.to_string(), v.as_bytes().to_vec()))
+            .collect();
+        (status, headers, body_bytes(resp).await)
+    }
+
+    fn json_reject(cx: RejectContext<'_>) -> Response {
+        Response::new(Body::from(format!("refused {}", cx.status.as_u16())))
+    }
+
+    /// A router whose one handler reads `Option<Credential>` and
+    /// `Option<AuthorizedToken>` through the extractors, counting its runs.
+    fn optional_extractor_app(
+        layer: AuthLayer,
+        runs: Arc<std::sync::atomic::AtomicUsize>,
+    ) -> Router {
+        let handler = move |credential: Option<Credential>, token: Option<AuthorizedToken>| {
+            let runs = Arc::clone(&runs);
+            async move {
+                runs.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                match (credential, token) {
+                    (None, None) => "none".to_string(),
+                    (Some(Credential::StaticToken), None) => "static".to_string(),
+                    (Some(Credential::OAuth(c)), Some(t)) => {
+                        assert_eq!(c, t);
+                        format!("oauth {}", t.subject.as_deref().unwrap_or_default())
+                    }
+                    other => panic!("inconsistent extraction: {other:?}"),
+                }
+            }
+        };
+        Router::new()
+            .route("/test", get(handler))
+            .route_layer(layer)
+    }
+
+    /// Request headers as raw bytes, so a test can send a non-ASCII value.
+    type Headers<'a> = Vec<(&'a str, &'a [u8])>;
+
+    async fn send_raw(app: &Router, headers: &[(&str, &[u8])]) -> Response {
+        let mut req = Request::builder().uri("/test");
+        for (name, value) in headers {
+            req = req.header(*name, HeaderValue::from_bytes(value).unwrap());
+        }
+        app.clone()
+            .oneshot(req.body(Body::empty()).unwrap())
+            .await
+            .unwrap()
+    }
+
+    #[tokio::test]
+    async fn the_extractors_read_a_valid_token_and_the_static_token() {
+        let jwks = testing::spawn_jwks_server("200 OK", testing::jwks_body()).await;
+        let v = validator(&jwks.url);
+        let layer = AuthLayer::builder()
+            .static_token(STATIC)
+            .oauth(Arc::clone(&v))
+            .build()
+            .unwrap();
+        let app = Router::new()
+            .route(
+                "/credential",
+                get(|credential: Credential| async move {
+                    match credential {
+                        Credential::StaticToken => "static".to_string(),
+                        Credential::OAuth(t) => format!("oauth {}", t.subject.unwrap_or_default()),
+                    }
+                }),
+            )
+            .route(
+                "/token",
+                get(|token: AuthorizedToken| async move {
+                    format!(
+                        "{} {}",
+                        token.subject.as_deref().unwrap_or_default(),
+                        token.has_scope("mcp:read")
+                    )
+                }),
+            )
+            .route_layer(layer);
+        let get_at = |path: &'static str, header: String| {
+            let app = app.clone();
+            async move {
+                app.oneshot(
+                    Request::builder()
+                        .uri(path)
+                        .header("authorization", header)
+                        .body(Body::empty())
+                        .unwrap(),
+                )
+                .await
+                .unwrap()
+            }
+        };
+
+        let valid = format!("Bearer {}", testing::valid_token());
+        let resp = get_at("/credential", valid.clone()).await;
+        assert_eq!(resp.status(), StatusCode::OK);
+        assert_eq!(body_bytes(resp).await, b"oauth user-1");
+        let resp = get_at("/token", valid).await;
+        assert_eq!(resp.status(), StatusCode::OK);
+        assert_eq!(body_bytes(resp).await, b"user-1 true");
+
+        let resp = get_at("/credential", "Bearer secret".into()).await;
+        assert_eq!(resp.status(), StatusCode::OK);
+        assert_eq!(body_bytes(resp).await, b"static");
+        // A static-token request has no OAuth token: the layer's own 401 and
+        // challenge, never a 500 or a pass.
+        let resp = get_at("/token", "Bearer secret".into()).await;
+        assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
+        assert_eq!(www_authenticate(&resp), v.invalid_token_challenge());
+    }
+
+    #[tokio::test]
+    async fn an_extractor_outside_every_layer_fails_closed_with_500() {
+        let runs = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let count = |runs: &Arc<std::sync::atomic::AtomicUsize>| {
+            runs.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        };
+        let (r1, r2, r3, r4) = (
+            Arc::clone(&runs),
+            Arc::clone(&runs),
+            Arc::clone(&runs),
+            Arc::clone(&runs),
+        );
+        let app = Router::new()
+            .route(
+                "/credential",
+                get(move |_: Credential| async move { count(&r1) }),
+            )
+            .route(
+                "/token",
+                get(move |_: AuthorizedToken| async move { count(&r2) }),
+            )
+            .route(
+                "/opt-credential",
+                get(move |_: Option<Credential>| async move { count(&r3) }),
+            )
+            .route(
+                "/opt-token",
+                get(move |_: Option<AuthorizedToken>| async move { count(&r4) }),
+            );
+        for path in ["/credential", "/token", "/opt-credential", "/opt-token"] {
+            for header in [None, Some("Bearer secret")] {
+                let mut req = Request::builder().uri(path);
+                if let Some(h) = header {
+                    req = req.header("authorization", h);
+                }
+                let resp = app
+                    .clone()
+                    .oneshot(req.body(Body::empty()).unwrap())
+                    .await
+                    .unwrap();
+                assert_eq!(
+                    resp.status(),
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    "{path} {header:?}"
+                );
+                assert!(resp.headers().get(WWW_AUTHENTICATE).is_none());
+                assert!(body_bytes(resp).await.is_empty(), "{path}");
+            }
+        }
+        assert_eq!(runs.load(std::sync::atomic::Ordering::SeqCst), 0);
+    }
+
+    #[test]
+    fn optional_still_needs_a_credential_to_build() {
+        assert_eq!(
+            AuthLayer::builder().optional().build().unwrap_err(),
+            AuthLayerError::NoCredential
+        );
+        assert_eq!(
+            AuthLayer::builder()
+                .static_token("")
+                .optional()
+                .build()
+                .unwrap_err(),
+            AuthLayerError::NoCredential
+        );
+        assert_eq!(
+            AuthLayer::builder()
+                .static_token(STATIC)
+                .optional()
+                .sources([])
+                .build()
+                .unwrap_err(),
+            AuthLayerError::NoSources
+        );
+        let layer = AuthLayer::builder()
+            .static_token("hunter2")
+            .optional()
+            .build()
+            .unwrap();
+        assert!(!layer.allows_unauthenticated());
+        let rendered = format!("{layer:?}");
+        assert!(!rendered.contains("hunter2") && rendered.contains("optional: true"));
+    }
+
+    /// Every refusal an `optional()` layer sends is byte-identical to the one
+    /// the same layer without `optional()` sends, and the handler never runs;
+    /// only a request presenting nothing passes, as `None`.
+    #[tokio::test]
+    async fn an_optional_layer_passes_only_a_request_with_no_credential() {
+        let jwks = testing::spawn_jwks_server("200 OK", testing::jwks_body()).await;
+        let v = validator(&jwks.url);
+        let builder = || {
+            AuthLayer::builder()
+                .static_token(STATIC)
+                .oauth(Arc::clone(&v))
+                .sources([
+                    CredentialSource::authorization_bearer(),
+                    CredentialSource::Raw(HeaderName::from_static("x-api-key")),
+                ])
+                .on_reject(json_reject)
+        };
+        let runs = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let optional =
+            optional_extractor_app(builder().optional().build().unwrap(), Arc::clone(&runs));
+        let strict =
+            optional_extractor_app(builder().build().unwrap(), Arc::new(Default::default()));
+        let ran = || runs.load(std::sync::atomic::Ordering::SeqCst);
+
+        // No credential, and blank ones: the handler runs with `None`.
+        let blanks: &[&[(&str, &[u8])]] = &[
+            &[],
+            &[("authorization", b"")],
+            &[("authorization", b"Bearer ")],
+            &[("authorization", b"bearer    ")],
+            // Another scheme carries no bearer credential at all.
+            &[("authorization", b"Basic c2VjcmV0")],
+            &[("x-api-key", b"   ")],
+            &[("authorization", b"Bearer "), ("x-api-key", b"")],
+            &[("authorization", b"Bearer "), ("authorization", b" ")],
+        ];
+        for headers in blanks {
+            let before = ran();
+            let resp = send_raw(&optional, headers).await;
+            assert_eq!(resp.status(), StatusCode::OK, "{headers:?}");
+            assert!(resp.headers().get(WWW_AUTHENTICATE).is_none());
+            assert_eq!(body_bytes(resp).await, b"none", "{headers:?}");
+            assert_eq!(ran(), before + 1);
+            // The same request is refused by the non-optional layer.
+            let resp = send_raw(&strict, headers).await;
+            assert_eq!(resp.status(), StatusCode::UNAUTHORIZED, "{headers:?}");
+            assert_eq!(www_authenticate(&resp), v.invalid_token_challenge());
+        }
+
+        // Anything presented but not accepted: refused exactly as without
+        // `optional()`, and the handler never runs.
+        let invalid = format!("Bearer {}", testing::valid_token().replace('.', "x."));
+        let expired = format!("Bearer {}", expired_token());
+        let unscoped = format!("Bearer {}", unscoped_token());
+        let refused: Vec<(Headers<'_>, StatusCode, String)> = vec![
+            (
+                vec![("authorization", b"Bearer not-a-jwt")],
+                StatusCode::UNAUTHORIZED,
+                v.invalid_token_challenge(),
+            ),
+            (
+                vec![("authorization", invalid.as_bytes())],
+                StatusCode::UNAUTHORIZED,
+                v.invalid_token_challenge(),
+            ),
+            (
+                vec![("authorization", expired.as_bytes())],
+                StatusCode::UNAUTHORIZED,
+                v.invalid_token_challenge(),
+            ),
+            (
+                vec![("x-api-key", b"wrong-key")],
+                StatusCode::UNAUTHORIZED,
+                v.invalid_token_challenge(),
+            ),
+            // A blank source never hides a bad one.
+            (
+                vec![("authorization", b"Bearer "), ("x-api-key", b"wrong-key")],
+                StatusCode::UNAUTHORIZED,
+                v.invalid_token_challenge(),
+            ),
+            // Only the first value is authenticated, but a non-blank later one
+            // is still something presented, not nothing.
+            (
+                vec![
+                    ("authorization", b"Bearer "),
+                    ("authorization", b"Bearer junk"),
+                ],
+                StatusCode::UNAUTHORIZED,
+                v.invalid_token_challenge(),
+            ),
+            // Not visible ASCII: unreadable, so not provably blank.
+            (
+                vec![("authorization", b"Bearer \xff")],
+                StatusCode::UNAUTHORIZED,
+                v.invalid_token_challenge(),
+            ),
+            (
+                vec![("authorization", unscoped.as_bytes())],
+                StatusCode::FORBIDDEN,
+                v.insufficient_scope_challenge(),
+            ),
+        ];
+        for (headers, status, challenge) in &refused {
+            let before = ran();
+            let resp = send_raw(&optional, headers).await;
+            assert_eq!(resp.status(), *status, "{headers:?}");
+            assert_eq!(&www_authenticate(&resp), challenge, "{headers:?}");
+            let got = observed(resp).await;
+            assert_eq!(got.2, format!("refused {}", status.as_u16()).as_bytes());
+            assert_eq!(
+                got,
+                observed(send_raw(&strict, headers).await).await,
+                "{headers:?}"
+            );
+            assert_eq!(ran(), before, "the handler ran for {headers:?}");
+        }
+
+        // Accepted credentials are inserted as usual.
+        let valid = format!("Bearer {}", testing::valid_token());
+        let resp = send_raw(&optional, &[("authorization", valid.as_bytes())]).await;
+        assert_eq!(resp.status(), StatusCode::OK);
+        assert_eq!(body_bytes(resp).await, b"oauth user-1");
+        let resp = send_raw(&optional, &[("x-api-key", STATIC.as_bytes())]).await;
+        assert_eq!(resp.status(), StatusCode::OK);
+        assert_eq!(body_bytes(resp).await, b"static");
+    }
+
+    /// The marker path: a required extractor behind an `optional()` layer that
+    /// passed a request through answers with the response the non-optional
+    /// layer gives the same request, byte for byte (`on_reject` body included).
+    #[tokio::test]
+    async fn a_required_extractor_behind_an_optional_layer_gets_the_layers_own_refusal() {
+        let v = unreachable_validator();
+        let builder = || {
+            AuthLayer::builder()
+                .static_token(STATIC)
+                .oauth(Arc::clone(&v))
+                .on_reject(json_reject)
+        };
+        let runs = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let make = |layer: AuthLayer| {
+            let (r1, r2) = (Arc::clone(&runs), Arc::clone(&runs));
+            Router::new()
+                .route(
+                    "/test",
+                    get(move |_: Credential| async move {
+                        r1.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                    }),
+                )
+                .route(
+                    "/token",
+                    get(move |_: AuthorizedToken| async move {
+                        r2.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                    }),
+                )
+                .route_layer(layer)
+        };
+        let optional = make(builder().optional().build().unwrap());
+        let strict = make(builder().build().unwrap());
+        for path in ["/test", "/token"] {
+            let request = || Request::builder().uri(path).body(Body::empty()).unwrap();
+            let got = observed(optional.clone().oneshot(request()).await.unwrap()).await;
+            let want = observed(strict.clone().oneshot(request()).await.unwrap()).await;
+            assert_eq!(got.0, StatusCode::UNAUTHORIZED, "{path}");
+            assert_eq!(got, want, "{path}");
+            assert!(
+                got.1.iter().any(|(k, val)| k == "www-authenticate"
+                    && val == v.invalid_token_challenge().as_bytes()),
+                "{path}"
+            );
+        }
+        assert_eq!(runs.load(std::sync::atomic::Ordering::SeqCst), 0);
+
+        // Without OAuth, the static challenge — the same code path again.
+        let optional = make(
+            AuthLayer::builder()
+                .static_token(STATIC)
+                .optional()
+                .build()
+                .unwrap(),
+        );
+        let resp = optional
+            .oneshot(Request::builder().uri("/test").body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
+        assert_eq!(resp.headers()[WWW_AUTHENTICATE], DEFAULT_STATIC_CHALLENGE);
+    }
+
+    #[tokio::test]
+    async fn the_extractors_under_allow_unauthenticated() {
+        let app = Router::new()
+            .route(
+                "/test",
+                get(
+                    |c: Option<Credential>, t: Option<AuthorizedToken>| async move {
+                        assert!(c.is_none() && t.is_none());
+                        "none"
+                    },
+                ),
+            )
+            .route("/required", get(|_: Credential| async { "unreachable" }))
+            .route_layer(AuthLayer::allow_unauthenticated());
+        let resp = get_with_auth(&app, Some("Bearer anything")).await;
+        assert_eq!(resp.status(), StatusCode::OK);
+        assert_eq!(body_bytes(resp).await, b"none");
+        let resp = app
+            .oneshot(
+                Request::builder()
+                    .uri("/required")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
+        assert_eq!(resp.headers()[WWW_AUTHENTICATE], DEFAULT_STATIC_CHALLENGE);
+    }
+
+    /// A non-optional layer with the extractors answers exactly as with
+    /// `Extension<..>`: the extractor only ever sees what the layer passed.
+    #[tokio::test]
+    async fn a_non_optional_layer_with_extractors_matches_extension_handlers() {
+        let jwks = testing::spawn_jwks_server("200 OK", testing::jwks_body()).await;
+        let layer = AuthLayer::builder()
+            .static_token(STATIC)
+            .oauth(validator(&jwks.url))
+            .build()
+            .unwrap();
+        let via_extension = Router::new()
+            .route(
+                "/test",
+                get(|Extension(c): Extension<Credential>| async move { format!("{c:?}") }),
+            )
+            .route_layer(layer.clone());
+        let via_extractor = Router::new()
+            .route(
+                "/test",
+                get(|c: Credential| async move { format!("{c:?}") }),
+            )
+            .route_layer(layer);
+        let valid = format!("Bearer {}", testing::valid_token());
+        let unscoped = format!("Bearer {}", unscoped_token());
+        let expired = format!("Bearer {}", expired_token());
+        for header in [
+            None,
+            Some("Bearer "),
+            Some("Bearer secret"),
+            Some("Bearer wrong"),
+            Some(valid.as_str()),
+            Some(unscoped.as_str()),
+            Some(expired.as_str()),
+        ] {
+            assert_eq!(
+                observed(get_with_auth(&via_extractor, header).await).await,
+                observed(get_with_auth(&via_extension, header).await).await,
+                "{header:?}"
+            );
+        }
+    }
+
+    fn claims_with(extra: serde_json::Value) -> serde_json::Value {
+        let mut claims = serde_json::json!({
+            "iss": testing::ISSUER, "aud": testing::AUDIENCE,
+            "exp": testing::now() + 3600, "scope": "mcp:read mcp:write", "sub": "user-1",
+        });
+        for (k, v) in extra.as_object().unwrap() {
+            claims[k] = v.clone();
+        }
+        claims
+    }
+
+    #[test]
+    fn names_a_token_only_for_dpop_and_tab_separated_bearer() {
+        for value in [
+            "DPoP x",
+            "dpop x",
+            "DPoP",
+            "Bearer\tx",
+            "bearer\t x",
+            " Bearer x",
+            "\tBEARER\tx",
+        ] {
+            assert!(names_a_token(value), "{value:?}");
+        }
+        for value in [
+            "",
+            "Bearer",
+            "Bearer ",
+            "Bearer\t",
+            "Bearer \t ",
+            "Basic x",
+            "x",
+        ] {
+            assert!(!names_a_token(value), "{value:?}");
+        }
+        // The strict parsing is untouched.
+        assert_eq!(bearer_credential("Bearer\tx"), "");
+        assert_eq!(bearer_credential("DPoP x"), "");
+    }
+
+    /// Every presented-but-unacceptable shape the security review listed is
+    /// refused by an `optional()` layer exactly as by the same layer without
+    /// it — status, every header and body, byte for byte — and the handler
+    /// never runs.
+    #[tokio::test]
+    async fn an_optional_layer_refuses_every_presented_shape_like_the_strict_layer() {
+        use base64::Engine;
+        use base64::engine::general_purpose::URL_SAFE_NO_PAD;
+
+        let jwks = testing::spawn_jwks_server("200 OK", testing::jwks_body()).await;
+        let v = validator(&jwks.url);
+        let builder = || {
+            AuthLayer::builder()
+                .static_token(STATIC)
+                .oauth(Arc::clone(&v))
+                .sources([
+                    CredentialSource::authorization_bearer(),
+                    CredentialSource::Raw(HeaderName::from_static("x-api-key")),
+                ])
+                .on_reject(json_reject)
+        };
+        let runs = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let optional =
+            optional_extractor_app(builder().optional().build().unwrap(), Arc::clone(&runs));
+        let strict =
+            optional_extractor_app(builder().build().unwrap(), Arc::new(Default::default()));
+
+        let forged = testing::mint(
+            testing::KEY_B_PEM,
+            testing::KID_A,
+            &claims_with(serde_json::json!({})),
+        );
+        let wrong_aud = testing::mint(
+            testing::KEY_A_PEM,
+            testing::KID_A,
+            &claims_with(serde_json::json!({ "aud": "some-other-client" })),
+        );
+        let cnf = testing::mint(
+            testing::KEY_A_PEM,
+            testing::KID_A,
+            &claims_with(serde_json::json!({ "cnf": { "jkt": "abc" } })),
+        );
+        let valid = testing::valid_token();
+        let crit = {
+            let mut parts: Vec<String> = valid.split('.').map(str::to_string).collect();
+            parts[0] =
+                URL_SAFE_NO_PAD.encode(br#"{"alg":"RS256","kid":"test-key-a","crit":["exp"]}"#);
+            parts.join(".")
+        };
+
+        let cases: Vec<(&str, Vec<(&str, String)>)> = vec![
+            (
+                "forged",
+                vec![("authorization", format!("Bearer {forged}"))],
+            ),
+            (
+                "wrong aud",
+                vec![("authorization", format!("Bearer {wrong_aud}"))],
+            ),
+            (
+                "cnf bearer",
+                vec![("authorization", format!("Bearer {cnf}"))],
+            ),
+            ("crit", vec![("authorization", format!("Bearer {crit}"))]),
+            (
+                "BEARER forged",
+                vec![("authorization", format!("BEARER {forged}"))],
+            ),
+            (
+                "bearer bad",
+                vec![("authorization", "bearer not-a-jwt".to_string())],
+            ),
+            (
+                "Bearer<TAB>forged",
+                vec![("authorization", format!("Bearer\t{forged}"))],
+            ),
+            (
+                "Bearer<TAB>valid",
+                vec![("authorization", format!("Bearer\t{valid}"))],
+            ),
+            (
+                " Bearer forged",
+                vec![("authorization", format!(" Bearer {forged}"))],
+            ),
+            ("DPoP cnf", vec![("authorization", format!("DPoP {cnf}"))]),
+            (
+                "DPoP forged",
+                vec![("authorization", format!("DPoP {forged}"))],
+            ),
+            (
+                "Basic, then Bearer forged",
+                vec![
+                    ("authorization", "Basic x".to_string()),
+                    ("authorization", format!("Bearer {forged}")),
+                ],
+            ),
+            (
+                "blank Bearer, then Bearer forged",
+                vec![
+                    ("authorization", "Bearer ".to_string()),
+                    ("authorization", format!("Bearer {forged}")),
+                ],
+            ),
+        ];
+        for (name, headers) in &cases {
+            let headers: Vec<(&str, &[u8])> =
+                headers.iter().map(|(n, v)| (*n, v.as_bytes())).collect();
+            let before = runs.load(std::sync::atomic::Ordering::SeqCst);
+            let got = observed(send_raw(&optional, &headers).await).await;
+            let want = observed(send_raw(&strict, &headers).await).await;
+            assert_eq!(got.0, StatusCode::UNAUTHORIZED, "{name}");
+            assert!(
+                got.1.iter().any(|(k, val)| k == "www-authenticate"
+                    && val == v.invalid_token_challenge().as_bytes()),
+                "{name}"
+            );
+            assert_eq!(got, want, "{name}");
+            assert_eq!(
+                runs.load(std::sync::atomic::Ordering::SeqCst),
+                before,
+                "the handler ran for {name}"
+            );
+        }
+    }
+
+    /// An inner `optional()` layer extracts only what IT accepted: the outer
+    /// strict OAuth layer's token and credential are not visible behind it.
+    #[tokio::test]
+    async fn an_inner_optional_layer_does_not_leak_an_outer_layers_credential() {
+        let jwks = testing::spawn_jwks_server("200 OK", testing::jwks_body()).await;
+        let outer = AuthLayer::builder()
+            .oauth(validator(&jwks.url))
+            .build()
+            .unwrap();
+        let inner = AuthLayer::builder()
+            .static_token("inner-key")
+            .sources([CredentialSource::Raw(HeaderName::from_static("x-inner"))])
+            .optional()
+            .build()
+            .unwrap();
+        let runs = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let app = optional_extractor_app(inner, Arc::clone(&runs)).layer(outer);
+        let valid = format!("Bearer {}", testing::valid_token());
+
+        let resp = send_raw(&app, &[("authorization", valid.as_bytes())]).await;
+        assert_eq!(resp.status(), StatusCode::OK);
+        assert_eq!(body_bytes(resp).await, b"none");
+
+        // The inner layer's own acceptance is all the handler sees.
+        let resp = send_raw(
+            &app,
+            &[
+                ("authorization", valid.as_bytes()),
+                ("x-inner", b"inner-key"),
+            ],
+        )
+        .await;
+        assert_eq!(resp.status(), StatusCode::OK);
+        assert_eq!(body_bytes(resp).await, b"static");
+        assert_eq!(runs.load(std::sync::atomic::Ordering::SeqCst), 2);
+    }
+
+    /// Strict nested layers keep accumulating, as documented: `Credential` is
+    /// the innermost acceptance, `AuthorizedToken` the outer layer's.
+    #[tokio::test]
+    async fn strict_nested_layers_accumulate_extensions_as_documented() {
+        let jwks = testing::spawn_jwks_server("200 OK", testing::jwks_body()).await;
+        let outer = AuthLayer::builder()
+            .oauth(validator(&jwks.url))
+            .build()
+            .unwrap();
+        let inner = AuthLayer::builder()
+            .static_token("inner-key")
+            .sources([CredentialSource::Raw(HeaderName::from_static("x-inner"))])
+            .build()
+            .unwrap();
+        let app = Router::new()
+            .route(
+                "/test",
+                get(|c: Credential, t: AuthorizedToken| async move {
+                    format!(
+                        "{} {}",
+                        matches!(c, Credential::StaticToken),
+                        t.subject.unwrap_or_default()
+                    )
+                }),
+            )
+            .route_layer(inner)
+            .layer(outer);
+        let valid = format!("Bearer {}", testing::valid_token());
+
+        let resp = send_raw(
+            &app,
+            &[
+                ("authorization", valid.as_bytes()),
+                ("x-inner", b"inner-key"),
+            ],
+        )
+        .await;
+        assert_eq!(resp.status(), StatusCode::OK);
+        assert_eq!(body_bytes(resp).await, b"true user-1");
+
+        // The inner strict layer still refuses on its own terms.
+        let resp = send_raw(&app, &[("authorization", valid.as_bytes())]).await;
+        assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
+        assert_eq!(resp.headers()[WWW_AUTHENTICATE], DEFAULT_STATIC_CHALLENGE);
     }
 }

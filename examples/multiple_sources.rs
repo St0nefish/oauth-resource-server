@@ -21,7 +21,7 @@ use axum::body::Body;
 use axum::http::{HeaderName, Request, header};
 use axum::response::IntoResponse;
 use axum::routing::get;
-use axum::{Extension, Json, Router};
+use axum::{Json, Router};
 use oauth_resource_server::axum::{AuthLayer, CredentialSource, RejectContext, metadata_router};
 use oauth_resource_server::testing;
 use oauth_resource_server::{
@@ -139,7 +139,7 @@ fn json_rejection(cx: RejectContext<'_>) -> axum::response::Response {
         .into_response()
 }
 
-async fn whoami(Extension(credential): Extension<Credential>) -> Json<serde_json::Value> {
+async fn whoami(credential: Credential) -> Json<serde_json::Value> {
     Json(match credential {
         Credential::OAuth(token) => serde_json::json!({
             "via": "oauth",

@@ -24,6 +24,31 @@ Before 1.0, a breaking change increments the minor version.
   A fractional `exp`/`iat` is rounded as `jsonwebtoken` rounds it, and one beyond
   9999-12-31T23:59:59Z saturates to that instant.
   Closes #6.
+- axum extractors (feature `axum`): `AuthorizedToken` and `Credential`
+  implement `FromRequestParts`, and `Option<AuthorizedToken>` /
+  `Option<Credential>` work through `OptionalFromRequestParts`. A handler can
+  take `credential: Credential` instead of `Extension<Credential>`. When the
+  `AuthLayer` inserted nothing, the extractor refuses with that layer's own
+  401 and `WWW-Authenticate` challenge (built by the same code as the layer's
+  refusals, `on_reject` body included); the `Option` forms return `None`. On
+  a route no `AuthLayer` covers, all four answer 500 and log at `error`
+  instead of reading the request as anonymous. `Extension<..>` extraction
+  keeps working unchanged.
+- `AuthLayerBuilder::optional()`: a request that presents no credential
+  passes through with nothing inserted (logged at `debug`). A presented but
+  refused credential (invalid, expired, unknown, wrong static token, or
+  valid without the required scopes) gets the same 401/403 and challenge as
+  without `optional()`. "No credential" means every value of every configured
+  source header is absent or blank, as `authenticate()` classifies `Missing`;
+  a header value that is not visible ASCII, a non-blank later value of a
+  repeated header, any `DPoP`-scheme value and a `Bearer` value followed by a
+  tab and a token count as presented and are refused. An optional layer
+  removes any `Credential`/`AuthorizedToken` an outer layer inserted, so a
+  pass-through always extracts as `None`; strict layers are unchanged (their
+  extensions accumulate, now documented under "Nested layers"). `build()`
+  still refuses a layer with no static token and no validator.
+- A typed per-handler scope extractor is not included; it waits on
+  per-request 403 challenges (oauth-resource-server#4).
 
 ### Changed
 

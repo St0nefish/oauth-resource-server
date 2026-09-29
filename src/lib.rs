@@ -22,7 +22,7 @@
 | [`authenticate`], [`Credential`] | Framework-free checking of several candidate credentials against a static token and OAuth. |
 | [`Algorithm`], [`parse_algorithm`], [`AlgorithmError`] | The JWS algorithms a config may allow (never HMAC or `none`). |
 | [`static_token_policy`], [`StaticTokenDecision`] | The startup decision about a static API key alongside OAuth. |
-| [`axum::AuthLayer`], [`axum::require_auth`], [`axum::metadata_router`] | The axum integration (feature `axum`). |
+| [`axum::AuthLayer`], [`axum::require_auth`], [`axum::metadata_router`] | The axum integration (feature `axum`), including extractors for [`Credential`] and [`AuthorizedToken`]. |
 | [`env::oauth_config_from_env`], [`env::secret_from_env`] | Configuration from environment variables (feature `env`). |"
 )]
 // The last row links the `testing` module, which exists only with that feature;
