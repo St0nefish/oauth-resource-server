@@ -381,7 +381,7 @@ from, and never a local plan/review label ("chunk p2", "round one").
 
 ## Workflow
 
-**Pattern A (CI-gated)** on GitHub, `master` as the default branch. The
+**pr-manual-release** (CI-gated PRs, release on demand) on GitHub, `master` as the default branch. The
 repository settings below are configured on GitHub, not tracked in this tree,
 so they are maintainer-owned configuration rather than something a change in
 this repo can alter directly — treat them as always-in-effect policy:

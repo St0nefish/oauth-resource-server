@@ -1,6 +1,6 @@
 name: CI
 
-# Pattern A gating: `ci-pass` is the one status check the repository ruleset
+# pr-manual-release gating: `ci-pass` is the one status check the repository ruleset
 # requires. It runs no build steps of its own — it just fails unless every
 # job named in its `needs:` succeeded, so adding a job here only strengthens
 # the gate if it is added to both `needs:` and the explicit result check in
