@@ -80,7 +80,7 @@ testing = ["tokio/net", "tokio/io-util", "dep:serde"]
 # uses `ring`, which a rustls-based HTTP stack already compiles, so this adds no new
 # crypto implementation there. Revisit when jsonwebtoken offers a backend that is
 # neither unpatched nor a new build-tooling requirement.
-jsonwebtoken = "9.2"
+jsonwebtoken = "11.1"
 # JWKS and discovery fetches. The TLS backend is chosen by this crate's features;
 # bodies are read under a size cap and parsed with serde_json, so no reqwest
 # feature beyond TLS is needed.
