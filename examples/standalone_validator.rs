@@ -129,8 +129,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 println!("{what}: 403 insufficient_scope")
             }
             // 401: send `invalid_token_challenge()`. The reason is for your
-            // logs only; never return it to the caller.
-            Err(TokenRejection::Invalid(reason)) => println!("{what}: 401, reason: {reason}"),
+            // logs only; never return it to the caller. Its `kind()` is the
+            // stable, matchable part (`as_str()` for a metrics label).
+            Err(TokenRejection::Invalid(reason)) => {
+                println!("{what}: 401, kind {}, reason: {reason}", reason.kind())
+            }
             Err(other) => println!("{what}: 401 ({other:?})"),
         }
     }

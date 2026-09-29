@@ -400,12 +400,16 @@ impl AuthorizedToken {
 /// only — `missing credential`, `invalid token`, `insufficient scope` — and
 /// never [`Invalid`](Self::Invalid)'s reason, so a careless `format!("{e}")`
 /// in a response body cannot tell a caller which check failed. The reason is
-/// reachable through the variant itself and through `Debug`, for logs.
+/// reachable through the variant itself ([`InvalidToken`]) and through
+/// `Debug`, for logs.
 ///
 /// ```
-/// use oauth_resource_server::TokenRejection;
+/// use oauth_resource_server::{InvalidToken, InvalidTokenKind, TokenRejection};
 ///
-/// let e = TokenRejection::Invalid("token rejected: InvalidAudience".into());
+/// let e = TokenRejection::Invalid(InvalidToken::new(
+///     InvalidTokenKind::WrongAudience,
+///     "token rejected: InvalidAudience",
+/// ));
 /// assert_eq!(e.to_string(), "invalid token");
 /// assert!(format!("{e:?}").contains("InvalidAudience"));
 /// ```
@@ -419,15 +423,290 @@ pub enum TokenRejection {
     #[error("missing credential")]
     Missing,
     /// 401 `invalid_token`: malformed, unsigned, wrong issuer/audience/type,
-    /// expired, or signed by a key we could not obtain. The string is for logs
-    /// only — never return it to the caller, since telling an unauthenticated
-    /// client exactly which check failed is a free oracle.
+    /// expired, or signed by a key we could not obtain. The
+    /// [`InvalidToken`] says which check failed: its
+    /// [`kind`](InvalidToken::kind) is stable and matchable (a metrics label
+    /// via [`InvalidTokenKind::as_str`]), its [`detail`](InvalidToken::detail)
+    /// is for logs only — never return it to the caller, since telling an
+    /// unauthenticated client exactly which check failed is a free oracle.
     #[error("invalid token")]
-    Invalid(String),
+    Invalid(InvalidToken),
     /// 403 `insufficient_scope`: signature, issuer, audience and expiry all
     /// passed, but the token does not carry every required scope.
     #[error("insufficient scope")]
     InsufficientScope,
+}
+
+impl TokenRejection {
+    /// `Invalid` of `kind`: the one constructor every refusal this crate makes
+    /// goes through, so each site names its kind.
+    pub(crate) fn invalid(kind: InvalidTokenKind, detail: impl Into<String>) -> Self {
+        Self::Invalid(InvalidToken::new(kind, detail))
+    }
+}
+
+/// Why a credential was refused as [`TokenRejection::Invalid`]: a stable,
+/// matchable [`kind`](Self::kind) and a log-only [`detail`](Self::detail).
+///
+/// `Display` (and `Deref<Target = str>`) is the detail — the same reason text
+/// `Invalid` carried as a `String` before 0.2.0 — so logging it, calling
+/// `str` methods on it and comparing it with a string literal keep working.
+/// Match on [`kind`](Self::kind), never on the text: the kind a given refusal
+/// carries is part of this crate's semver contract, its wording is not.
+///
+/// Equality between two `InvalidToken`s compares the kind and the detail;
+/// equality with a `str` compares the detail only.
+///
+/// # Security
+///
+/// The detail names the check that failed and can quote token-derived text
+/// (truncated). Log it; never put it in a response body, where it would be a
+/// free oracle for an unauthenticated caller. The kind's
+/// [`as_str`](InvalidTokenKind::as_str) label is low-cardinality and meant for
+/// metrics and logs; this crate's own responses never carry it either.
+///
+/// # Examples
+///
+/// ```
+/// use oauth_resource_server::{InvalidToken, InvalidTokenKind, TokenRejection};
+///
+/// fn metrics_label(rejection: &TokenRejection) -> &'static str {
+///     match rejection {
+///         TokenRejection::Missing => "missing",
+///         TokenRejection::Invalid(invalid) => invalid.kind().as_str(),
+///         TokenRejection::InsufficientScope => "insufficient_scope",
+///         _ => "other",
+///     }
+/// }
+///
+/// let expired = TokenRejection::Invalid(InvalidToken::new(
+///     InvalidTokenKind::Expired,
+///     "token rejected: ExpiredSignature",
+/// ));
+/// assert_eq!(metrics_label(&expired), "expired");
+///
+/// // The 0.1 shapes still compile: a string converts (kind `Other`), and the
+/// // reason reads as a `str`.
+/// let legacy = TokenRejection::Invalid("custom refusal".into());
+/// if let TokenRejection::Invalid(reason) = &legacy {
+///     assert_eq!(reason.kind(), InvalidTokenKind::Other);
+///     assert!(reason.contains("custom"));
+///     assert_eq!(reason, "custom refusal");
+///     assert_eq!(reason.to_string(), "custom refusal");
+/// }
+/// ```
+///
+/// A `String` expression needs `.into()`: `Invalid(format!(..))` does not
+/// compile, `Invalid(format!(..).into())` does.
+///
+/// ```compile_fail
+/// # use oauth_resource_server::TokenRejection;
+/// let _ = TokenRejection::Invalid(format!("{} candidates", 3));
+/// ```
+#[derive(Debug, Clone, PartialEq, Eq)]
+#[non_exhaustive]
+pub struct InvalidToken {
+    kind: InvalidTokenKind,
+    detail: String,
+}
+
+impl InvalidToken {
+    /// A refusal of `kind`, with `detail` for the log. Every refusal this
+    /// crate makes is built here; an application building its own (in a test,
+    /// or for a check of its own) can name a kind the same way.
+    pub fn new(kind: InvalidTokenKind, detail: impl Into<String>) -> Self {
+        Self {
+            kind,
+            detail: detail.into(),
+        }
+    }
+
+    /// Which check refused the token: stable and matchable, see
+    /// [`InvalidTokenKind`].
+    pub fn kind(&self) -> InvalidTokenKind {
+        self.kind
+    }
+
+    /// The human-readable reason, for logs only (see the type's `# Security`).
+    /// Its wording may change in any release.
+    pub fn detail(&self) -> &str {
+        &self.detail
+    }
+}
+
+impl fmt::Display for InvalidToken {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(&self.detail)
+    }
+}
+
+/// Kind [`InvalidTokenKind::Other`]: what a 0.1-style
+/// `TokenRejection::Invalid(reason.into())` builds.
+impl From<String> for InvalidToken {
+    fn from(detail: String) -> Self {
+        Self::new(InvalidTokenKind::Other, detail)
+    }
+}
+
+/// Kind [`InvalidTokenKind::Other`]: what a 0.1-style
+/// `TokenRejection::Invalid("reason".into())` builds.
+impl From<&str> for InvalidToken {
+    fn from(detail: &str) -> Self {
+        Self::new(InvalidTokenKind::Other, detail)
+    }
+}
+
+/// The [`detail`](InvalidToken::detail), so `str` methods (`contains`,
+/// `starts_with`, ...) keep working on a 0.1-style `Invalid(reason)` binding.
+impl std::ops::Deref for InvalidToken {
+    type Target = str;
+
+    fn deref(&self) -> &str {
+        &self.detail
+    }
+}
+
+/// Compares the [`detail`](InvalidToken::detail) only.
+impl PartialEq<str> for InvalidToken {
+    fn eq(&self, other: &str) -> bool {
+        self.detail == other
+    }
+}
+
+/// Compares the [`detail`](InvalidToken::detail) only.
+impl PartialEq<&str> for InvalidToken {
+    fn eq(&self, other: &&str) -> bool {
+        self.detail == *other
+    }
+}
+
+/// Which check refused a token — see [`InvalidToken::kind`].
+///
+/// Each kind names one family of checks, and [`as_str`](Self::as_str) gives it
+/// a stable, low-cardinality `snake_case` label for metrics and alerting (for
+/// example, [`KeySetUnavailable`](Self::KeySetUnavailable) is an
+/// authorization-server outage, not junk traffic). Every kind is a 401
+/// `invalid_token`; the kind changes nothing about the response.
+///
+/// `#[non_exhaustive]`: a kind may be added in a minor release, so match with a
+/// wildcard arm. Which kind an existing refusal carries, and each kind's label,
+/// are stable; the [`InvalidToken::detail`] text is not.
+///
+/// # Examples
+///
+/// ```
+/// use oauth_resource_server::{InvalidToken, InvalidTokenKind};
+///
+/// /// Whether a refusal points at the authorization server rather than at the
+/// /// caller — worth an alert of its own.
+/// fn is_idp_trouble(invalid: &InvalidToken) -> bool {
+///     match invalid.kind() {
+///         InvalidTokenKind::KeySetUnavailable => true,
+///         InvalidTokenKind::Expired | InvalidTokenKind::BadSignature => false,
+///         _ => false,
+///     }
+/// }
+///
+/// let outage = InvalidToken::new(InvalidTokenKind::KeySetUnavailable, "JWKS refresh failed");
+/// assert!(is_idp_trouble(&outage));
+/// assert_eq!(outage.kind().as_str(), "key_set_unavailable");
+/// ```
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[non_exhaustive]
+pub enum InvalidTokenKind {
+    /// The credential is over the 16 KiB cap; refused before it is decoded.
+    TooLarge,
+    /// The credential is not three dot-separated segments: a mistyped static
+    /// token, or an opaque (non-JWT) access token.
+    NotJwt,
+    /// The JWS protected header is not a base64url JSON object this crate can
+    /// read (including an `alg` it does not know at all, such as `none`).
+    MalformedHeader,
+    /// The header lists critical extensions (`crit`, RFC 7515 §4.1.11), none of
+    /// which this crate supports.
+    CriticalHeader,
+    /// The header's `alg` is not in the configured allowlist.
+    AlgorithmNotAllowed,
+    /// The header's `typ` is not an access-token type (or is absent or `JWT`
+    /// while `require_at_jwt` is on).
+    TypeNotAllowed,
+    /// No held key matches the token's `kid` and `alg`: not in the key set
+    /// even after a refetch, or unknown while the unknown-`kid` refetch
+    /// cooldown runs.
+    KeyNotFound,
+    /// The key set could not be loaded: discovery or the JWKS fetch failed.
+    /// An authorization-server (or network) outage, not the caller's fault.
+    KeySetUnavailable,
+    /// The header checks passed but the rest does not decode: the payload is
+    /// not base64url JSON (an object), or the signature is not base64url.
+    MalformedToken,
+    /// The signature does not verify with the selected key (or the key could
+    /// not be used to verify it).
+    BadSignature,
+    /// `exp` is in the past (beyond the configured leeway).
+    Expired,
+    /// `nbf` is in the future (beyond the configured leeway).
+    NotYetValid,
+    /// `iss` is not exactly the configured issuer (including an `iss` array).
+    WrongIssuer,
+    /// No `aud` entry is an accepted audience.
+    WrongAudience,
+    /// A claim the checks need is absent: `exp`, `iss` or `aud`.
+    MissingClaim,
+    /// A registered claim has the wrong type: an `nbf` that is not a
+    /// NumericDate.
+    MalformedClaim,
+    /// The token carries `cnf` (a DPoP or mTLS sender constraint), which this
+    /// crate cannot verify and so refuses as a bearer token.
+    SenderConstrained,
+    /// Only a static token is configured (no OAuth validator) and no
+    /// credential is it.
+    StaticTokenMismatch,
+    /// Neither a static token nor an OAuth validator is configured.
+    NoMechanism,
+    /// A credential was accepted, but the handler needs an OAuth access token
+    /// (the axum `AuthorizedToken` extractor) and got a static token.
+    OAuthTokenRequired,
+    /// Anything else: every [`InvalidToken`] built from a `String` or `&str`,
+    /// and a decoder failure this crate cannot classify more precisely.
+    Other,
+}
+
+impl InvalidTokenKind {
+    /// A stable, lowercase `snake_case` label (`"expired"`, `"bad_signature"`,
+    /// `"key_set_unavailable"`, ...), for a metrics label or a log field. It
+    /// does not change between releases for an existing kind.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::TooLarge => "too_large",
+            Self::NotJwt => "not_jwt",
+            Self::MalformedHeader => "malformed_header",
+            Self::CriticalHeader => "critical_header",
+            Self::AlgorithmNotAllowed => "algorithm_not_allowed",
+            Self::TypeNotAllowed => "type_not_allowed",
+            Self::KeyNotFound => "key_not_found",
+            Self::KeySetUnavailable => "key_set_unavailable",
+            Self::MalformedToken => "malformed_token",
+            Self::BadSignature => "bad_signature",
+            Self::Expired => "expired",
+            Self::NotYetValid => "not_yet_valid",
+            Self::WrongIssuer => "wrong_issuer",
+            Self::WrongAudience => "wrong_audience",
+            Self::MissingClaim => "missing_claim",
+            Self::MalformedClaim => "malformed_claim",
+            Self::SenderConstrained => "sender_constrained",
+            Self::StaticTokenMismatch => "static_token_mismatch",
+            Self::NoMechanism => "no_mechanism",
+            Self::OAuthTokenRequired => "oauth_token_required",
+            Self::Other => "other",
+        }
+    }
+}
+
+impl fmt::Display for InvalidTokenKind {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(self.as_str())
+    }
 }
 
 /// The union of every configured scope claim, in first-seen order, deduplicated.
@@ -486,10 +765,13 @@ pub(crate) fn check_typ(
 ) -> Result<(), TokenRejection> {
     let Some(raw) = typ else {
         return if require_at_jwt {
-            Err(TokenRejection::Invalid(format!(
-                "token header has no typ and {} is on",
-                naming.key("require_at_jwt")
-            )))
+            Err(TokenRejection::invalid(
+                InvalidTokenKind::TypeNotAllowed,
+                format!(
+                    "token header has no typ and {} is on",
+                    naming.key("require_at_jwt")
+                ),
+            ))
         } else {
             Ok(())
         };
@@ -499,15 +781,18 @@ pub(crate) fn check_typ(
     match media {
         "at+jwt" => Ok(()),
         "jwt" if !require_at_jwt => Ok(()),
-        _ => Err(TokenRejection::Invalid(format!(
-            "token typ {:?} is not accepted as an access token{}",
-            for_log(raw),
-            if require_at_jwt {
-                format!(" ({} is on)", naming.key("require_at_jwt"))
-            } else {
-                String::new()
-            }
-        ))),
+        _ => Err(TokenRejection::invalid(
+            InvalidTokenKind::TypeNotAllowed,
+            format!(
+                "token typ {:?} is not accepted as an access token{}",
+                for_log(raw),
+                if require_at_jwt {
+                    format!(" ({} is on)", naming.key("require_at_jwt"))
+                } else {
+                    String::new()
+                }
+            ),
+        )),
     }
 }
 
@@ -645,33 +930,112 @@ mod tests {
 
     #[test]
     fn typ_rejection_reasons_name_the_setting_per_key_naming() {
+        let typ = |detail: &str| {
+            Err(TokenRejection::Invalid(InvalidToken::new(
+                InvalidTokenKind::TypeNotAllowed,
+                detail,
+            )))
+        };
         let dotted = KeyNamingBuf::Dotted("mcp.oauth".into());
         assert_eq!(
             check_typ(None, true, &dotted),
-            Err(TokenRejection::Invalid(
-                "token header has no typ and mcp.oauth.require_at_jwt is on".into()
-            ))
+            typ("token header has no typ and mcp.oauth.require_at_jwt is on")
         );
         assert_eq!(
             check_typ(Some("JWT"), true, &dotted),
-            Err(TokenRejection::Invalid(
-                "token typ \"JWT\" is not accepted as an access token \
-                 (mcp.oauth.require_at_jwt is on)"
-                    .into()
-            ))
+            typ("token typ \"JWT\" is not accepted as an access token \
+                 (mcp.oauth.require_at_jwt is on)")
         );
         assert_eq!(
             check_typ(Some("dpop+jwt"), false, &dotted),
-            Err(TokenRejection::Invalid(
-                "token typ \"dpop+jwt\" is not accepted as an access token".into()
-            ))
+            typ("token typ \"dpop+jwt\" is not accepted as an access token")
         );
         let env = KeyNamingBuf::Env("APP_OAUTH_".into());
         assert_eq!(
             check_typ(None, true, &env),
-            Err(TokenRejection::Invalid(
-                "token header has no typ and APP_OAUTH_REQUIRE_AT_JWT is on".into()
-            ))
+            typ("token header has no typ and APP_OAUTH_REQUIRE_AT_JWT is on")
         );
+    }
+
+    /// The 0.1 uses of `Invalid(String)` that 0.2 keeps compiling, each as a
+    /// consumer would write it.
+    #[test]
+    #[allow(clippy::op_ref, clippy::cmp_owned)]
+    fn invalid_token_keeps_the_string_uses_compiling() {
+        // Construction from a literal and from an owned `String`: kind `Other`.
+        let from_str = TokenRejection::Invalid("bad token".into());
+        let from_string = TokenRejection::Invalid(String::from("bad token").into());
+        assert_eq!(from_str, from_string);
+        let TokenRejection::Invalid(reason) = &from_str else {
+            panic!("not Invalid")
+        };
+        assert_eq!(reason.kind(), InvalidTokenKind::Other);
+        assert_eq!(reason.detail(), "bad token");
+        // `Display` is the detail, byte for byte; `format!`/`to_string` too.
+        assert_eq!(reason.to_string(), "bad token");
+        assert_eq!(format!("refused: {reason}"), "refused: bad token");
+        // `Deref<Target = str>`: `str` methods and `&str` coercion.
+        assert!(reason.contains("bad"));
+        assert!(reason.starts_with("bad "));
+        assert_eq!(reason.len(), 9);
+        let as_str: &str = reason;
+        assert_eq!(as_str, "bad token");
+        // `PartialEq<str>` and `PartialEq<&str>`, from a reference and a value.
+        assert!(reason == "bad token");
+        assert!(*reason == "bad token");
+        assert!(reason.clone() == "bad token");
+        assert!(&**reason == "bad token");
+        assert!(reason != "other");
+        // `matches!` on the variant, with and without a binding.
+        assert!(matches!(from_str, TokenRejection::Invalid(_)));
+        assert!(matches!(&from_str, TokenRejection::Invalid(r) if r.contains("bad")));
+        // Equality between two `InvalidToken`s includes the kind.
+        assert_ne!(
+            InvalidToken::new(InvalidTokenKind::Expired, "bad token"),
+            InvalidToken::from("bad token")
+        );
+        // `Debug` still carries the reason, for logs.
+        assert!(format!("{from_str:?}").contains("bad token"));
+        // `Invalid(format!(..))` alone no longer compiles; `.into()` does.
+        let n = 3;
+        let formatted = TokenRejection::Invalid(format!("{n} candidates").into());
+        assert!(matches!(formatted, TokenRejection::Invalid(r) if r == "3 candidates"));
+    }
+
+    #[test]
+    fn every_invalid_token_kind_label_is_distinct_snake_case() {
+        use InvalidTokenKind as K;
+        let all = [
+            K::TooLarge,
+            K::NotJwt,
+            K::MalformedHeader,
+            K::CriticalHeader,
+            K::AlgorithmNotAllowed,
+            K::TypeNotAllowed,
+            K::KeyNotFound,
+            K::KeySetUnavailable,
+            K::MalformedToken,
+            K::BadSignature,
+            K::Expired,
+            K::NotYetValid,
+            K::WrongIssuer,
+            K::WrongAudience,
+            K::MissingClaim,
+            K::MalformedClaim,
+            K::SenderConstrained,
+            K::StaticTokenMismatch,
+            K::NoMechanism,
+            K::OAuthTokenRequired,
+            K::Other,
+        ];
+        let labels: HashSet<&str> = all.iter().map(|k| k.as_str()).collect();
+        assert_eq!(labels.len(), all.len());
+        for (kind, label) in all.iter().zip(all.iter().map(|k| k.as_str())) {
+            assert!(
+                label.bytes().all(|b| b.is_ascii_lowercase() || b == b'_'),
+                "{label}"
+            );
+            assert_eq!(kind.to_string(), label);
+        }
     }
 }

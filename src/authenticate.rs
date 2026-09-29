@@ -8,7 +8,7 @@
 
 use subtle::ConstantTimeEq;
 
-use crate::token::{AuthorizedToken, TokenRejection};
+use crate::token::{AuthorizedToken, InvalidToken, InvalidTokenKind, TokenRejection};
 use crate::validator::{CachedAttempt, OAuthValidator};
 
 /// Which mechanism accepted a request.
@@ -69,8 +69,10 @@ pub enum Credential {
 ///   of any of them.
 /// - Otherwise [`TokenRejection::Missing`] if there was no non-blank candidate.
 /// - Otherwise [`TokenRejection::Invalid`] carrying the first candidate's
-///   reason — the validator's, when OAuth is configured. The reason is for logs
-///   only; never send it to the caller.
+///   [`InvalidToken`] — the validator's, when OAuth is configured, kind
+///   included; without OAuth, [`InvalidTokenKind::StaticTokenMismatch`] (or
+///   [`InvalidTokenKind::NoMechanism`] with nothing configured). Its detail
+///   is for logs only; never send it to the caller.
 ///
 /// Map a refusal to a response the same way the axum layer does: 403 with
 /// [`OAuthValidator::insufficient_scope_challenge`] for `InsufficientScope`,
@@ -141,14 +143,17 @@ pub async fn authenticate<'a>(
     }
 
     let Some(validator) = oauth else {
-        return Err(TokenRejection::Invalid(
-            if static_token.is_some() {
-                "credential does not match the static token"
-            } else {
-                "no credential mechanism is configured"
-            }
-            .to_string(),
-        ));
+        return Err(if static_token.is_some() {
+            TokenRejection::invalid(
+                InvalidTokenKind::StaticTokenMismatch,
+                "credential does not match the static token",
+            )
+        } else {
+            TokenRejection::invalid(
+                InvalidTokenKind::NoMechanism,
+                "no credential mechanism is configured",
+            )
+        });
     };
 
     // Two passes. The first decides every candidate it can from the keys
@@ -176,7 +181,7 @@ pub async fn authenticate<'a>(
     }
 
     let mut insufficient_scope = false;
-    let mut first_reason: Option<String> = None;
+    let mut first_reason: Option<InvalidToken> = None;
     for refusal in refusals.into_iter().flatten() {
         match refusal {
             TokenRejection::InsufficientScope => insufficient_scope = true,
@@ -187,15 +192,22 @@ pub async fn authenticate<'a>(
             // refusal all the same: whatever the validator says that is not
             // `Ok` must never read as acceptance.
             TokenRejection::Missing => {
-                first_reason.get_or_insert_with(|| "no credential presented".to_string());
+                first_reason.get_or_insert_with(|| {
+                    InvalidToken::new(InvalidTokenKind::Other, "no credential presented")
+                });
             }
         }
     }
     if insufficient_scope {
         return Err(TokenRejection::InsufficientScope);
     }
+    // Unreachable in practice (every non-blank candidate left a refusal),
+    // and still a refusal, never an acceptance.
     Err(TokenRejection::Invalid(first_reason.unwrap_or_else(|| {
-        "no candidate credential was accepted".to_string()
+        InvalidToken::new(
+            InvalidTokenKind::Other,
+            "no candidate credential was accepted",
+        )
     })))
 }
 
@@ -323,9 +335,10 @@ mod tests {
         );
         assert_eq!(
             authenticate(["x"], Some(""), None).await,
-            Err(TokenRejection::Invalid(
-                "no credential mechanism is configured".into()
-            ))
+            Err(TokenRejection::Invalid(InvalidToken::new(
+                InvalidTokenKind::NoMechanism,
+                "no credential mechanism is configured"
+            )))
         );
     }
 
@@ -352,9 +365,10 @@ mod tests {
         let token = testing::valid_token();
         assert_eq!(
             authenticate([token.as_str()], Some(STATIC), None).await,
-            Err(TokenRejection::Invalid(
-                "credential does not match the static token".into()
-            ))
+            Err(TokenRejection::Invalid(InvalidToken::new(
+                InvalidTokenKind::StaticTokenMismatch,
+                "credential does not match the static token"
+            )))
         );
     }
 
@@ -373,9 +387,10 @@ mod tests {
     async fn neither_mechanism_configured_accepts_nothing() {
         assert_eq!(
             authenticate([STATIC], None, None).await,
-            Err(TokenRejection::Invalid(
-                "no credential mechanism is configured".into()
-            ))
+            Err(TokenRejection::Invalid(InvalidToken::new(
+                InvalidTokenKind::NoMechanism,
+                "no credential mechanism is configured"
+            )))
         );
     }
 

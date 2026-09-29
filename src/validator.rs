@@ -20,8 +20,8 @@ use crate::jwks::{
     background_retry_delay, http_clients, keyless_retry_delay, redact_url,
 };
 use crate::token::{
-    AuthorizedToken, MAX_TOKEN_BYTES, TokenRejection, check_typ, extract_principal, extract_scopes,
-    for_log,
+    AuthorizedToken, InvalidTokenKind, MAX_TOKEN_BYTES, TokenRejection, check_typ,
+    extract_principal, extract_scopes, for_log,
 };
 
 /// Why an [`OAuthValidator`] could not be built.
@@ -739,21 +739,24 @@ impl OAuthValidator {
             return Err(TokenRejection::Missing);
         }
         if token.len() > MAX_TOKEN_BYTES {
-            return Err(TokenRejection::Invalid(format!(
-                "credential is {} bytes, over the {MAX_TOKEN_BYTES}-byte cap",
-                token.len()
-            )));
+            return Err(TokenRejection::invalid(
+                InvalidTokenKind::TooLarge,
+                format!(
+                    "credential is {} bytes, over the {MAX_TOKEN_BYTES}-byte cap",
+                    token.len()
+                ),
+            ));
         }
         if token.split('.').count() != 3 {
             // The single most useful hint in this crate for a new deployment:
             // Authelia (by default), Ory Hydra (by default) and others issue OPAQUE
             // access tokens, which no amount of JWKS can verify. (This is where an
             // RFC 7662 introspection backend would take over; see the type docs.)
-            return Err(TokenRejection::Invalid(
+            return Err(TokenRejection::invalid(
+                InvalidTokenKind::NotJwt,
                 "credential is not a JWT (a mistyped static token, or an opaque access \
                  token — this server validates JWT access tokens only; configure the \
-                 authorization server to issue JWT access tokens)"
-                    .into(),
+                 authorization server to issue JWT access tokens)",
             ));
         }
 
@@ -766,20 +769,23 @@ impl OAuthValidator {
         // `alg` string, verbatim), so it is truncated like every other
         // token-derived string that reaches a log line.
         let header = decode_header(token).map_err(|e| {
-            TokenRejection::Invalid(format!(
-                "malformed token header: {}",
-                for_log(&e.to_string())
-            ))
+            TokenRejection::invalid(
+                InvalidTokenKind::MalformedHeader,
+                format!("malformed token header: {}", for_log(&e.to_string())),
+            )
         })?;
         check_crit(token)?;
         let alg = Algorithm::from_jwt(header.alg)
             .filter(|_| self.jwt_algorithms.contains(&header.alg))
             .ok_or_else(|| {
-                TokenRejection::Invalid(format!(
-                    "token algorithm {:?} is not in {}",
-                    header.alg,
-                    self.config.key_naming.key("algorithms")
-                ))
+                TokenRejection::invalid(
+                    InvalidTokenKind::AlgorithmNotAllowed,
+                    format!(
+                        "token algorithm {:?} is not in {}",
+                        header.alg,
+                        self.config.key_naming.key("algorithms")
+                    ),
+                )
             })?;
         check_typ(
             header.typ.as_deref(),
@@ -808,7 +814,7 @@ impl OAuthValidator {
             // `jsonwebtoken`'s error kinds already distinguish bad signature from
             // bad issuer/audience/expiry; all of them are 401 `invalid_token` to the
             // caller, and only the log gets to know which.
-            TokenRejection::Invalid(format!("token rejected: {e}"))
+            TokenRejection::invalid(decode_error_kind(e.kind()), format!("token rejected: {e}"))
         })?;
         let claims = data.claims;
 
@@ -817,10 +823,13 @@ impl OAuthValidator {
         // StringOrURI, and "one of several issuers" is not a shape any real AS
         // emits, so anything but the exact string is refused.
         if claims.get("iss").and_then(Value::as_str) != Some(self.config.issuer.as_str()) {
-            return Err(TokenRejection::Invalid(format!(
-                "token iss is not a single string equal to {}",
-                self.config.key_naming.key("issuer")
-            )));
+            return Err(TokenRejection::invalid(
+                InvalidTokenKind::WrongIssuer,
+                format!(
+                    "token iss is not a single string equal to {}",
+                    self.config.key_naming.key("issuer")
+                ),
+            ));
         }
 
         // RFC 7519 §4.1.5: `nbf` is a NumericDate, and the token MUST NOT be
@@ -831,8 +840,9 @@ impl OAuthValidator {
         if let Some(nbf) = claims.get("nbf")
             && !nbf_is_numeric_date(nbf)
         {
-            return Err(TokenRejection::Invalid(
-                "token nbf is not a NumericDate (a non-negative number of seconds)".into(),
+            return Err(TokenRejection::invalid(
+                InvalidTokenKind::MalformedClaim,
+                "token nbf is not a NumericDate (a non-negative number of seconds)",
             ));
         }
 
@@ -843,8 +853,9 @@ impl OAuthValidator {
         // authorization server set up — exactly what RFC 9449 §7.2 and RFC 8705
         // §3 forbid a resource server to do.
         if claims.contains_key("cnf") {
-            return Err(TokenRejection::Invalid(
-                "token is sender-constrained (cnf); this server accepts bearer tokens only".into(),
+            return Err(TokenRejection::invalid(
+                InvalidTokenKind::SenderConstrained,
+                "token is sender-constrained (cnf); this server accepts bearer tokens only",
             ));
         }
 
@@ -1120,15 +1131,47 @@ pub(crate) fn check_crit(token: &str) -> Result<(), TokenRejection> {
         .ok()
         .and_then(|raw| serde_json::from_slice(&raw).ok())
         .ok_or_else(|| {
-            TokenRejection::Invalid("malformed token header: not a base64url JSON object".into())
+            TokenRejection::invalid(
+                InvalidTokenKind::MalformedHeader,
+                "malformed token header: not a base64url JSON object",
+            )
         })?;
     if header.contains_key("crit") {
-        return Err(TokenRejection::Invalid(
-            "token header lists critical extensions (crit), none of which this server supports"
-                .into(),
+        return Err(TokenRejection::invalid(
+            InvalidTokenKind::CriticalHeader,
+            "token header lists critical extensions (crit), none of which this server supports",
         ));
     }
     Ok(())
+}
+
+/// The [`InvalidTokenKind`] for a `jsonwebtoken::decode` failure. The header
+/// was already parsed and its `alg` allowlisted by `check_header`, so what is
+/// left is the signature, the payload's encoding and the claim checks.
+fn decode_error_kind(kind: &jsonwebtoken::errors::ErrorKind) -> InvalidTokenKind {
+    use jsonwebtoken::errors::ErrorKind as E;
+    match kind {
+        E::InvalidSignature
+        | E::InvalidEcdsaKey
+        | E::InvalidRsaKey(_)
+        | E::InvalidKeyFormat
+        | E::Crypto(_) => InvalidTokenKind::BadSignature,
+        E::ExpiredSignature => InvalidTokenKind::Expired,
+        E::ImmatureSignature => InvalidTokenKind::NotYetValid,
+        E::InvalidIssuer => InvalidTokenKind::WrongIssuer,
+        E::InvalidAudience => InvalidTokenKind::WrongAudience,
+        E::MissingRequiredClaim(_) => InvalidTokenKind::MissingClaim,
+        E::InvalidToken | E::Base64(_) | E::Json(_) | E::Utf8(_) => {
+            InvalidTokenKind::MalformedToken
+        }
+        E::InvalidAlgorithm | E::MissingAlgorithm | E::InvalidAlgorithmName => {
+            InvalidTokenKind::AlgorithmNotAllowed
+        }
+        // `InvalidSubject` (no `sub` check is configured), `RsaFailedSigning`
+        // (signing only) and any kind a later jsonwebtoken adds. Still a
+        // refusal: the kind only labels it.
+        _ => InvalidTokenKind::Other,
+    }
 }
 
 /// Whether `nbf` is a NumericDate jsonwebtoken actually checks: a non-negative
@@ -1207,6 +1250,7 @@ mod tests {
     use crate::config::KeyNamingBuf;
     use crate::jwks::{MAX_FETCH_BYTES, RefreshErrorKind};
     use crate::testing::*;
+    use crate::token::InvalidToken;
     use std::collections::HashMap;
     use std::sync::atomic::Ordering;
 
@@ -1995,7 +2039,10 @@ mod tests {
             cfg.key_naming = naming;
             assert_eq!(
                 validator_with(cfg).validate(&token).await.unwrap_err(),
-                TokenRejection::Invalid(expected.into())
+                TokenRejection::Invalid(InvalidToken::new(
+                    InvalidTokenKind::AlgorithmNotAllowed,
+                    expected
+                ))
             );
         }
     }
@@ -2138,11 +2185,11 @@ mod tests {
             );
             assert_eq!(
                 v.validate(&token).await,
-                Err(TokenRejection::Invalid(
+                Err(TokenRejection::Invalid(InvalidToken::new(
+                    InvalidTokenKind::CriticalHeader,
                     "token header lists critical extensions (crit), none of which this \
                      server supports"
-                        .into()
-                )),
+                ))),
                 "crit {crit}"
             );
         }
@@ -2174,9 +2221,10 @@ mod tests {
             );
             assert_eq!(
                 v.validate(&token).await,
-                Err(TokenRejection::Invalid(
-                    "token nbf is not a NumericDate (a non-negative number of seconds)".into()
-                )),
+                Err(TokenRejection::Invalid(InvalidToken::new(
+                    InvalidTokenKind::MalformedClaim,
+                    "token nbf is not a NumericDate (a non-negative number of seconds)"
+                ))),
                 "nbf {nbf}"
             );
         }
@@ -2226,10 +2274,10 @@ mod tests {
             );
             assert_eq!(
                 v.validate(&token).await,
-                Err(TokenRejection::Invalid(
+                Err(TokenRejection::Invalid(InvalidToken::new(
+                    InvalidTokenKind::SenderConstrained,
                     "token is sender-constrained (cnf); this server accepts bearer tokens only"
-                        .into()
-                )),
+                ))),
                 "cnf {cnf}"
             );
         }
@@ -2587,6 +2635,8 @@ mod tests {
             panic!("no key can be loaded");
         };
         assert_eq!(jwks.hits.load(Ordering::SeqCst), 2, "both fetches went out");
+        assert_eq!(reason.kind(), InvalidTokenKind::KeySetUnavailable);
+        let reason = reason.to_string();
 
         let status = v.key_set_status();
         assert_eq!(status.jwks_uri.as_deref(), Some(shown.as_str()));
@@ -3591,5 +3641,189 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(t.issued_at, None);
+    }
+
+    // ── rejection kinds ──────────────────────────────────────────────────────
+
+    fn kind_of<T: std::fmt::Debug>(r: Result<T, TokenRejection>) -> InvalidTokenKind {
+        match r {
+            Err(TokenRejection::Invalid(invalid)) => invalid.kind(),
+            other => panic!("expected Invalid, got {other:?}"),
+        }
+    }
+
+    /// `claims` plus the required scope plus `extra`.
+    fn scoped(extra: serde_json::Value) -> serde_json::Value {
+        let mut c = claims(serde_json::json!({"scope": "mcp:read"}));
+        for (k, val) in extra.as_object().unwrap() {
+            c[k] = val.clone();
+        }
+        c
+    }
+
+    /// Every kind a validation can refuse with, each reached through the real
+    /// path: a minted token (or header junk) against a live fake JWKS server.
+    #[tokio::test]
+    async fn every_validator_refusal_names_its_kind() {
+        use InvalidTokenKind as K;
+        let jwks = spawn_jwks_server("200 OK", jwks_body()).await;
+        let v = validator_no_cooldown(&jwks.url);
+        let good = scoped(serde_json::json!({}));
+        let mut no_exp = good.clone();
+        no_exp.as_object_mut().unwrap().remove("exp");
+        let later = now() + 365 * 24 * 3600;
+        let bad_signature_encoding = {
+            let t = mint(KEY_A_PEM, KID_A, &good);
+            format!("{}.@@@", &t[..t.rfind('.').unwrap()])
+        };
+
+        let cases: Vec<(String, InvalidTokenKind)> = vec![
+            ("a".repeat(MAX_TOKEN_BYTES + 1), K::TooLarge),
+            ("not-a-jwt".into(), K::NotJwt),
+            ("@@@.e30.sig".into(), K::MalformedHeader),
+            (
+                mint_raw_header(serde_json::json!({"alg": "none"}), good.clone()),
+                K::MalformedHeader,
+            ),
+            (
+                mint_raw_header(
+                    serde_json::json!({"alg": "RS256", "kid": KID_A, "crit": ["x"]}),
+                    good.clone(),
+                ),
+                K::CriticalHeader,
+            ),
+            (
+                mint_raw_header(
+                    serde_json::json!({"alg": "HS256", "kid": KID_A}),
+                    good.clone(),
+                ),
+                K::AlgorithmNotAllowed,
+            ),
+            (
+                mint_with(
+                    crate::Algorithm::RS256,
+                    Some(KID_A),
+                    Some("dpop+jwt"),
+                    &good,
+                ),
+                K::TypeNotAllowed,
+            ),
+            (mint(KEY_A_PEM, "no-such-kid", &good), K::KeyNotFound),
+            (
+                mint(KEY_A_PEM, KID_A, &"a JSON string, not an object"),
+                K::MalformedToken,
+            ),
+            (bad_signature_encoding, K::MalformedToken),
+            (mint(KEY_B_PEM, KID_A, &good), K::BadSignature),
+            (
+                mint(
+                    KEY_A_PEM,
+                    KID_A,
+                    &scoped(serde_json::json!({"exp": now() - 3600})),
+                ),
+                K::Expired,
+            ),
+            (
+                mint(KEY_A_PEM, KID_A, &scoped(serde_json::json!({"nbf": later}))),
+                K::NotYetValid,
+            ),
+            (
+                mint(
+                    KEY_A_PEM,
+                    KID_A,
+                    &scoped(serde_json::json!({"iss": "https://other.example.test/"})),
+                ),
+                K::WrongIssuer,
+            ),
+            (
+                mint(
+                    KEY_A_PEM,
+                    KID_A,
+                    &scoped(serde_json::json!({"iss": [ISSUER]})),
+                ),
+                K::WrongIssuer,
+            ),
+            (
+                mint(
+                    KEY_A_PEM,
+                    KID_A,
+                    &scoped(serde_json::json!({"aud": "someone-else"})),
+                ),
+                K::WrongAudience,
+            ),
+            (mint(KEY_A_PEM, KID_A, &no_exp), K::MissingClaim),
+            (
+                mint(
+                    KEY_A_PEM,
+                    KID_A,
+                    &scoped(serde_json::json!({"nbf": "later"})),
+                ),
+                K::MalformedClaim,
+            ),
+            (
+                mint(
+                    KEY_A_PEM,
+                    KID_A,
+                    &scoped(serde_json::json!({"cnf": {"jkt": "x"}})),
+                ),
+                K::SenderConstrained,
+            ),
+        ];
+        for (token, expected) in cases {
+            let got = kind_of(v.validate(&token).await);
+            assert_eq!(got, expected, "token {}", for_log(&token));
+        }
+        // The same kinds come out of the cache-only pass `authenticate` runs,
+        // and out of `authenticate`, which reports the first candidate's.
+        let expired = mint(
+            KEY_A_PEM,
+            KID_A,
+            &scoped(serde_json::json!({"exp": now() - 3600})),
+        );
+        let CachedAttempt::Decided(r) = v.validate_cached(&expired).await else {
+            panic!("the key is cached by now");
+        };
+        assert_eq!(kind_of(r), K::Expired);
+        assert_eq!(
+            kind_of(crate::authenticate([expired.as_str(), "x"], None, Some(&v)).await),
+            K::Expired
+        );
+    }
+
+    /// An authorization server that cannot be reached is `KeySetUnavailable`
+    /// (an outage worth its own alert), not a verdict on the token.
+    #[tokio::test]
+    async fn an_unreachable_key_set_is_key_set_unavailable() {
+        let v = validator("http://127.0.0.1:1/jwks");
+        assert_eq!(
+            kind_of(v.validate(&valid_token()).await),
+            InvalidTokenKind::KeySetUnavailable
+        );
+        let jwks = spawn_jwks_server("500 Internal Server Error", "{}".into()).await;
+        let v = validator(&jwks.url);
+        assert_eq!(
+            kind_of(v.validate(&valid_token()).await),
+            InvalidTokenKind::KeySetUnavailable
+        );
+    }
+
+    /// An unknown `kid` during the refetch cooldown is `KeyNotFound`, like one
+    /// missing from a freshly fetched set.
+    #[tokio::test]
+    async fn an_unknown_kid_in_the_cooldown_is_key_not_found() {
+        let jwks = spawn_jwks_server("200 OK", jwks_body()).await;
+        let v = validator(&jwks.url);
+        let token = mint(
+            KEY_A_PEM,
+            "rotated-key",
+            &claims(serde_json::json!({"scope": "mcp:read"})),
+        );
+        for _ in 0..2 {
+            assert_eq!(
+                kind_of(v.validate(&token).await),
+                InvalidTokenKind::KeyNotFound
+            );
+        }
+        assert_eq!(jwks.hits.load(Ordering::SeqCst), 1);
     }
 }

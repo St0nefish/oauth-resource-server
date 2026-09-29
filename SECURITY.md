@@ -81,6 +81,10 @@ the ones a report is most likely to concern:
   whose configured challenge would not be one logs at `error` and uses a
   fallback without `resource_metadata`, and the layers refuse to build with
   it);
+- which check refused a token (`InvalidToken::kind()`) never changes the
+  response: every `TokenRejection::Invalid` is the same 401 with the same
+  challenge, and neither the kind nor the log-only detail reaches a response
+  the crate builds;
 - a configuration that would accept ID tokens as access tokens, or fetch keys
   from (or receive tokens at) a plain-`http` non-loopback URL — configured,
   discovered or reached by a redirect — is refused (at startup, or when the

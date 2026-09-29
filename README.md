@@ -630,11 +630,64 @@ returns, the crate sets the status (401 for a missing or invalid credential,
 the callback set: to the validator's challenge when OAuth is configured, and
 otherwise to the static challenge described below. `RejectContext` also
 carries the request's method, URI and headers, so the body can follow
-`Accept`. Never put the reason inside `TokenRejection::Invalid` in the body:
+`Accept`. Never put the detail inside `TokenRejection::Invalid` in the body:
 it says which check failed, which is an oracle for an attacker. The layer
-logs it instead. `RejectContext`'s `Debug` prints header names but no header
+logs it instead. (Its `kind()` is coarser, but this crate's own responses
+never carry it either; whether to expose it is your decision.) `RejectContext`'s `Debug` prints header names but no header
 values, and the credential headers are marked sensitive, so
 `tracing::warn!(?cx)` in the callback does not log the token.
+
+### Metrics: counting refusals by kind
+
+`TokenRejection::Invalid` holds an `InvalidToken`, whose `kind()` is an
+`InvalidTokenKind`: which check refused the token (`Expired`, `BadSignature`,
+`WrongAudience`, `KeySetUnavailable`, ...). `kind().as_str()` is a stable,
+low-cardinality `snake_case` label, so it can go straight into a metrics
+label; the human-readable `detail()` cannot (it is unbounded, and for logs
+only). `on_reject` sees every refusal, so it is one place to count them:
+
+```rust
+use std::sync::Arc;
+
+use axum::response::IntoResponse;
+use oauth_resource_server::axum::{AuthLayer, AuthLayerError, RejectContext};
+use oauth_resource_server::{InvalidTokenKind, OAuthValidator, TokenRejection};
+
+/// Stand-in for your metrics library's counter.
+fn count_refusal(reason: &'static str) {
+    let _ = reason;
+}
+
+fn layer(oauth: Arc<OAuthValidator>) -> Result<AuthLayer, AuthLayerError> {
+    AuthLayer::builder()
+        .oauth(oauth)
+        .on_reject(|cx: RejectContext<'_>| {
+            let reason = match cx.rejection {
+                TokenRejection::Missing => "missing",
+                TokenRejection::InsufficientScope => "insufficient_scope",
+                TokenRejection::Invalid(invalid) => {
+                    if invalid.kind() == InvalidTokenKind::KeySetUnavailable {
+                        // The authorization server is unreachable: an outage to
+                        // alert on, not junk traffic.
+                        tracing::error!(detail = %invalid, "signing keys unavailable");
+                    }
+                    invalid.kind().as_str()
+                }
+                _ => "other",
+            };
+            count_refusal(reason);
+            cx.status.into_response()
+        })
+        .build()
+}
+```
+
+The same `TokenRejection` comes back from `authenticate` and
+`OAuthValidator::validate` on any other stack. Every kind is a 401
+`invalid_token`: the kind never changes the response. The labels, and which
+kind a given refusal carries, are stable across releases (a new kind may be
+added in a minor release, so match with a wildcard arm); the detail text is
+not.
 
 **Without OAuth**, a 401 carries `WWW-Authenticate: Bearer error="invalid_token"`
 (`axum::DEFAULT_STATIC_CHALLENGE`), because RFC 9110 §15.5.2 requires every 401
@@ -1077,7 +1130,8 @@ For each candidate credential, `OAuthValidator::validate`:
 
 The result is an `AuthorizedToken` (`subject`, `principal`, `scopes`, plus the
 verified claims and token metadata) or a
-`TokenRejection` (`Missing`, `Invalid(reason)` or `InsufficientScope`).
+`TokenRejection` (`Missing`, `Invalid(InvalidToken)` or `InsufficientScope`;
+an `InvalidToken`'s `kind()` names the check that failed).
 
 ### Guarantees
 
@@ -1442,7 +1496,8 @@ async fn check(
     authenticate(candidates, static_token, Some(oauth))
         .await
         .map_err(|rejection| {
-            // Log `rejection` (an `Invalid` carries its reason); never send it.
+            // Log `rejection` (an `Invalid` carries its kind and detail);
+            // never send it.
             let r = refusal(&rejection, Some(oauth));
             (r.status, r.www_authenticate)
         })
@@ -1463,7 +1518,8 @@ outside authentication, as in [Readiness and liveness
 probes](#readiness-and-liveness-probes) (never from `refresh_now()`, which
 fetches every time). `TokenRejection` is a `std::error::Error` whose `Display` is only its category
 (`invalid token`), so `?` and `{e}` never expose the reason; the reason is in
-the variant and in `Debug`, for your log.
+the variant (an `InvalidToken`: `kind()` for code and metrics, `detail()` for
+your log) and in `Debug`.
 [`examples/hyper.rs`](https://github.com/St0nefish/oauth-resource-server/blob/master/examples/hyper.rs)
 is a complete hyper 1.x server built this way, and
 [`examples/standalone_validator.rs`](https://github.com/St0nefish/oauth-resource-server/blob/master/examples/standalone_validator.rs)
@@ -1648,11 +1704,12 @@ is logged at `warn` like any other refusal. Enable `debug` for that target while
 this:
 
 ```text
-WARN oauth_resource_server::axum: OAuth bearer auth rejected path=/v1/things reason=Invalid("token rejected: InvalidAudience")
+WARN oauth_resource_server::axum: OAuth bearer auth rejected path=/v1/things reason=Invalid(InvalidToken { kind: WrongAudience, detail: "token rejected: InvalidAudience" })
 ```
 
 With only a static token configured, the line is `Bearer auth rejected`, with
-no reason. The validator and key-set messages come from the targets
+no reason. The table below is keyed on the detail text, which is for reading
+logs; in code, match `InvalidToken::kind()` instead. The validator and key-set messages come from the targets
 `oauth_resource_server::validator` and `oauth_resource_server::jwks`.
 
 | Reason or log line | Cause and fix |
@@ -1825,11 +1882,13 @@ A new minor release is required for:
 change in any release, a patch included. The troubleshooting table above is
 for reading logs; do not string-match these messages in code. Match on the
 types instead (`TokenRejection`, `ValidatorError`, `AuthLayerError`, and so
-on) and, for configuration problems, on `ConfigProblem::kind()`
-(`ProblemKind`) and `keys()`, which are the durable alternative to matching
-the sentence. The `ProblemKind` a given problem carries is part of the
-contract (reclassifying one is a breaking change; adding a variant is not),
-while its message text is not.
+on): for a refused token, on `InvalidToken::kind()` (`InvalidTokenKind`,
+with `as_str()` labels for metrics), and for configuration problems, on
+`ConfigProblem::kind()` (`ProblemKind`) and `keys()`. These are the durable
+alternative to matching the sentence. The kind a given refusal or problem
+carries, and each kind's `as_str()` label, are part of the contract
+(reclassifying one is a breaking change; adding a variant is not), while the
+message text (`InvalidToken::detail()`, `ConfigProblem::message()`) is not.
 
 ## License
 

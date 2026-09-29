@@ -27,7 +27,7 @@ use tracing::{debug, info, warn};
 
 use crate::algorithms::{Algorithm, key_algorithms, signing_algorithm};
 use crate::config::{KeyNamingBuf, ResolvedOAuthConfig};
-use crate::token::{TokenRejection, describe_kid, for_log};
+use crate::token::{InvalidTokenKind, TokenRejection, describe_kid, for_log};
 use crate::validator::{is_loopback_url, plain_http_non_loopback};
 
 /// How long an unknown `kid` is allowed to trigger a JWKS refetch again.
@@ -731,11 +731,14 @@ impl JwksStore {
         {
             // See `JWKS_MIN_REFETCH_INTERVAL`: `kid` comes from an unverified token
             // header, so an unknown one must not be able to schedule IdP traffic.
-            return Err(TokenRejection::Invalid(format!(
-                "no {alg} key for kid {} and the JWKS was refetched less than {}s ago",
-                describe_kid(kid),
-                self.min_refetch_interval.as_secs()
-            )));
+            return Err(TokenRejection::invalid(
+                InvalidTokenKind::KeyNotFound,
+                format!(
+                    "no {alg} key for kid {} and the JWKS was refetched less than {}s ago",
+                    describe_kid(kid),
+                    self.min_refetch_interval.as_secs()
+                ),
+            ));
         }
 
         if let Err(e) = self.refresh_detached(refreshing).await {
@@ -745,14 +748,20 @@ impl JwksStore {
                 "JWKS refresh failed — tokens signed by a key we do not already hold will \
                  be rejected until the next attempt"
             );
-            return Err(TokenRejection::Invalid(format!("JWKS refresh failed: {e}")));
+            return Err(TokenRejection::invalid(
+                InvalidTokenKind::KeySetUnavailable,
+                format!("JWKS refresh failed: {e}"),
+            ));
         }
 
         lookup(&self.jwks.read().await.keys, kid, alg).ok_or_else(|| {
-            TokenRejection::Invalid(format!(
-                "no {alg} key for kid {} in the fetched JWKS",
-                describe_kid(kid)
-            ))
+            TokenRejection::invalid(
+                InvalidTokenKind::KeyNotFound,
+                format!(
+                    "no {alg} key for kid {} in the fetched JWKS",
+                    describe_kid(kid)
+                ),
+            )
         })
     }
 

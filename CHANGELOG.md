@@ -8,6 +8,46 @@ Before 1.0, a breaking change increments the minor version.
 
 ## [Unreleased]
 
+### Breaking changes (0.2.0)
+
+This is the 0.2.0 breaking batch. **Upgrading from 0.1.x:** change your
+requirement to `oauth-resource-server = "0.2"` (Cargo treats 0.1 → 0.2 as
+incompatible, so a `"0.1"` requirement never picks it up). No response
+changes: the 401/403 split, every `WWW-Authenticate` challenge and every
+response body are byte-for-byte what 0.1 sent.
+
+- **`TokenRejection::Invalid` holds an `InvalidToken` instead of a
+  `String`.** `InvalidToken` (`#[non_exhaustive]`, `Clone`, `Debug`,
+  `PartialEq`, `Eq`) has `kind()`, a stable `InvalidTokenKind`, and
+  `detail()`, the log-only reason text 0.1 carried. `InvalidTokenKind`
+  (`#[non_exhaustive]`, `Copy`, `Hash`) names which check refused the token —
+  `TooLarge`, `NotJwt`, `MalformedHeader`, `CriticalHeader`,
+  `AlgorithmNotAllowed`, `TypeNotAllowed`, `KeyNotFound`,
+  `KeySetUnavailable`, `MalformedToken`, `BadSignature`, `Expired`,
+  `NotYetValid`, `WrongIssuer`, `WrongAudience`, `MissingClaim`,
+  `MalformedClaim`, `SenderConstrained`, `StaticTokenMismatch`,
+  `NoMechanism`, `OAuthTokenRequired`, `Other` — and `as_str()` gives each a
+  stable `snake_case` label for metrics (`"expired"`, `"key_set_unavailable"`,
+  ...). Every refusal the crate makes carries its specific kind;
+  `KeySetUnavailable` separates an authorization-server outage from junk
+  traffic. The kind a refusal carries and the labels are part of the semver
+  contract; the detail text is not. Closes oauth-resource-server#1 (narrowed:
+  `InsufficientScope` stays a unit variant, `Missing` is unchanged, and
+  `authenticate()`'s precedence is unchanged).
+
+  Migration: `InvalidToken`'s `Display` is the old reason text, byte for
+  byte, and it implements `Deref<Target = str>`, `PartialEq<str>`,
+  `PartialEq<&str>`, `From<String>` and `From<&str>` (kind `Other`), so
+  logging a reason, `reason.contains(..)`, `reason == "..."`,
+  `Invalid("..".into())` and `Invalid(_)` patterns keep compiling.
+  `Invalid(format!(..))` needs `Invalid(format!(..).into())`, and code that
+  needs an owned `String` takes `reason.to_string()` (or `detail()`). Two
+  `InvalidToken`s compare equal only when kind and detail both match, so a
+  test asserting `assert_eq!(r, Invalid("..".into()))` against a refusal the
+  crate made now fails (the hand-built one is kind `Other`): assert
+  `kind()` instead, or compare the detail. Stop string-matching reasons:
+  match `kind()`, and use `kind().as_str()` as a metrics label.
+
 ### Added
 
 - A general-purpose consumer test harness in the `testing` feature.

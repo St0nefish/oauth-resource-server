@@ -134,5 +134,5 @@ pub use jwks::{
 };
 pub use policy::{NoAuthConfigured, StaticTokenDecision, static_token_policy};
 pub use refusal::{DEFAULT_STATIC_CHALLENGE, Refusal, refusal, refusal_with_static_challenge};
-pub use token::{AuthorizedToken, TokenRejection};
+pub use token::{AuthorizedToken, InvalidToken, InvalidTokenKind, TokenRejection};
 pub use validator::{OAuthValidator, ValidatorError};
