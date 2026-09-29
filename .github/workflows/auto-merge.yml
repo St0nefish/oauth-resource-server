@@ -13,11 +13,14 @@ name: Auto-merge
 # both from a run triggered by a fork's PR, so this job only works for PRs
 # from branches of this repository — which is the intent.
 #
-# A PR that changes a file under `.github/workflows/` cannot be auto-merged:
-# GitHub refuses to let an App enable auto-merge on it without the
-# `workflows` permission, which this App deliberately does not hold (it
-# would let the App rewrite what CI runs). This job fails on such a PR and
-# the owner merges it by hand once `ci-pass` is green.
+# The App deliberately does not hold the `workflows` permission (it would let
+# the App rewrite what CI runs). A PR that changes a file under
+# `.github/workflows/` still auto-merges when its branch already contains
+# master's version of those files (#34). When master has changed a workflow
+# file the PR also touches since the branch was cut, the squash merge would
+# write workflow content that is not in the PR, and GitHub refuses to let an
+# App enable auto-merge without `workflows` (#27). This job then fails; merge
+# `master` into the branch and push, or merge by hand once `ci-pass` is green.
 #
 # Actions are pinned to full commit SHAs, release in the trailing comment.
 
@@ -48,8 +51,8 @@ jobs:
           permission-contents: write
           permission-pull-requests: write
           # No `workflows` permission: the installation does not grant it (asking
-          # for it fails token creation with a 422). Without it, a PR that
-          # changes a workflow file cannot be auto-merged — see the header.
+          # for it fails token creation with a 422). Without it, some PRs that
+          # change a workflow file cannot be auto-merged — see the header.
 
       - name: Enable auto-merge
         run: gh pr merge "$PR_NUMBER" --auto --squash --repo "$REPO"
