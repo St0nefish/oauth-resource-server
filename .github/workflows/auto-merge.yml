@@ -7,11 +7,17 @@ name: Auto-merge
 # The merge must be enabled with a GitHub App token, never GITHUB_TOKEN:
 # GitHub starts no new workflow runs for events GITHUB_TOKEN causes, so a
 # merge made with it would trigger neither the post-merge CI run on `master`
-# (ci.yml's `push` trigger) nor `release.yml`. The App's id is the `APP_ID`
-# repo variable and its key the `APP_PRIVATE_KEY` repo secret; the token is
-# narrowed to the two permissions merging needs. GitHub withholds both from
-# a run triggered by a fork's PR, so this job only works for PRs from
-# branches of this repository — which is the intent.
+# (ci.yml's `push` trigger) nor `release.yml`. The App's Client ID is the
+# `APP_CLIENT_ID` repo variable and its key the `APP_PRIVATE_KEY` repo secret;
+# the token is narrowed to the two permissions merging needs. GitHub withholds
+# both from a run triggered by a fork's PR, so this job only works for PRs
+# from branches of this repository — which is the intent.
+#
+# A PR that changes a file under `.github/workflows/` cannot be auto-merged:
+# GitHub refuses to let an App enable auto-merge on it without the
+# `workflows` permission, which this App deliberately does not hold (it
+# would let the App rewrite what CI runs). This job fails on such a PR and
+# the owner merges it by hand once `ci-pass` is green.
 #
 # Actions are pinned to full commit SHAs, release in the trailing comment.
 
@@ -35,16 +41,15 @@ jobs:
         id: app-token
         uses: actions/create-github-app-token@bcd2ba49218906704ab6c1aa796996da409d3eb1 # v3.2.0
         with:
-          # `app-id` is deprecated in v3 in favor of `client-id`, but still
-          # accepted; the repo stores the App's numeric id as APP_ID.
-          app-id: ${{ vars.APP_ID }}
+          # The App's Client ID (`Iv…`), not its numeric app id: v3
+          # deprecates `app-id` in favor of `client-id`.
+          client-id: ${{ vars.APP_CLIENT_ID }}
           private-key: ${{ secrets.APP_PRIVATE_KEY }}
           permission-contents: write
           permission-pull-requests: write
           # No `workflows` permission: the installation does not grant it (asking
-          # for it fails token creation with a 422), and it is not needed —
-          # GitHub performs the auto-merge, and PRs that change workflow files
-          # merge fine this way.
+          # for it fails token creation with a 422). Without it, a PR that
+          # changes a workflow file cannot be auto-merged — see the header.
 
       - name: Enable auto-merge
         run: gh pr merge "$PR_NUMBER" --auto --squash --repo "$REPO"

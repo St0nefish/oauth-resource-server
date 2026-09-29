@@ -440,9 +440,11 @@ this repo can alter directly — treat them as always-in-effect policy:
   container: nothing secret lives on that runner (CI jobs hold only a
   read-only token), and the job that can mint a crates.io token never runs
   there (see Release process).
-- A GitHub App's id (`APP_ID` repo variable) and private key
+- A GitHub App's Client ID (`APP_CLIENT_ID` repo variable) and private key
   (`APP_PRIVATE_KEY` repo secret) are what `auto-merge.yml` authenticates
-  with.
+  with. The App deliberately lacks the `workflows` permission, so a PR that
+  changes a file under `.github/workflows/` fails the auto-merge job and is
+  merged by hand once `ci-pass` is green.
 - A GitHub environment named `release`, whose deployment policy admits only
   `v*` tags, which `release.yml`'s `publish` job runs in; crates.io trusted
   publishing is bound to it.
