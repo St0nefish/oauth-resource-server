@@ -121,8 +121,9 @@ pub use algorithms::{Algorithm, AlgorithmError, DEFAULT_ALGORITHMS, parse_algori
 pub use authenticate::{Credential, authenticate};
 pub use challenge::PROTECTED_RESOURCE_METADATA_PREFIX;
 pub use config::{
-    ConfigError, DEFAULT_LEEWAY_SECS, DEFAULT_PRINCIPAL_CLAIMS, DEFAULT_SCOPE_CLAIMS, KeyNaming,
-    KeyNamingBuf, MAX_LEEWAY_SECS, OAuthConfig, ResolvedOAuthConfig,
+    ConfigError, ConfigProblem, DEFAULT_LEEWAY_SECS, DEFAULT_PRINCIPAL_CLAIMS,
+    DEFAULT_SCOPE_CLAIMS, KeyNaming, KeyNamingBuf, MAX_LEEWAY_SECS, OAuthConfig, ProblemKind,
+    ResolvedOAuthConfig,
 };
 pub use jwks::{KeySetStatus, RefreshError, RefreshErrorKind};
 pub use policy::{NoAuthConfigured, StaticTokenDecision, static_token_policy};
