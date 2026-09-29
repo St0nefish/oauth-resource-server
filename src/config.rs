@@ -695,7 +695,9 @@ pub struct OAuthConfig {
     /// no client, or another one, is refused (401,
     /// [`crate::InvalidTokenKind::ClientNotAllowed`]). `client_id` wins when
     /// both are present: a token whose `client_id` is not listed is refused
-    /// even if its `azp` is.
+    /// even if its `azp` is, and a `client_id` that is present but empty or
+    /// not a string is refused too, never read past to `azp` (stricter than
+    /// the `AuthorizedToken::client_id` accessor, which skips it).
     ///
     /// Empty (the default) checks nothing. Use it where the audience is
     /// shared: an authorization server that stamps an API identifier as `aud`
@@ -724,7 +726,10 @@ pub struct OAuthConfig {
     /// .unwrap();
     /// assert_eq!(resolved.allowed_client_ids, ["web-app", "cli"]);
     /// ```
-    #[cfg_attr(feature = "serde", serde(default))]
+    #[cfg_attr(
+        feature = "serde",
+        serde(default, skip_serializing_if = "Vec::is_empty")
+    )]
     pub allowed_client_ids: Vec<String>,
     /// Refuse a token issued more than this many seconds ago: `now - iat`
     /// must not exceed it, with [`OAuthConfig::leeway_secs`] of slack. With it
@@ -786,6 +791,14 @@ pub struct OAuthConfig {
     /// claims this crate already checks (`iss`, `aud`, `exp`, `nbf`, `iat`,
     /// `cnf`). Empty (the default) checks nothing. All refusals are 401.
     ///
+    /// Naming a scope claim (`scope`, `scp`, or any `scope_claims` entry), or
+    /// `azp`/`client_id`, is accepted but logged as a `warn` when the validator
+    /// is built: a scope string is compared as one whole value (use
+    /// `required_scopes`), and one client claim sidesteps
+    /// [`allowed_client_ids`](Self::allowed_client_ids)' precedence. An array
+    /// value is refused today; "any of these values" may be given that meaning
+    /// later, as an additive change.
+    ///
     /// # Examples
     ///
     /// ```
@@ -822,7 +835,10 @@ pub struct OAuthConfig {
     /// .unwrap_err();
     /// assert_eq!(err.problems.len(), 2);
     /// ```
-    #[cfg_attr(feature = "serde", serde(default))]
+    #[cfg_attr(
+        feature = "serde",
+        serde(default, skip_serializing_if = "BTreeMap::is_empty")
+    )]
     pub required_claims: BTreeMap<String, Value>,
 }
 
@@ -1203,7 +1219,8 @@ impl OAuthConfig {
                 ProblemKind::EmptyListEntry,
                 [key("allowed_client_ids")],
                 format!(
-                    "{} contains an empty entry — list the OAuth client IDs whose tokens                      are accepted",
+                    "{} contains an empty entry — list the OAuth client IDs whose tokens \
+                     are accepted",
                     key("allowed_client_ids")
                 ),
             ));
@@ -1215,7 +1232,8 @@ impl OAuthConfig {
                 ProblemKind::TokenAgeOutOfRange,
                 [key("max_token_age_secs")],
                 format!(
-                    "{} {age} is outside 1..={MAX_TOKEN_AGE_SECS} seconds (30 days) — leave it                      unset to not bound token age",
+                    "{} {age} is outside 1..={MAX_TOKEN_AGE_SECS} seconds (30 days) — leave it \
+                     unset to not bound token age",
                     key("max_token_age_secs")
                 ),
             ));
@@ -1226,11 +1244,13 @@ impl OAuthConfig {
                 Some("has an entry with a blank claim name".to_string())
             } else if RESERVED_REQUIRED_CLAIMS.contains(&name.as_str()) {
                 Some(format!(
-                    "names {name:?}, which this crate already checks (iss, aud, exp, nbf, iat,                      cnf) — use issuer/audience, leeway_secs or max_token_age_secs instead"
+                    "names {name:?}, which this crate already checks (iss, aud, exp, nbf, iat, \
+                     cnf) — use issuer/audience, leeway_secs or max_token_age_secs instead"
                 ))
             } else if !matches!(value, Value::String(_) | Value::Number(_) | Value::Bool(_)) {
                 Some(format!(
-                    "entry {name:?} requires {value}, but a required value must be a string,                      number or boolean (a token's array claim passes when it contains it)"
+                    "entry {name:?} requires {value}, but a required value must be a string, \
+                     number or boolean (a token's array claim passes when it contains it)"
                 ))
             } else {
                 None
@@ -2755,6 +2775,33 @@ required_claims:
         for p in err.problem_details() {
             assert_eq!(p.kind(), ProblemKind::InvalidRequiredClaim);
             assert_eq!(p.keys(), ["APP_OAUTH_REQUIRED_CLAIMS"]);
+        }
+    }
+
+    #[test]
+    fn no_problem_message_carries_a_run_of_spaces() {
+        // A dropped `\` at the end of a wrapped string literal leaves the next
+        // line's indentation inside the message.
+        for naming in [WIKI, KeyNaming::Env("APP_OAUTH_")] {
+            for (kind, edit, _) in one_problem_per_kind() {
+                let err = enabled(edit).resolve(naming).unwrap_err();
+                for problem in &err.problems {
+                    assert!(!problem.contains("  "), "{kind:?}: {problem:?}");
+                }
+            }
+        }
+    }
+
+    #[cfg(feature = "serde")]
+    #[test]
+    fn unset_claim_policy_settings_are_not_serialized() {
+        let yaml = serde_yaml_ng::to_string(&OAuthConfig::default()).unwrap();
+        for key in [
+            "allowed_client_ids",
+            "max_token_age_secs",
+            "required_claims",
+        ] {
+            assert!(!yaml.contains(key), "{key} in {yaml}");
         }
     }
 }

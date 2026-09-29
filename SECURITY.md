@@ -73,7 +73,9 @@ the ones a report is most likely to concern:
   `required_claims`) reads only claims the verified signature covers, runs
   after those rechecks and before the scope check (so its refusals are 401,
   never 403), and changes nothing when unset; with `max_token_age_secs` set,
-  a token without a readable `iat` is refused, never waved through;
+  a token without a readable `iat` is refused, never waved through, and with
+  `allowed_client_ids` set a `client_id` that is present but not a non-empty
+  string is refused rather than read past to `azp`;
 - every failure mode (fetch error, parse error, unknown key) fails closed —
   a failed refresh never discards keys already held, and the validator never
   falls back to accepting a token it cannot verify against the keys it has;

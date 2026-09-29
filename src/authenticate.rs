@@ -815,12 +815,11 @@ mod tests {
             authenticate([""], Some(""), None).await,
             Err(TokenRejection::Missing)
         );
-        assert_eq!(
+        crate::token::assert_invalid(
             authenticate(["x"], Some(""), None).await,
-            Err(TokenRejection::Invalid(InvalidToken::new(
-                InvalidTokenKind::NoMechanism,
-                "no credential mechanism is configured"
-            )))
+            InvalidTokenKind::NoMechanism,
+            "no credential mechanism is configured",
+            "",
         );
     }
 
@@ -845,12 +844,11 @@ mod tests {
     #[tokio::test]
     async fn static_only_refuses_a_jwt_without_validating_it() {
         let token = testing::valid_token();
-        assert_eq!(
+        crate::token::assert_invalid(
             authenticate([token.as_str()], Some(STATIC), None).await,
-            Err(TokenRejection::Invalid(InvalidToken::new(
-                InvalidTokenKind::StaticTokenMismatch,
-                "credential does not match the static token"
-            )))
+            InvalidTokenKind::StaticTokenMismatch,
+            "credential does not match the static token",
+            "",
         );
     }
 
@@ -867,12 +865,11 @@ mod tests {
 
     #[tokio::test]
     async fn neither_mechanism_configured_accepts_nothing() {
-        assert_eq!(
+        crate::token::assert_invalid(
             authenticate([STATIC], None, None).await,
-            Err(TokenRejection::Invalid(InvalidToken::new(
-                InvalidTokenKind::NoMechanism,
-                "no credential mechanism is configured"
-            )))
+            InvalidTokenKind::NoMechanism,
+            "no credential mechanism is configured",
+            "",
         );
     }
 
@@ -1072,12 +1069,11 @@ mod tests {
         }
         // No set, and an empty set, are "no static token", as `None` is.
         for set in [None, Some(&StaticTokens::new())] {
-            assert_eq!(
+            crate::token::assert_invalid(
                 authenticate_with_static_tokens(["x"], set, None).await,
-                Err(TokenRejection::Invalid(InvalidToken::new(
-                    InvalidTokenKind::NoMechanism,
-                    "no credential mechanism is configured"
-                )))
+                InvalidTokenKind::NoMechanism,
+                "no credential mechanism is configured",
+                "",
             );
         }
     }
@@ -1109,13 +1105,11 @@ mod tests {
     async fn a_wrong_token_is_refused() {
         let set = rotation();
         for candidate in ["key-", "key-current ", "KEY-CURRENT", "key-nextx", "other"] {
-            assert_eq!(
+            crate::token::assert_invalid(
                 authenticate_with_static_tokens([candidate], Some(&set), None).await,
-                Err(TokenRejection::Invalid(InvalidToken::new(
-                    InvalidTokenKind::StaticTokenMismatch,
-                    "credential does not match any static token"
-                ))),
-                "{candidate}"
+                InvalidTokenKind::StaticTokenMismatch,
+                "credential does not match any static token",
+                candidate,
             );
         }
         assert_eq!(

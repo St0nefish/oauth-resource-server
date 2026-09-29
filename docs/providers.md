@@ -211,7 +211,7 @@ token with the checklist below.
 |---|---|---|
 | Keycloak | `documented_shape_fixture_not_live_tested_keycloak` | Realm issuer; `typ: JWT` (`at+jwt` is an opt-in client switch since 26.2); `scope` string; `aud` includes the client (set `audience` to it); `azp` names the client; `preferred_username` present. |
 | Okta (custom authorization server) | `documented_shape_fixture_not_live_tested_okta_custom_as` | No `typ` header at all; `scp` array; `aud` is the configured API audience, shared by every client granted it; `cid` names the client, which `allowed_client_ids` does not read, so restrict clients with `required_claims: {cid: "<client id>"}` (see [Shared audiences](#shared-audiences-restrict-the-clients)). |
-| Microsoft Entra ID (v2.0) | `documented_shape_fixture_not_live_tested_entra_id_v2` | `typ: JWT`; `scp` a space-delimited string; `aud` is the API's own client id. |
+| Microsoft Entra ID (v2.0) | `documented_shape_fixture_not_live_tested_entra_id_v2` | `typ: JWT`; `scp` a space-delimited string; `aud` is the API's own client id, shared by every client granted the API. Microsoft documents the calling client as `azp` in v2.0 access tokens (list it in `allowed_client_ids`) and as `appid` in v1.0 ones, which only `required_claims: {appid: "<client id>"}` reaches. The fixture does not carry either claim (see [Shared audiences](#shared-audiences-restrict-the-clients)). |
 | Auth0 | `documented_shape_fixture_not_live_tested_auth0` | Issuer with a trailing slash; `aud` an array (API identifier plus `/userinfo`); `scope` string; both the classic (`typ: JWT`) and RFC 9068 (`at+jwt`) profiles work. The API identifier is shared by every client granted the API; `azp` names the client, so list yours in `allowed_client_ids` (see [Shared audiences](#shared-audiences-restrict-the-clients)). |
 | Ory Hydra (JWT strategy) | `documented_shape_fixture_not_live_tested_ory_hydra_jwt_strategy` | Only with `strategies.access_token: jwt` set (opaque is Hydra's default); `scp` is a list by default, a string with `oauth2.jwt.scope_claim: string`. |
 | Logto | `documented_shape_fixture_not_live_tested_logto_resource_indicator` | `aud` is the registered API resource indicator (RFC 8707); `scope` string; ES256 among its allowed signing algorithms. |
@@ -230,8 +230,10 @@ gets a token this crate accepts. Restrict it to the clients you mean to serve:
 - **`allowed_client_ids`** when the token names its client in `client_id`
   (RFC 9068) or `azp` (Auth0, Keycloak): `allowed_client_ids: ["<client id>"]`.
 - **`required_claims`** when the client is in some other claim, such as
-  Okta's `cid`: `required_claims: {cid: "<client id>"}`. A single value only;
-  for several clients there, check `AuthorizedToken::claims()` in the
+  Okta's `cid` or an Entra ID v1.0 token's `appid`:
+  `required_claims: {cid: "<client id>"}`. A single value only: an array value
+  is refused today (it may later mean "any of these", as an additive change),
+  so for several clients there, check `AuthorizedToken::claims()` in the
   application.
 
 `documented_shape_fixture_not_live_tested_shared_audience_client_restriction`

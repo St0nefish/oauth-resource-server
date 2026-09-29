@@ -733,10 +733,29 @@ impl JwksStore {
         {
             // See `JWKS_MIN_REFETCH_INTERVAL`: `kid` comes from an unverified token
             // header, so an unknown one must not be able to schedule IdP traffic.
+            // When the last attempt failed, or no key is held at all, the key
+            // is missing because the authorization server is unreachable, not
+            // because the token names a key it never published: that is an
+            // outage (`KeySetUnavailable`), which an operator alerts on.
+            let (outage, detail_suffix) = {
+                let status = self.status_fields();
+                if status.public.last_error.is_some() {
+                    (true, " (the last JWKS refresh failed)")
+                } else if status.public.keys == 0 {
+                    (true, " (no signing key is held)")
+                } else {
+                    (false, "")
+                }
+            };
             return Err(TokenRejection::invalid(
-                InvalidTokenKind::KeyNotFound,
+                if outage {
+                    InvalidTokenKind::KeySetUnavailable
+                } else {
+                    InvalidTokenKind::KeyNotFound
+                },
                 format!(
-                    "no {alg} key for kid {} and the JWKS was refetched less than {}s ago",
+                    "no {alg} key for kid {} and the JWKS was refetched less than {}s \
+                     ago{detail_suffix}",
                     describe_kid(kid),
                     self.min_refetch_interval.as_secs()
                 ),

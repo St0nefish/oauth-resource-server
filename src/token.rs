@@ -89,8 +89,10 @@ pub struct AuthorizedToken {
     /// non-negative number (the token is still accepted then). `None` on a token built with [`AuthorizedToken::new`].
     pub issued_at: Option<SystemTime>,
     /// The OAuth client the token was issued to: `client_id` (RFC 9068 §2.2),
-    /// else `azp`, the first that is a non-empty string — the same reading
-    /// [`crate::OAuthConfig::allowed_client_ids`] is checked against. `None` when the token
+    /// else `azp`, the first that is a non-empty string. The
+    /// [`crate::OAuthConfig::allowed_client_ids`] check reads the same claims
+    /// more strictly: there, a `client_id` that is present but empty or not a
+    /// string refuses the token instead of falling through to `azp`. `None` when the token
     /// carries neither, and on a token built with [`AuthorizedToken::new`].
     pub client_id: Option<String>,
     /// The token's `jti`, when it carried one as a non-empty string. `None` on
@@ -472,8 +474,12 @@ impl TokenRejection {
 /// Match on [`kind`](Self::kind), never on the text: the kind a given refusal
 /// carries is part of this crate's semver contract, its wording is not.
 ///
-/// Equality between two `InvalidToken`s compares the kind and the detail;
-/// equality with a `str` compares the detail only.
+/// Equality compares the **detail only** — between two `InvalidToken`s as
+/// with a `str` or `String` — so a 0.1-style
+/// `assert_eq!(r, TokenRejection::Invalid("..".into()))` keeps passing
+/// against a refusal the crate made. Assert [`kind`](Self::kind) separately
+/// when the kind matters. With the `serde` feature it serializes as the detail
+/// string, as the `String` did.
 ///
 /// # Security
 ///
@@ -521,7 +527,10 @@ impl TokenRejection {
 /// # use oauth_resource_server::TokenRejection;
 /// let _ = TokenRejection::Invalid(format!("{} candidates", 3));
 /// ```
-#[derive(Debug, Clone, PartialEq, Eq)]
+// Equality is hand-written, on the detail only (see the type docs). If `Hash`
+// is ever added it must hash the detail only too, or `a == b` would no longer
+// imply `hash(a) == hash(b)`.
+#[derive(Debug, Clone)]
 #[non_exhaustive]
 pub struct InvalidToken {
     kind: InvalidTokenKind,
@@ -549,6 +558,44 @@ impl InvalidToken {
     /// Its wording may change in any release.
     pub fn detail(&self) -> &str {
         &self.detail
+    }
+
+    /// The same as [`detail`](Self::detail), under the name 0.1's `String`
+    /// reason offered (`reason.as_str()`).
+    pub fn as_str(&self) -> &str {
+        &self.detail
+    }
+}
+
+/// Detail only; see the type docs.
+impl PartialEq for InvalidToken {
+    fn eq(&self, other: &Self) -> bool {
+        self.detail == other.detail
+    }
+}
+
+impl Eq for InvalidToken {}
+
+/// The detail, so `std::error::Error` consumers (`Box<dyn Error>`, `?` into
+/// `anyhow`) take an `InvalidToken` as they took the `String`. Log-only, like
+/// the detail itself.
+impl std::error::Error for InvalidToken {}
+
+/// Serializes as the [`detail`](InvalidToken::detail) string, so
+/// `json!({"reason": reason})` keeps producing what the 0.1 `String` did. That
+/// value is for logs only — never a response body.
+#[cfg(feature = "serde")]
+#[cfg_attr(docsrs, doc(cfg(feature = "serde")))]
+impl serde::Serialize for InvalidToken {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        serializer.serialize_str(&self.detail)
+    }
+}
+
+/// The detail, as the 0.1 `String` was.
+impl From<InvalidToken> for String {
+    fn from(invalid: InvalidToken) -> Self {
+        invalid.detail
     }
 }
 
@@ -595,6 +642,34 @@ impl PartialEq<str> for InvalidToken {
 impl PartialEq<&str> for InvalidToken {
     fn eq(&self, other: &&str) -> bool {
         self.detail == *other
+    }
+}
+
+/// Compares the [`detail`](InvalidToken::detail) only.
+impl PartialEq<String> for InvalidToken {
+    fn eq(&self, other: &String) -> bool {
+        self.detail == *other
+    }
+}
+
+/// Compares the [`detail`](InvalidToken::detail) only.
+impl PartialEq<InvalidToken> for str {
+    fn eq(&self, other: &InvalidToken) -> bool {
+        self == other.detail
+    }
+}
+
+/// Compares the [`detail`](InvalidToken::detail) only.
+impl PartialEq<InvalidToken> for &str {
+    fn eq(&self, other: &InvalidToken) -> bool {
+        *self == other.detail
+    }
+}
+
+/// Compares the [`detail`](InvalidToken::detail) only.
+impl PartialEq<InvalidToken> for String {
+    fn eq(&self, other: &InvalidToken) -> bool {
+        *self == other.detail
     }
 }
 
@@ -648,12 +723,14 @@ pub enum InvalidTokenKind {
     /// The header's `typ` is not an access-token type (or is absent or `JWT`
     /// while `require_at_jwt` is on).
     TypeNotAllowed,
-    /// No held key matches the token's `kid` and `alg`: not in the key set
-    /// even after a refetch, or unknown while the unknown-`kid` refetch
-    /// cooldown runs.
+    /// No held key matches the token's `kid` and `alg` while the key set is
+    /// healthy: not in it even after a refetch, or unknown while the
+    /// unknown-`kid` refetch cooldown runs and the last refresh succeeded.
     KeyNotFound,
-    /// The key set could not be loaded: discovery or the JWKS fetch failed.
-    /// An authorization-server (or network) outage, not the caller's fault.
+    /// The key set could not be loaded: discovery or the JWKS fetch failed,
+    /// including during the refetch cooldown when the last refresh failed or
+    /// no key is held at all. An authorization-server (or network) outage,
+    /// not the caller's fault.
     KeySetUnavailable,
     /// The header checks passed but the rest does not decode: the payload is
     /// not base64url JSON (an object), or the signature is not base64url.
@@ -673,8 +750,9 @@ pub enum InvalidTokenKind {
     /// A claim the checks need is absent: `exp`, `iss` or `aud`; `iat` with
     /// `max_token_age_secs` set; a `required_claims` entry.
     MissingClaim,
-    /// A registered claim has the wrong type: an `nbf` (or, with
-    /// `max_token_age_secs` set, an `iat`) that is not a NumericDate.
+    /// A claim the checks need is present but unreadable: an `exp`, `iss` or
+    /// `aud` of the wrong type, an `nbf` (or, with `max_token_age_secs` set,
+    /// an `iat`) that is not a NumericDate.
     MalformedClaim,
     /// The token carries `cnf` (a DPoP or mTLS sender constraint), which this
     /// crate cannot verify and so refuses as a bearer token.
@@ -829,6 +907,26 @@ pub(crate) fn check_typ(
                 }
             ),
         )),
+    }
+}
+
+/// Test helper: `result` is an `Invalid` of `kind` with exactly `detail`.
+/// `InvalidToken`'s equality compares the detail only, so a test that means
+/// the kind too says so through this.
+#[cfg(test)]
+#[track_caller]
+pub(crate) fn assert_invalid<T: fmt::Debug>(
+    result: Result<T, TokenRejection>,
+    kind: InvalidTokenKind,
+    detail: &str,
+    context: &str,
+) {
+    match result {
+        Err(TokenRejection::Invalid(invalid)) => {
+            assert_eq!(invalid.kind(), kind, "{context}");
+            assert_eq!(invalid.detail(), detail, "{context}");
+        }
+        other => panic!("expected Invalid({kind:?}), got {other:?} {context}"),
     }
 }
 
@@ -991,6 +1089,13 @@ mod tests {
             check_typ(None, true, &env),
             typ("token header has no typ and APP_OAUTH_REQUIRE_AT_JWT is on")
         );
+        // Equality is detail-only, so the kind is asserted on its own.
+        for (t, require) in [(None, true), (Some("JWT"), true), (Some("dpop+jwt"), false)] {
+            let Err(TokenRejection::Invalid(invalid)) = check_typ(t, require, &dotted) else {
+                panic!("{t:?} passed");
+            };
+            assert_eq!(invalid.kind(), InvalidTokenKind::TypeNotAllowed);
+        }
     }
 
     /// The 0.1 uses of `Invalid(String)` that 0.2 keeps compiling, each as a
@@ -1025,11 +1130,28 @@ mod tests {
         // `matches!` on the variant, with and without a binding.
         assert!(matches!(from_str, TokenRejection::Invalid(_)));
         assert!(matches!(&from_str, TokenRejection::Invalid(r) if r.contains("bad")));
-        // Equality between two `InvalidToken`s includes the kind.
-        assert_ne!(
+        // Equality between two `InvalidToken`s compares the detail only, so
+        // a 0.1-style comparison with a hand-built reason keeps passing.
+        assert_eq!(
             InvalidToken::new(InvalidTokenKind::Expired, "bad token"),
             InvalidToken::from("bad token")
         );
+        assert_ne!(
+            InvalidToken::new(InvalidTokenKind::Expired, "bad token"),
+            InvalidToken::new(InvalidTokenKind::Expired, "other")
+        );
+        // `as_str`, `String` comparisons both ways, and `str`/`&str` on the left.
+        assert_eq!(reason.as_str(), "bad token");
+        let owned = String::from("bad token");
+        assert!(*reason == owned);
+        assert!(owned == *reason);
+        assert!("bad token" == *reason);
+        assert!("bad token" == reason.clone());
+        // Into an owned `String`, and into a boxed error.
+        let s: String = reason.clone().into();
+        assert_eq!(s, "bad token");
+        let boxed: Box<dyn std::error::Error> = reason.clone().into();
+        assert_eq!(boxed.to_string(), "bad token");
         // `Debug` still carries the reason, for logs.
         assert!(format!("{from_str:?}").contains("bad token"));
         // `Invalid(format!(..))` alone no longer compiles; `.into()` does.
@@ -1077,5 +1199,18 @@ mod tests {
             );
             assert_eq!(kind.to_string(), label);
         }
+    }
+
+    #[cfg(feature = "serde")]
+    #[test]
+    fn invalid_token_serializes_as_its_detail() {
+        let reason = InvalidToken::new(
+            InvalidTokenKind::Expired,
+            "token rejected: ExpiredSignature",
+        );
+        assert_eq!(
+            serde_json::json!({ "reason": reason }),
+            serde_json::json!({ "reason": "token rejected: ExpiredSignature" })
+        );
     }
 }

@@ -521,6 +521,16 @@ impl OAuthValidator {
             warn!("{message}");
         }
 
+        for (claim, why) in required_claim_footguns(config) {
+            warn!(
+                claim = %for_log(claim),
+                "{} names {:?}: {} — it still works, but probably not as intended",
+                naming.key("required_claims"),
+                for_log(claim),
+                why
+            );
+        }
+
         let metadata = challenge::metadata_document(config);
         let settings = builder.fetch_settings()?;
         let seed = builder.seed_keys()?;
@@ -821,7 +831,10 @@ impl OAuthValidator {
             // `jsonwebtoken`'s error kinds already distinguish bad signature from
             // bad issuer/audience/expiry; all of them are 401 `invalid_token` to the
             // caller, and only the log gets to know which.
-            TokenRejection::invalid(decode_error_kind(e.kind()), format!("token rejected: {e}"))
+            TokenRejection::invalid(
+                decode_error_kind(e.kind(), token),
+                format!("token rejected: {e}"),
+            )
         })?;
         let claims = data.claims;
 
@@ -912,6 +925,22 @@ impl OAuthValidator {
     fn check_claim_policy(&self, claims: &Map<String, Value>) -> Result<(), TokenRejection> {
         let config = &self.config;
         if !config.allowed_client_ids.is_empty() {
+            // Stricter than `client_id_of` (the `AuthorizedToken::client_id`
+            // accessor, which reads the first non-empty string): a `client_id`
+            // that is present but not a non-empty string is refused here
+            // rather than falling through to `azp`, so a token cannot pick
+            // which claim the allowlist reads by blanking or mistyping one.
+            if let Some(raw) = claims.get("client_id")
+                && raw.as_str().is_none_or(str::is_empty)
+            {
+                return Err(TokenRejection::invalid(
+                    InvalidTokenKind::ClientNotAllowed,
+                    format!(
+                        "token client_id is present but not a non-empty string, and {} is set",
+                        config.key_naming.key("allowed_client_ids")
+                    ),
+                ));
+            }
             match client_id_of(claims) {
                 Some(client) if config.allowed_client_ids.iter().any(|c| c == client) => {}
                 Some(client) => {
@@ -1248,8 +1277,27 @@ pub(crate) fn check_crit(token: &str) -> Result<(), TokenRejection> {
 /// The [`InvalidTokenKind`] for a `jsonwebtoken::decode` failure. The header
 /// was already parsed and its `alg` allowlisted by `check_header`, so what is
 /// left is the signature, the payload's encoding and the claim checks.
-fn decode_error_kind(kind: &jsonwebtoken::errors::ErrorKind) -> InvalidTokenKind {
+///
+/// jsonwebtoken reports a present-but-unreadable `exp`, `iss` or `aud` (a
+/// string `exp`, a numeric `iss`) as `MissingRequiredClaim`, the same as an
+/// absent one. It checks claims only after the signature verified, so the
+/// payload is signed by then; it is re-read here only to tell the two apart
+/// (`MalformedClaim` when the claim is there), never to trust anything in it.
+fn decode_error_kind(kind: &jsonwebtoken::errors::ErrorKind, token: &str) -> InvalidTokenKind {
     use jsonwebtoken::errors::ErrorKind as E;
+    if let E::MissingRequiredClaim(name) = kind {
+        let present = token
+            .split('.')
+            .nth(1)
+            .and_then(|payload| URL_SAFE_NO_PAD.decode(payload).ok())
+            .and_then(|raw| serde_json::from_slice::<Map<String, Value>>(&raw).ok())
+            .is_some_and(|claims| claims.contains_key(name));
+        return if present {
+            InvalidTokenKind::MalformedClaim
+        } else {
+            InvalidTokenKind::MissingClaim
+        };
+    }
     match kind {
         E::InvalidSignature
         | E::InvalidEcdsaKey
@@ -1350,6 +1398,32 @@ pub(crate) fn non_canonical_warnings(config: &ResolvedOAuthConfig) -> Vec<String
                 redact_url(value),
                 redact_url(&canonical),
             ))
+        })
+        .collect()
+}
+
+/// `required_claims` names that work but are probably a mistake, with why:
+/// a scope claim is matched as a whole value (a space-delimited `scope` string
+/// equals `"api:read"` only when that is its only scope), and `azp` /
+/// `client_id` sidestep `allowed_client_ids`' `client_id`-then-`azp`
+/// precedence. Logged once at startup; never refused, since each can be
+/// deliberate.
+fn required_claim_footguns(config: &ResolvedOAuthConfig) -> Vec<(&str, &'static str)> {
+    config
+        .required_claims
+        .keys()
+        .filter_map(|name| {
+            let why = if name == "scope"
+                || name == "scp"
+                || config.scope_claims.iter().any(|c| c == name)
+            {
+                "a scope claim is compared as one whole value (a space-delimited string                  matches only when it holds exactly that value); require scopes with                  required_scopes instead"
+            } else if name == "azp" || name == "client_id" {
+                "requiring one client claim bypasses allowed_client_ids' client_id-then-azp                  precedence; restrict clients with allowed_client_ids instead"
+            } else {
+                return None;
+            };
+            Some((name.as_str(), why))
         })
         .collect()
 }
@@ -1456,7 +1530,6 @@ mod tests {
     use crate::config::KeyNamingBuf;
     use crate::jwks::{MAX_FETCH_BYTES, RefreshErrorKind};
     use crate::testing::*;
-    use crate::token::InvalidToken;
     use std::collections::HashMap;
     use std::sync::atomic::Ordering;
 
@@ -2332,12 +2405,11 @@ mod tests {
             let mut cfg = oauth_config(&jwks.url);
             cfg.algorithms = vec![Algorithm::RS256];
             cfg.key_naming = naming;
-            assert_eq!(
-                validator_with(cfg).validate(&token).await.unwrap_err(),
-                TokenRejection::Invalid(InvalidToken::new(
-                    InvalidTokenKind::AlgorithmNotAllowed,
-                    expected
-                ))
+            crate::token::assert_invalid(
+                Err::<(), _>(validator_with(cfg).validate(&token).await.unwrap_err()),
+                InvalidTokenKind::AlgorithmNotAllowed,
+                expected,
+                "",
             );
         }
     }
@@ -2478,14 +2550,12 @@ mod tests {
                 }),
                 c.clone(),
             );
-            assert_eq!(
+            crate::token::assert_invalid(
                 v.validate(&token).await,
-                Err(TokenRejection::Invalid(InvalidToken::new(
-                    InvalidTokenKind::CriticalHeader,
-                    "token header lists critical extensions (crit), none of which this \
-                     server supports"
-                ))),
-                "crit {crit}"
+                InvalidTokenKind::CriticalHeader,
+                "token header lists critical extensions (crit), none of which this \
+                     server supports",
+                &format!("crit {crit}"),
             );
         }
         assert_eq!(jwks.hits.load(Ordering::SeqCst), 0);
@@ -2514,13 +2584,11 @@ mod tests {
                 KID_A,
                 &claims(serde_json::json!({"nbf": nbf, "scope": "mcp:read"})),
             );
-            assert_eq!(
+            crate::token::assert_invalid(
                 v.validate(&token).await,
-                Err(TokenRejection::Invalid(InvalidToken::new(
-                    InvalidTokenKind::MalformedClaim,
-                    "token nbf is not a NumericDate (a non-negative number of seconds)"
-                ))),
-                "nbf {nbf}"
+                InvalidTokenKind::MalformedClaim,
+                "token nbf is not a NumericDate (a non-negative number of seconds)",
+                &format!("nbf {nbf}"),
             );
         }
         // An array fails jsonwebtoken's own claim parsing: refused either way.
@@ -2567,13 +2635,11 @@ mod tests {
                 Some("at+jwt"),
                 &claims(serde_json::json!({"cnf": cnf, "scope": "mcp:read"})),
             );
-            assert_eq!(
+            crate::token::assert_invalid(
                 v.validate(&token).await,
-                Err(TokenRejection::Invalid(InvalidToken::new(
-                    InvalidTokenKind::SenderConstrained,
-                    "token is sender-constrained (cnf); this server accepts bearer tokens only"
-                ))),
-                "cnf {cnf}"
+                InvalidTokenKind::SenderConstrained,
+                "token is sender-constrained (cnf); this server accepts bearer tokens only",
+                &format!("cnf {cnf}"),
             );
         }
     }
@@ -4093,11 +4159,17 @@ mod tests {
     /// (an outage worth its own alert), not a verdict on the token.
     #[tokio::test]
     async fn an_unreachable_key_set_is_key_set_unavailable() {
+        // Real 60 s cooldown: the first request's refetch fails, and the two
+        // after it land inside the cooldown with no key held and the last
+        // attempt failed — still an outage, not an unknown key.
         let v = validator("http://127.0.0.1:1/jwks");
-        assert_eq!(
-            kind_of(v.validate(&valid_token()).await),
-            InvalidTokenKind::KeySetUnavailable
-        );
+        for attempt in 0..3 {
+            assert_eq!(
+                kind_of(v.validate(&valid_token()).await),
+                InvalidTokenKind::KeySetUnavailable,
+                "attempt {attempt}"
+            );
+        }
         let jwks = spawn_jwks_server("500 Internal Server Error", "{}".into()).await;
         let v = validator(&jwks.url);
         assert_eq!(
@@ -4157,10 +4229,23 @@ mod tests {
         let cases = [
             (serde_json::json!({"client_id": "client-a"}), Ok(())),
             (serde_json::json!({"azp": "client-b"}), Ok(())),
-            // An empty `client_id` is no client_id: `azp` decides.
+            // A `client_id` that is present but empty or not a string is
+            // refused outright: it never falls through to a listed `azp`.
             (
                 serde_json::json!({"client_id": "", "azp": "client-a"}),
-                Ok(()),
+                Err(K::ClientNotAllowed),
+            ),
+            (
+                serde_json::json!({"client_id": 7, "azp": "client-a"}),
+                Err(K::ClientNotAllowed),
+            ),
+            (
+                serde_json::json!({"client_id": null, "azp": "client-a"}),
+                Err(K::ClientNotAllowed),
+            ),
+            (
+                serde_json::json!({"client_id": ["client-a"], "azp": "client-a"}),
+                Err(K::ClientNotAllowed),
             ),
             // `client_id` wins over `azp`, so a listed `azp` cannot rescue an
             // unlisted `client_id`.
@@ -4207,6 +4292,18 @@ mod tests {
         );
         // The accepted token reports the client the check used.
         let t = v
+            .validate(&mint(
+                KEY_A_PEM,
+                KID_A,
+                &scoped(serde_json::json!({"azp": "client-b"})),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(t.client_id.as_deref(), Some("client-b"));
+        // Without the allowlist, the accessor keeps its "first non-empty
+        // string" reading: an empty `client_id` falls through to `azp`.
+        let (_jwks, open) = policy_validator(|_| {}).await;
+        let t = open
             .validate(&mint(
                 KEY_A_PEM,
                 KID_A,
@@ -4457,5 +4554,107 @@ mod tests {
             kind_of(v.validate(&okta_token("another-client")).await),
             InvalidTokenKind::ClaimMismatch
         );
+    }
+
+    /// With keys held, an unknown `kid` inside the cooldown is `KeyNotFound`
+    /// while the IdP is healthy, and `KeySetUnavailable` while the last
+    /// refresh failed: the kind follows the key set's state, not just the
+    /// cooldown.
+    #[tokio::test]
+    async fn the_cooldown_kind_follows_the_last_refresh() {
+        let server = spawn_http_server(
+            HashMap::from([("/jwks".to_string(), ("200 OK", jwks_body()))]),
+            None,
+        )
+        .await;
+        let v = validator(&format!("{}/jwks", server.base)); // real 60 s cooldown
+        v.refresh_now().await.unwrap();
+        let unknown = mint(
+            KEY_A_PEM,
+            "rotated-key",
+            &claims(serde_json::json!({"scope": "mcp:read"})),
+        );
+        assert_eq!(
+            kind_of(v.validate(&unknown).await),
+            InvalidTokenKind::KeyNotFound
+        );
+        // The IdP goes down; a refresh fails and is recorded.
+        server.routes.lock().unwrap().insert(
+            "/jwks".to_string(),
+            ("500 Internal Server Error", "{}".to_string()),
+        );
+        assert!(v.refresh_now().await.is_err());
+        for _ in 0..2 {
+            assert_eq!(
+                kind_of(v.validate(&unknown).await),
+                InvalidTokenKind::KeySetUnavailable
+            );
+        }
+        // A token whose key is held is still accepted meanwhile.
+        assert!(v.validate(&valid_token()).await.is_ok());
+        // Healthy again: back to `KeyNotFound`.
+        server
+            .routes
+            .lock()
+            .unwrap()
+            .insert("/jwks".to_string(), ("200 OK", jwks_body()));
+        v.refresh_now().await.unwrap();
+        assert_eq!(
+            kind_of(v.validate(&unknown).await),
+            InvalidTokenKind::KeyNotFound
+        );
+    }
+
+    /// A required claim that is present but unreadable is `MalformedClaim`;
+    /// only an absent one is `MissingClaim`.
+    #[tokio::test]
+    async fn an_unreadable_required_claim_is_malformed_not_missing() {
+        let jwks = spawn_jwks_server("200 OK", jwks_body()).await;
+        let v = validator(&jwks.url);
+        for extra in [
+            serde_json::json!({"exp": "tomorrow"}),
+            serde_json::json!({"exp": null}),
+            serde_json::json!({"iss": 7}),
+            serde_json::json!({"aud": 7}),
+            serde_json::json!({"aud": {"id": AUDIENCE}}),
+        ] {
+            let token = mint(KEY_A_PEM, KID_A, &scoped(extra.clone()));
+            assert_eq!(
+                kind_of(v.validate(&token).await),
+                InvalidTokenKind::MalformedClaim,
+                "{extra}"
+            );
+        }
+        for name in ["exp", "iss", "aud"] {
+            let mut c = scoped(serde_json::json!({}));
+            c.as_object_mut().unwrap().remove(name);
+            let token = mint(KEY_A_PEM, KID_A, &c);
+            assert_eq!(
+                kind_of(v.validate(&token).await),
+                InvalidTokenKind::MissingClaim,
+                "{name}"
+            );
+        }
+    }
+
+    #[test]
+    fn required_claims_on_scope_or_client_claims_are_warned_about_not_refused() {
+        let mut cfg = oauth_config("http://127.0.0.1:1/jwks");
+        cfg.scope_claims.push("roles".into());
+        cfg.required_claims = ["scope", "scp", "roles", "azp", "client_id", "tid"]
+            .into_iter()
+            .map(|n| (n.to_string(), serde_json::json!("x")))
+            .collect();
+        let named: Vec<&str> = required_claim_footguns(&cfg)
+            .into_iter()
+            .map(|(n, _)| n)
+            .collect();
+        assert_eq!(named, ["azp", "client_id", "roles", "scope", "scp"]);
+        // Still builds: a warning, never a refusal.
+        assert!(OAuthValidator::new(&cfg).is_ok());
+        cfg.required_claims = [("tid".to_string(), serde_json::json!("x"))]
+            .into_iter()
+            .collect();
+        assert!(required_claim_footguns(&cfg).is_empty());
     }
 }
