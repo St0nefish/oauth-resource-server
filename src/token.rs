@@ -104,7 +104,8 @@ impl fmt::Debug for AuthorizedToken {
             .field("subject", &self.subject)
             .field("principal", &self.principal)
             .field("scopes", &self.scopes)
-            .field("issuer", &self.issuer)
+            // The configured issuer, which may carry userinfo.
+            .field("issuer", &crate::jwks::debug_url(&self.issuer))
             .field("audiences", &self.audiences)
             .field("expires_at", &self.expires_at)
             .field("issued_at", &self.issued_at)

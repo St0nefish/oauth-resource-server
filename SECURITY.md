@@ -58,6 +58,15 @@ the ones a report is most likely to concern:
   credential in a plain-`http` non-loopback proxy URL is refused without
   `allow_insecure_http`, and the proxy URL is never logged, displayed or
   `Debug`-printed unredacted (a refused one is not shown at all);
+- a credential in the `issuer`, `jwks_uri` or `resource` URL (userinfo, or a
+  `jwks_uri` query) never reaches a log line, an error or configuration
+  problem message, or the `Debug` output of the config types, the validator,
+  `AuthorizedToken` or the layers: every such display masks userinfo, query
+  and fragment, and a value that cannot be parsed is shown only when it has
+  no `@`, `?` or `#` and only visible ASCII;
+- a refused request's query (which may carry an RFC 6750 §2.3
+  `access_token`) never reaches a log line or `RejectContext`'s `Debug`:
+  the layers log the path only, and the `Debug` shows the query as `?***`;
 - no proxy — explicit, from `HTTP_PROXY`/`HTTPS_PROXY`/`ALL_PROXY`, or from
   the system settings — ever carries a fetch of a loopback URL (it uses a
   proxy-free client), so the plain-http loopback exemption never crosses the

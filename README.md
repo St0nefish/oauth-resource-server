@@ -706,7 +706,8 @@ carries the request's method, URI and headers, so the body can follow
 `Accept`. Never put the reason inside `TokenRejection::Invalid` in the body:
 it says which check failed, which is an oracle for an attacker. The layer
 logs it instead. `RejectContext`'s `Debug` prints header names but no header
-values, and the credential headers are marked sensitive, so
+values, and the URI's path with any query shown as `?***` (a client may put
+an `access_token` there), and the credential headers are marked sensitive, so
 `tracing::warn!(?cx)` in the callback does not log the token.
 
 **Without OAuth**, a 401 carries `WWW-Authenticate: Bearer error="invalid_token"`
@@ -996,13 +997,12 @@ config format; these are wired in code). `OAuthValidator::new(&resolved)` is
 the builder with nothing set. Every option is checked by `build()`, and a
 refused one is a `ValidatorError`, never silently dropped.
 
-| Builder method | Default | Meaning |
-|---|---|---|
-| `add_root_certificate_pem(&[u8])` | none | Adds the certificate(s) in a PEM file (one, or a bundle) as TLS trust anchors, on top of the TLS feature's own roots. Works with every TLS feature. Pass CA certificates only. Error: `ValidatorError::InvalidRootCertificate` (no certificate in it, one the backend cannot use, or a private-key block). |
-| `proxy(url)` | reqwest's own proxy handling (environment variables, and system settings where reqwest's `system-proxy` feature is on), for non-loopback fetches | An explicit `http://` or `https://` proxy for every non-loopback metadata and JWKS fetch, `user:password@` sent as proxy Basic auth. Setting it turns the environment and system proxies off, `NO_PROXY` included. No path, query, fragment, SOCKS scheme, space, control or non-ASCII character, and no credential in a plain-`http` proxy URL on a non-loopback host unless `allow_insecure_http` is set. Error: `ValidatorError::InvalidProxy` (never showing the URL). |
-
-| `fetch_timeout(Duration)` | `DEFAULT_FETCH_TIMEOUT`, 10 s | Timeout for one metadata or JWKS request, connect through last body byte. `MIN_FETCH_TIMEOUT` (1 s) to `MAX_FETCH_TIMEOUT` (60 s); zero or anything outside is `ValidatorError::FetchTimeoutOutOfRange`. |
-| `initial_jwks(&str)` | none | A JWK Set (`{"keys": [...]}`) the key cache starts with, parsed and narrowed exactly like a fetched one (256 KiB and 64-key caps, no `oct`/`use: enc`/non-`verify` key, each key limited to the configured algorithms). Refreshed normally: the first successful refresh replaces it, a failed one keeps it. Error: `ValidatorError::InvalidInitialJwks`. |
+| Builder method                    | Default                                                                                                                                          | Meaning                                                                                                                                                                                                                                                                                                                                                                                                                                                                    |
+| --------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------ | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `add_root_certificate_pem(&[u8])` | none                                                                                                                                             | Adds the certificate(s) in a PEM file (one, or a bundle) as TLS trust anchors, on top of the TLS feature's own roots. Works with every TLS feature. Pass CA certificates only. Error: `ValidatorError::InvalidRootCertificate` (no certificate in it, one the backend cannot use, or a private-key block).                                                                                                                                                                 |
+| `proxy(url)`                      | reqwest's own proxy handling (environment variables, and system settings where reqwest's `system-proxy` feature is on), for non-loopback fetches | An explicit `http://` or `https://` proxy for every non-loopback metadata and JWKS fetch, `user:password@` sent as proxy Basic auth. Setting it turns the environment and system proxies off, `NO_PROXY` included. No path, query, fragment, SOCKS scheme, space, control or non-ASCII character, and no credential in a plain-`http` proxy URL on a non-loopback host unless `allow_insecure_http` is set. Error: `ValidatorError::InvalidProxy` (never showing the URL). |
+| `fetch_timeout(Duration)`         | `DEFAULT_FETCH_TIMEOUT`, 10 s                                                                                                                    | Timeout for one metadata or JWKS request, connect through last body byte. `MIN_FETCH_TIMEOUT` (1 s) to `MAX_FETCH_TIMEOUT` (60 s); zero or anything outside is `ValidatorError::FetchTimeoutOutOfRange`.                                                                                                                                                                                                                                                                   |
+| `initial_jwks(&str)`              | none                                                                                                                                             | A JWK Set (`{"keys": [...]}`) the key cache starts with, parsed and narrowed exactly like a fetched one (256 KiB and 64-key caps, no `oct`/`use: enc`/non-`verify` key, each key limited to the configured algorithms). Refreshed normally: the first successful refresh replaces it, a failed one keeps it. Error: `ValidatorError::InvalidInitialJwks`.                                                                                                                  |
 
 Every fetch whose URL is on a loopback host (`localhost`, `*.localhost`,
 `127.0.0.0/8`, `::1`) uses a separate client with no proxy of any kind, so a
@@ -1279,7 +1279,16 @@ verified claims and token metadata) or a
   principal are truncated to 128 characters when logged; scope values are
   logged in full (on an insufficient-scope refusal at `info`, and on an
   accepted token at `debug`), bounded only by the 16 KiB credential cap.
-  Rejection reasons go to the log, never to the client.
+  Rejection reasons go to the log, never to the client. A credential in the
+  `issuer`, `jwks_uri` or `resource` URL (userinfo, or a query) is masked
+  (`***@`, `?***`) wherever this crate shows it: every log line, error and
+  configuration problem, and the `Debug` output of `OAuthConfig`,
+  `ResolvedOAuthConfig`, `EnvOAuthConfig`, `AuthorizedToken`, the validator,
+  the layers and their builders. The refused request's URI in a
+  `RejectContext` `Debug` is its path, with any query shown as `?***` (a
+  client may send its token there, RFC 6750 §2.3); the layers log the path
+  only. The RFC 9728 metadata document and the challenges publish
+  `issuer` and `resource` as configured.
 - **The static token is compared in constant time** (with `subtle`). Its
   length is not hidden. With several static tokens, every candidate is
   compared with every entry, with no early exit once one matches, and the
