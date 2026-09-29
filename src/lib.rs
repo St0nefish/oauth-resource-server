@@ -24,11 +24,25 @@
 | [`authenticate`], [`Credential`] | Framework-free checking of several candidate credentials against a static token and OAuth. |
 | [`authenticate_with_static_tokens`], [`StaticTokens`], [`StaticTokenMatch`], [`StaticTokensError`] | The same check against several labeled static tokens (zero-downtime key rotation, one key per client), reporting which one matched. |
 | [`refusal`], [`refusal_with_static_challenge`], [`Refusal`], [`DEFAULT_STATIC_CHALLENGE`] | Framework-free mapping of a [`TokenRejection`] to its status (401/403) and `WWW-Authenticate` challenge — the same decision both layers make. |
+| [`AuthorizedToken::require_scopes`], [`MissingScopes`], [`refusal_for_scopes`], [`OAuthValidator::insufficient_scope_challenge_for`] | Per-route and per-operation scopes on top of the validator's: the all-of check, and the 403 whose challenge names the scopes that request needs. |
 | [`Algorithm`], [`parse_algorithm`], [`AlgorithmError`] | The JWS algorithms a config may allow (never HMAC or `none`). |
 | [`static_token_policy`], [`StaticTokenDecision`] | The startup decision about a static API key alongside OAuth. |
-| [`axum::AuthLayer`], [`axum::require_auth`], [`axum::metadata_router`] | The axum integration (feature `axum`), including extractors for [`Credential`], [`AuthorizedToken`] and [`StaticTokenMatch`]. |
-| [`http_layer::HttpAuthLayer`], [`http_layer::HttpAuthLayerBuilder`] | A `tower` layer for any `http::Request<B>` service, whatever its body types (feature `tower`, implied by `axum`). |
+| [`axum::AuthLayer`], [`axum::require_auth`], [`axum::metadata_router`] | The axum integration (feature `axum`), including extractors for [`Credential`], [`AuthorizedToken`] and [`StaticTokenMatch`], and the per-handler scope extractor [`axum::Scoped`]. |
+| [`http_layer::HttpAuthLayer`], [`http_layer::HttpAuthLayerBuilder`], [`http_layer::RequireScopes`] | A `tower` layer for any `http::Request<B>` service, whatever its body types (feature `tower`, implied by `axum`), and the per-route scope layer both layers share. |
 | [`env::oauth_config_from_env`], [`env::secret_from_env`], [`env::static_tokens_from_env`] | Configuration from environment variables (feature `env`), including a current and a next static key for rotation. |"
+)]
+#![cfg_attr(
+    all(feature = "serde", feature = "env", feature = "axum", feature = "mcp"),
+    doc = "| [`mcp::McpToolScopes`] | Per-tool scopes for an MCP server's JSON-RPC endpoint (feature `mcp`). |"
+)]
+#![cfg_attr(
+    all(
+        feature = "serde",
+        feature = "env",
+        feature = "axum",
+        not(feature = "mcp")
+    ),
+    doc = "| `mcp::McpToolScopes` | Per-tool scopes for an MCP server's JSON-RPC endpoint (feature `mcp`, not enabled in this build). |"
 )]
 // The last row links the `testing` module, which exists only with that feature;
 // without it the row is rendered with no link, so a `serde,env,axum` doc build
@@ -104,6 +118,10 @@ pub mod http_layer;
 #[cfg_attr(docsrs, doc(cfg(feature = "axum")))]
 pub mod axum;
 
+#[cfg(feature = "mcp")]
+#[cfg_attr(docsrs, doc(cfg(feature = "mcp")))]
+pub mod mcp;
+
 // Entry points for the `fuzz/` cargo-fuzz crate into internals that are not
 // public API. cargo-fuzz sets `--cfg fuzzing`; no ordinary build (including
 // docs.rs and every CI job but `fuzz.yml`) compiles this module. cargo-fuzz
@@ -137,6 +155,8 @@ pub use jwks::{
     RefreshErrorKind,
 };
 pub use policy::{NoAuthConfigured, StaticTokenDecision, static_token_policy};
-pub use refusal::{DEFAULT_STATIC_CHALLENGE, Refusal, refusal, refusal_with_static_challenge};
-pub use token::{AuthorizedToken, InvalidToken, InvalidTokenKind, TokenRejection};
+pub use refusal::{
+    DEFAULT_STATIC_CHALLENGE, Refusal, refusal, refusal_for_scopes, refusal_with_static_challenge,
+};
+pub use token::{AuthorizedToken, InvalidToken, InvalidTokenKind, MissingScopes, TokenRejection};
 pub use validator::{OAuthValidator, ValidatorError};

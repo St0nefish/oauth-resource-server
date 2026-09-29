@@ -83,7 +83,8 @@ oauth-resource-server = { version = "0.2", features = ["axum", "serde"] }
 | `serde` | no | `Deserialize`/`Serialize` for `OAuthConfig`, to load it from YAML, TOML, JSON or any other serde format. |
 | `env` | no | The `env` module: load the config and secrets from environment variables, with `VAR_FILE` support. |
 | `tower` | no | The `http_layer` module: `HttpAuthLayer`, an authentication layer for any `tower` service over `http::Request<B>` (hyper, tonic, ...), whatever its body types. See [Using with other frameworks](#using-with-other-frameworks). |
-| `axum` | no | The `axum` module: the `AuthLayer` middleware, `metadata_router`, and axum extractors for `Credential` and `AuthorizedToken`. Implies `tower`. |
+| `axum` | no | The `axum` module: the `AuthLayer` middleware, `metadata_router`, axum extractors for `Credential` and `AuthorizedToken`, and per-route scopes (`RequireScopes`, the `Scoped<S>` extractor). Implies `tower`. |
+| `mcp` | no | The `mcp` module, an integration helper for [Model Context Protocol](https://modelcontextprotocol.io) servers: `McpToolScopes`, a tower layer that requires scopes per tool by reading the JSON-RPC `tools/call` in the request body. `serde_json` only, no MCP SDK. Implies `tower`. See [Per-tool scopes](#per-tool-scopes-mcptoolscopes). |
 | `testing` | no | A fake authorization server (`TestAuthority`), a fluent token builder, and the throwaway signing keys behind them, for **your tests only**. Never enable it in a production build. It follows semver like the rest of the crate. |
 
 The core (config, validator, `authenticate`, `refusal`, `static_token_policy`)
@@ -310,9 +311,72 @@ When a static token is also configured, extract `Credential` rather than
 `subject`, the verbatim signed `sub`; `principal` comes from a configurable
 claim list and is meant for logs.
 
-The layer checks one set of required scopes for everything behind it. For a
-finer check, such as a write scope on some routes, decide in the handler, and
-decide **fail-closed**: allow only a credential you positively recognize.
+### Per-route and per-handler scopes
+
+The validator's required scopes are the floor every token must meet. For more
+on some routes — a write scope on the routes that write — require it where it
+applies, on top of that floor. Every way below checks the token the layer
+already validated (one validator, one key cache; no second validator), and
+refuses a token without the scopes with **403 and a challenge naming the
+scopes this request needs**: the validator's required scopes followed by the
+route's, `Bearer error="insufficient_scope", scope="api:read api:write",
+resource_metadata="…"`. A client re-authorizes for exactly that set and
+passes both checks (this is the per-request challenge MCP's scope step-up
+expects).
+
+| For | Use |
+|---|---|
+| everything behind a layer | `AuthLayer::builder().require_scopes([..])` (or `HttpAuthLayerBuilder::require_scopes`) |
+| some routes | the `RequireScopes::new([..])` route layer, behind the auth layer |
+| one handler | the `Scoped<S>` extractor, with `S` a `ScopeSet` type of yours |
+| one MCP tool | [`McpToolScopes`](#per-tool-scopes-mcptoolscopes) (feature `mcp`) |
+| any other code | `AuthorizedToken::require_scopes(&[..])`, and `refusal_for_scopes()` for the 403 |
+
+```rust
+use axum::{Router, routing::{get, post}};
+use oauth_resource_server::axum::{AuthLayer, RequireScopes, ScopeSet, Scoped};
+
+struct DocsAdmin;
+impl ScopeSet for DocsAdmin {
+    const SCOPES: &'static [&'static str] = &["docs:admin"];
+}
+
+async fn purge(token: Scoped<DocsAdmin>) -> String {
+    format!("purged by {:?}", token.subject)
+}
+
+fn app(auth: AuthLayer) -> Router {
+    Router::new()
+        .route("/docs/new", post(|| async { "written" }))
+        // Applies to the routes added above it.
+        .route_layer(RequireScopes::new(["docs:write"]))
+        .route("/docs/purge", post(purge))
+        .route("/docs", get(|| async { "listed" }))
+        // Added last, so it runs first: everything above is behind it.
+        .route_layer(auth)
+}
+```
+
+They refuse through the layer's own refusal path: its status, challenge and
+`on_reject` body. A request with no credential (an `optional()` layer passed
+it through) gets the layer's own 401; a route no layer covers gets 500,
+logged at `error`, never access. Scopes are matched exactly, all-of, the same
+way the validator matches its own.
+
+**A static token has no scopes**, so wherever scopes are required it is
+refused with the same 403 — fail-safe, even though in dual mode it was never
+held to the validator's scopes: a route that names a scope asks it of every
+credential. Where the static key is meant to be a full-access key, say so
+with `static_token_bypasses_scopes()` (on the layer builders,
+`RequireScopes` and `McpToolScopes`). A layer with required scopes, no OAuth
+validator and no bypass refuses to build (`AuthLayerError::ScopesNeedOAuth`):
+nothing could ever pass it. `Scoped<S>` extracts an OAuth token, so it always
+refuses a static token. A request presenting both a static token and an
+OAuth token (in two sources) is judged by the static token, which the layer
+checks first.
+
+A check of your own in the handler works too; decide it **fail-closed**:
+allow only a credential you positively recognize.
 
 ```rust
 use axum::http::StatusCode;
@@ -341,10 +405,9 @@ Avoid `Option<AuthorizedToken>` with an
 `if let Some(token) = .. { if !token.has_scope(..) { deny } }` check: `None`
 covers a static-token request and every request that an `optional()` or
 `allow_unauthenticated()` layer passed through, so that shape lets all of them
-through the write check. You can also put a second layer with its own validator on those
-routes. Scopes are matched exactly, with no hierarchy: if your authorization
-server means `api:write` to imply `api:read`, check for either here. A typed
-per-handler scope extractor is not provided yet.
+through the write check. Scopes are matched exactly, with no hierarchy: if
+your authorization server means `api:write` to imply `api:read`, check for
+either here.
 
 ### Optional authentication
 
@@ -1052,13 +1115,12 @@ config format; these are wired in code). `OAuthValidator::new(&resolved)` is
 the builder with nothing set. Every option is checked by `build()`, and a
 refused one is a `ValidatorError`, never silently dropped.
 
-| Builder method | Default | Meaning |
-|---|---|---|
-| `add_root_certificate_pem(&[u8])` | none | Adds the certificate(s) in a PEM file (one, or a bundle) as TLS trust anchors, on top of the TLS feature's own roots. Works with every TLS feature. Pass CA certificates only. Error: `ValidatorError::InvalidRootCertificate` (no certificate in it, one the backend cannot use, or a private-key block). |
-| `proxy(url)` | reqwest's own proxy handling (environment variables, and system settings where reqwest's `system-proxy` feature is on), for non-loopback fetches | An explicit `http://` or `https://` proxy for every non-loopback metadata and JWKS fetch, `user:password@` sent as proxy Basic auth. Setting it turns the environment and system proxies off, `NO_PROXY` included. No path, query, fragment, SOCKS scheme, space, control or non-ASCII character, and no credential in a plain-`http` proxy URL on a non-loopback host unless `allow_insecure_http` is set. Error: `ValidatorError::InvalidProxy` (never showing the URL). |
-
-| `fetch_timeout(Duration)` | `DEFAULT_FETCH_TIMEOUT`, 10 s | Timeout for one metadata or JWKS request, connect through last body byte. `MIN_FETCH_TIMEOUT` (1 s) to `MAX_FETCH_TIMEOUT` (60 s); zero or anything outside is `ValidatorError::FetchTimeoutOutOfRange`. |
-| `initial_jwks(&str)` | none | A JWK Set (`{"keys": [...]}`) the key cache starts with, parsed and narrowed exactly like a fetched one (256 KiB and 64-key caps, no `oct`/`use: enc`/non-`verify` key, each key limited to the configured algorithms). Refreshed normally: the first successful refresh replaces it, a failed one keeps it. Error: `ValidatorError::InvalidInitialJwks`. |
+| Builder method                    | Default                                                                                                                                          | Meaning                                                                                                                                                                                                                                                                                                                                                                                                                                                                    |
+| --------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------ | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `add_root_certificate_pem(&[u8])` | none                                                                                                                                             | Adds the certificate(s) in a PEM file (one, or a bundle) as TLS trust anchors, on top of the TLS feature's own roots. Works with every TLS feature. Pass CA certificates only. Error: `ValidatorError::InvalidRootCertificate` (no certificate in it, one the backend cannot use, or a private-key block).                                                                                                                                                                 |
+| `proxy(url)`                      | reqwest's own proxy handling (environment variables, and system settings where reqwest's `system-proxy` feature is on), for non-loopback fetches | An explicit `http://` or `https://` proxy for every non-loopback metadata and JWKS fetch, `user:password@` sent as proxy Basic auth. Setting it turns the environment and system proxies off, `NO_PROXY` included. No path, query, fragment, SOCKS scheme, space, control or non-ASCII character, and no credential in a plain-`http` proxy URL on a non-loopback host unless `allow_insecure_http` is set. Error: `ValidatorError::InvalidProxy` (never showing the URL). |
+| `fetch_timeout(Duration)`         | `DEFAULT_FETCH_TIMEOUT`, 10 s                                                                                                                    | Timeout for one metadata or JWKS request, connect through last body byte. `MIN_FETCH_TIMEOUT` (1 s) to `MAX_FETCH_TIMEOUT` (60 s); zero or anything outside is `ValidatorError::FetchTimeoutOutOfRange`.                                                                                                                                                                                                                                                                   |
+| `initial_jwks(&str)`              | none                                                                                                                                             | A JWK Set (`{"keys": [...]}`) the key cache starts with, parsed and narrowed exactly like a fetched one (256 KiB and 64-key caps, no `oct`/`use: enc`/non-`verify` key, each key limited to the configured algorithms). Refreshed normally: the first successful refresh replaces it, a failed one keeps it. Error: `ValidatorError::InvalidInitialJwks`.                                                                                                                  |
 
 Every fetch whose URL is on a loopback host (`localhost`, `*.localhost`,
 `127.0.0.0/8`, `::1`) uses a separate client with no proxy of any kind, so a
@@ -1270,6 +1332,17 @@ an `InvalidToken`'s `kind()` names the check that failed).
   validator to build. It also removes any credential an outer layer inserted,
   so `None` after its pass-through is never replaced by an outer layer's
   token.
+- **Per-route scopes fail closed.** A layer's `require_scopes`,
+  `RequireScopes`, `Scoped` and `McpToolScopes` refuse a token without the
+  scopes with 403 and a challenge naming them, and a static token (it has
+  none) the same way unless `static_token_bypasses_scopes()` says otherwise.
+  `RequireScopes`, `Scoped` and `McpToolScopes` answer 500 (logged at
+  `error`) on a route no authentication layer covers, even when they require
+  nothing. `McpToolScopes` reads at most its body limit (1 MiB by default)
+  and refuses a larger body with 413; a body it cannot classify with
+  certainty (not JSON, a `tools/call` with no readable tool name, a repeated
+  member) needs every scope any tool requires, never fewer; a JSON-RPC batch
+  needs every scope any of its calls needs; it never logs body content.
 - **The extractors fail closed.** `Credential` and `AuthorizedToken` refuse a
   request the layer inserted nothing into with that layer's own 401 and
   challenge, built by the same code as its other refusals. On a route no
@@ -1397,11 +1470,12 @@ an `InvalidToken`'s `kind()` names the check that failed).
   [Audience](#audience-which-value-to-configure) for what a client_id
   audience means. Any further claim policy (a tenant, a group) can be
   required with `required_claims`.
-- **Per-route or per-operation scopes, and scope hierarchies.** Each validator
-  has one set of required scopes, matched exactly: there is no way to say
-  "`api:write` implies `api:read`". Finer and hierarchy-aware checks are the
-  application's (`AuthorizedToken::has_scope`); see [Reading the caller in a
-  handler](#reading-the-caller-in-a-handler).
+- **Scope hierarchies.** Every scope check — the validator's, a layer's
+  `require_scopes`, `RequireScopes`, `Scoped`, `McpToolScopes` — is an exact,
+  all-of match: there is no way to say "`api:write` implies `api:read`".
+  Hierarchy-aware checks are the application's (`AuthorizedToken::has_scope`);
+  see [Per-route and per-handler
+  scopes](#per-route-and-per-handler-scopes).
 - **Malformed requests get 401, not 400.** RFC 6750 §3.1 suggests 400
   `invalid_request` for a malformed request; this crate treats anything it
   cannot read as no credential. A request that repeats a credential header
@@ -1552,7 +1626,11 @@ from a Tokio runtime handle.
 
 Whatever the stack, the 401/403 decision is one function, `refusal()`: the
 axum layer, the tower layer and a hand-built integration all get the status and
-`WWW-Authenticate` challenge from the same code, so they cannot disagree.
+`WWW-Authenticate` challenge from the same code, so they cannot disagree. For
+a request that needed more scopes than the validator's (checked with
+`AuthorizedToken::require_scopes`), `refusal_for_scopes()` is the same
+decision with a 403 challenge naming them — the bytes the layers'
+per-route scope checks send.
 
 ### A tower stack (hyper, tonic, ...): `HttpAuthLayer`
 
@@ -1560,8 +1638,11 @@ With the `tower` feature, `oauth_resource_server::http_layer::HttpAuthLayer` wra
 any `tower` service over `http::Request<ReqBody>` / `http::Response<ResBody>`,
 for any body types. It is the axum layer's check without axum: the same
 builder (`static_token`, `static_tokens`, `oauth`, `sources`, `static_challenge`, `optional`,
-`build_with_decision`), the same fail-closed build, the same refusals, and the
-same `Credential`/`AuthorizedToken`/`StaticTokenMatch` request extensions. A refusal's body is
+`require_scopes`, `static_token_bypasses_scopes`, `build_with_decision`), the
+same fail-closed build, the same refusals, and the
+same `Credential`/`AuthorizedToken`/`StaticTokenMatch` request extensions; the
+`http_layer::RequireScopes` route layer (and `McpToolScopes`) work behind it
+exactly as behind the axum layer. A refusal's body is
 `ResBody::default()` unless `on_reject` builds a response, whose status and
 challenge the layer then sets:
 
@@ -1749,11 +1830,61 @@ fits MCP's authorization model:
   in the application with `AuthorizedToken::has_scope`.
 - **Merge `metadata_router` outside the auth layer,** on the same origin as
   the MCP endpoint.
-- **Per-tool scopes are the application's job.** The layer sees HTTP requests,
-  not the JSON-RPC method inside a POST to `/mcp`, so any accepted token can
-  call every tool. To require a write scope for some tools, check
-  `AuthorizedToken::has_scope` from the request extensions when the tool is
-  dispatched.
+- **Per-tool scopes need the request body.** The auth layer sees HTTP
+  requests, not the JSON-RPC method inside a POST to `/mcp`, so on its own
+  any accepted token can call every tool. The `mcp` feature's
+  `McpToolScopes` reads the tool name and requires that tool's scopes before
+  the MCP server sees the request (below); a tool handler can also check
+  scopes itself ([Reading the token inside a tool
+  handler](#reading-the-token-inside-a-tool-handler)).
+
+### Per-tool scopes: `McpToolScopes`
+
+With the `mcp` feature, `oauth_resource_server::mcp::McpToolScopes` is a tower
+layer for the MCP endpoint, placed behind the auth layer. It gives every
+request a default requirement and each named tool its own, reading the tool
+name from a `tools/call` in the POST body (the same example is compiled in
+the `mcp` module's documentation):
+
+```text
+use axum::Router;
+use oauth_resource_server::axum::AuthLayer;
+use oauth_resource_server::mcp::McpToolScopes;
+
+fn app(mcp_service: Router, auth: AuthLayer) -> Router {
+    let tool_scopes = McpToolScopes::new()
+        .default(["mcp:read"])
+        .tool("write_document", ["mcp:write"]);
+    Router::new()
+        .nest_service("/mcp", mcp_service)
+        .route_layer(tool_scopes)
+        .route_layer(auth)
+}
+```
+
+A token without the scopes is refused with 403 before the MCP server parses
+anything, with a challenge naming the layer's scopes followed by that tool's
+(`scope="mcp:read mcp:write"`), which is how a client knows to step up; a
+request with no credential gets the auth layer's 401. What each request
+needs:
+
+| Request | Requires |
+|---|---|
+| not a `POST` (the event stream `GET`, `DELETE`) | the default |
+| `tools/call` for a listed tool | that tool's scopes |
+| `tools/call` for another tool, or any other method | the default |
+| a JSON-RPC batch | every scope any of its messages needs |
+| a body that is not JSON, a `tools/call` with no readable `params.name`, or a message repeating `method`, `params` or `params.name` | every scope in the configuration (default and all tools) |
+| a body over the limit (`body_limit`, 1 MiB by default, 4 KiB to 64 MiB) | refused with 413, unread past the limit |
+
+Anything it cannot classify with certainty gets the strictest set rather
+than the default, because the MCP server's parser might read that body as a
+tool call; a caller holding every scope loses nothing, and the server answers
+a malformed body itself. A static token is refused wherever scopes are
+required, unless `static_token_bypasses_scopes()`. A served request reaches
+the MCP server with its body byte-identical (trailers are not passed on). The
+body type must be buildable from bytes (`axum::body::Body`, `Full<Bytes>`);
+nothing from the body is ever logged.
 
 ### Reading the token inside a tool handler
 
@@ -1787,6 +1918,10 @@ own does not do this: rmcp's `Extension<T>` extractor reads from its own
 request-scoped extension map, which holds the whole `Parts` value as one
 entry, not the individual values inside `Parts.extensions` — extract
 `Parts` first, as shown above, then read `AuthorizedToken` out of it.
+
+A scope check there is `token.require_scopes(&["mcp:write"])`. It answers
+inside the protocol (a tool error), not with the 403 and challenge a client
+can re-authorize from; `McpToolScopes` does the latter.
 
 ## Provider guide
 
@@ -1833,7 +1968,12 @@ WARN oauth_resource_server::axum: OAuth bearer auth rejected path=/v1/things rea
 ```
 
 With only a static token configured, the line is `Bearer auth rejected`, with
-no reason. The table below is keyed on the detail text, which is for reading
+no reason. A per-route scope refusal (`RequireScopes`, `McpToolScopes`) is
+logged under `oauth_resource_server::http_layer` at `info`, as `The credential
+lacks the scopes this route requires` with the required and present scopes
+(and a `Scoped` extractor's under `oauth_resource_server::axum`); a layer's
+own `require_scopes` refusal is its usual `warn` line with
+`reason=InsufficientScope`. The table below is keyed on the detail text, which is for reading
 logs; in code, match `InvalidToken::kind()` instead. The validator and key-set messages come from the targets
 `oauth_resource_server::validator` and `oauth_resource_server::jwks`.
 

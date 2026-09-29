@@ -19,7 +19,7 @@ cargo-fuzz = true
 [dependencies]
 arbitrary = { version = "1", features = ["derive"] }
 libfuzzer-sys = "0.4"
-oauth-resource-server = { path = "..", features = ["axum", "testing"] }
+oauth-resource-server = { path = "..", features = ["axum", "testing", "mcp"] }
 
 [workspace]
 
@@ -61,6 +61,20 @@ bench = false
 [[bin]]
 name = "jwks_entries"
 path = "fuzz_targets/jwks_entries.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "scope_challenge"
+path = "fuzz_targets/scope_challenge.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "mcp_tool_calls"
+path = "fuzz_targets/mcp_tool_calls.rs"
 test = false
 doc = false
 bench = false

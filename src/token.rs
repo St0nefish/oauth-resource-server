@@ -397,6 +397,102 @@ impl AuthorizedToken {
     pub fn has_scope(&self, scope: &str) -> bool {
         self.scopes.iter().any(|s| s == scope)
     }
+
+    /// Whether the token carries EVERY scope in `required` (all-of): `Ok(())`,
+    /// or the [`MissingScopes`] naming what it lacks. An empty `required`
+    /// passes every token.
+    ///
+    /// The same matching the validator's own `required_scopes` check runs, on
+    /// the same [`scopes`](Self::scopes) (every configured scope claim, a
+    /// string split on whitespace, an array taken element by element), so a
+    /// route asking for a scope here and a validator requiring it agree
+    /// exactly: an exact, case-sensitive comparison per scope (RFC 6749 §3.3).
+    /// An entry that is blank or contains whitespace can never be carried, so
+    /// it is always missing.
+    ///
+    /// This is the per-route or per-operation check on top of the
+    /// validator's floor; the layers' `require_scopes`, the `axum` feature's
+    /// `RequireScopes` and `Scoped` extractor, and the `mcp` feature all run
+    /// it. To answer a refusal with a 403 whose challenge names these scopes,
+    /// see [`crate::refusal_for_scopes`]; `?` converts the error into
+    /// [`TokenRejection::InsufficientScope`].
+    ///
+    /// # Errors
+    ///
+    /// [`MissingScopes`] when at least one entry of `required` is not among
+    /// the token's scopes.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use oauth_resource_server::AuthorizedToken;
+    ///
+    /// let token = AuthorizedToken::new(None, None, ["docs:read"]);
+    /// assert!(token.require_scopes(&["docs:read"]).is_ok());
+    ///
+    /// let missing = token.require_scopes(&["docs:read", "docs:write"]).unwrap_err();
+    /// assert_eq!(missing.required(), ["docs:read", "docs:write"]);
+    /// assert_eq!(missing.missing(), ["docs:write"]);
+    /// ```
+    pub fn require_scopes(&self, required: &[&str]) -> Result<(), MissingScopes> {
+        let missing = missing_scopes(&self.scopes, required.iter().copied());
+        if missing.is_empty() {
+            return Ok(());
+        }
+        Err(MissingScopes {
+            required: required.iter().map(|s| (*s).to_string()).collect(),
+            missing: missing.into_iter().map(str::to_string).collect(),
+        })
+    }
+}
+
+/// The entries of `required` that `present` does not carry, in order: the one
+/// scope-matching rule, shared by the validator's `required_scopes` check and
+/// [`AuthorizedToken::require_scopes`] (exact, case-sensitive, all-of).
+pub(crate) fn missing_scopes<'r>(
+    present: &[String],
+    required: impl IntoIterator<Item = &'r str>,
+) -> Vec<&'r str> {
+    required
+        .into_iter()
+        .filter(|required| !present.iter().any(|p| p == required))
+        .collect()
+}
+
+/// A token that is valid but lacks scopes a route or operation requires; see
+/// [`AuthorizedToken::require_scopes`]. It answers with 403
+/// `insufficient_scope`: convert it with `?` (or `From`) into
+/// [`TokenRejection::InsufficientScope`], and build the response with
+/// [`crate::refusal_for_scopes`] so the challenge names what was required.
+///
+/// Scopes are not secret; `Display` names the missing ones.
+///
+/// `#[non_exhaustive]`: read it through its accessors.
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+#[error("insufficient scope: missing {}", .missing.join(" "))]
+#[non_exhaustive]
+pub struct MissingScopes {
+    required: Vec<String>,
+    missing: Vec<String>,
+}
+
+impl MissingScopes {
+    /// Every scope that was required, in the order given.
+    pub fn required(&self) -> &[String] {
+        &self.required
+    }
+
+    /// The required scopes the token does not carry, in the order given;
+    /// never empty.
+    pub fn missing(&self) -> &[String] {
+        &self.missing
+    }
+}
+
+impl From<MissingScopes> for TokenRejection {
+    fn from(_: MissingScopes) -> Self {
+        TokenRejection::InsufficientScope
+    }
 }
 
 /// Why a bearer credential was refused, and — crucially — with which HTTP status.
@@ -1025,6 +1121,66 @@ mod tests {
         assert_eq!(numeric_date(&serde_json::json!(-0.4)), None);
         assert_eq!(numeric_date(&serde_json::json!(1e30)), None);
         assert_eq!(numeric_date(&serde_json::json!("10")), None);
+    }
+
+    #[test]
+    fn require_scopes_is_all_of_and_names_what_is_missing() {
+        let t = AuthorizedToken::new(None, None, ["a", "b"]);
+        assert_eq!(t.require_scopes(&[]), Ok(()));
+        assert_eq!(t.require_scopes(&["a"]), Ok(()));
+        assert_eq!(t.require_scopes(&["b", "a"]), Ok(()));
+        let missing = t.require_scopes(&["a", "c", "b", "d"]).unwrap_err();
+        assert_eq!(missing.required(), ["a", "c", "b", "d"]);
+        assert_eq!(missing.missing(), ["c", "d"]);
+        assert_eq!(missing.to_string(), "insufficient scope: missing c d");
+        assert_eq!(
+            TokenRejection::from(missing),
+            TokenRejection::InsufficientScope
+        );
+        // Exact and case-sensitive; an entry no token can carry is missing.
+        for never in ["A", "a ", "", "a b"] {
+            assert_eq!(
+                t.require_scopes(&[never]).unwrap_err().missing(),
+                [never],
+                "{never:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn require_scopes_matches_exactly_what_the_validator_extracts() {
+        // Every accepted claim shape, read by the validator's own reader:
+        // `require_scopes` on the result agrees with `missing_scopes`, the
+        // rule `verify` applies to the same list.
+        let claims = serde_json::json!({
+            "scope": "a  b\tc",
+            "scp": ["d", "e f", 7],
+        });
+        let names = vec!["scope".to_string(), "scp".to_string()];
+        let scopes = extract_scopes(claims.as_object().unwrap(), &names);
+        let t = AuthorizedToken::new(None, None, scopes.clone());
+        for required in [
+            vec!["a", "b", "c", "d"],
+            vec!["e f"],
+            vec!["e"],
+            vec!["7"],
+            vec!["a", "x"],
+        ] {
+            let by_token = t
+                .require_scopes(&required)
+                .map_err(|m| m.missing().to_vec());
+            let by_rule = missing_scopes(&scopes, required.iter().copied());
+            assert_eq!(
+                by_token.is_ok(),
+                by_rule.is_empty(),
+                "{required:?}: {by_token:?} vs {by_rule:?}"
+            );
+        }
+        assert!(t.require_scopes(&["a", "b", "c", "d", "e f"]).is_ok());
+        assert_eq!(
+            t.require_scopes(&["e", "7"]).unwrap_err().missing(),
+            ["e", "7"]
+        );
     }
 
     #[test]

@@ -1354,7 +1354,7 @@ fn check_url(key: &str, value: &str, identifier: bool) -> Result<(), String> {
 /// ASCII other than space, `"` and `\`. RFC 6750 §3 holds the `scope` attribute
 /// of a challenge to the same set, and RFC 9728 §2 `scopes_supported` to the
 /// same values.
-fn is_scope_token(scope: &str) -> bool {
+pub(crate) fn is_scope_token(scope: &str) -> bool {
     !scope.is_empty()
         && scope
             .bytes()

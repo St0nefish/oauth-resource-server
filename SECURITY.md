@@ -114,6 +114,23 @@ the ones a report is most likely to concern:
   turn a missing credential into access: they answer with the layer's own 401
   and challenge, and with 500 on a route no `AuthLayer` covers (their `Option`
   forms too);
+- per-route and per-operation scope requirements (a layer's
+  `require_scopes`, `RequireScopes`, the `Scoped` extractor, the `mcp`
+  feature's `McpToolScopes`) are an exact all-of match on the token the
+  layer validated, the same matching as the validator's own; a token missing
+  one, and a static token (which has no scopes) unless the application opted
+  in with `static_token_bypasses_scopes`, get 403 through the layer's own
+  refusal path, with a challenge that is always a valid header value (a
+  caller-supplied `error_description` is reduced to RFC 6750's character
+  set, never escaped in); a route-level check with no authentication layer in
+  front answers 500, never access;
+- `McpToolScopes` reads a request body under a limit enforced while it
+  streams (1 MiB by default; a larger body is refused with 413 without being
+  read further), gives a body it cannot classify with certainty (not JSON, no
+  readable tool name, a repeated member two parsers could read differently)
+  the strictest scope set rather than the default, authorizes every message
+  of a JSON-RPC batch, passes a served body on byte-identical, and never logs
+  body content;
 - static tokens are compared in constant time (`subtle`): with several
   (`StaticTokens`), every candidate is compared with every entry, with no
   early exit once one matches and no branch on which entry matched. A
@@ -146,7 +163,9 @@ before a release rather than reported after it:
   own parsers: the `Bearer` header parser, the validator's pre-fetch header
   checks (`check_header`, `check_crit`, `check_typ`), scope and principal
   extraction, the RFC 9728 metadata URL and path builders, the discovery-URL
-  builder, and the per-entry JWK parse. They assert invariants as well as
+  builder, the per-entry JWK parse, the per-request 403 challenge, and the
+  `mcp` feature's JSON-RPC tool-call classification (against
+  `serde_json::Value` as an oracle). They assert invariants as well as
   looking for panics: for example, a token whose header carries `crit` is
   never accepted, and no parsed key ends up with an empty or out-of-allowlist
   algorithm set. They run nightly rather than on every pull request.

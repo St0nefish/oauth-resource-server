@@ -114,6 +114,67 @@ response body are byte-for-byte what 0.1 sent.
 
 ### Added
 
+- Per-route and per-operation scope requirements, with a 403 challenge per
+  request (oauth-resource-server#4, including the typed per-handler scope
+  extractor deferred from oauth-resource-server#8). All additive: no
+  existing signature or response changes, and a layer built without the new
+  settings answers exactly as before. Every new check runs on the token the
+  layer already validated (one validator, one key cache — the old advice to
+  put a second layer with its own validator on the routes that need more is
+  gone), is an exact all-of match like the validator's own, and refuses with
+  403 and `Bearer error="insufficient_scope", scope="<the validator's
+  required scopes, then the request's>", resource_metadata="…"`, so a client
+  that re-authorizes for exactly that set passes.
+  - `OAuthValidator::insufficient_scope_challenge_for(scopes, description)`:
+    the per-request 403 challenge, with an optional `error_description`.
+    Always a valid header value: an entry that is not a scope-token is left
+    out of `scope`, and every `"`, `\`, control and non-ASCII character of
+    the description becomes a space (RFC 6750 §3's character set), so it can
+    neither end its quoted string nor split the header; it is cut to 256
+    bytes. With the configured scopes and no description it is
+    `insufficient_scope_challenge()` byte for byte.
+  - `refusal_for_scopes(rejection, oauth, scopes, description)`: `refusal()`
+    with that 403 challenge, for a hand-built integration.
+  - `AuthorizedToken::require_scopes(&[..]) -> Result<(), MissingScopes>`,
+    the validator's own scope matching; `MissingScopes`
+    (`#[non_exhaustive]`, `required()`, `missing()`, `Display` naming the
+    missing scopes, `From<MissingScopes> for TokenRejection` giving
+    `InsufficientScope`).
+  - `AuthLayerBuilder::require_scopes` / `HttpAuthLayerBuilder::require_scopes`
+    and `static_token_bypasses_scopes` on both. `build` refuses an entry that
+    is not a scope-token (`AuthLayerError::InvalidScope`) and scopes with no
+    OAuth validator and no bypass (`AuthLayerError::ScopesNeedOAuth`); both
+    variants are new (the enum is `#[non_exhaustive]`).
+  - `http_layer::RequireScopes` (also `axum::RequireScopes`) and
+    `RequireScopesService`: a route layer behind either authentication layer.
+    Both layers now insert a private marker into every request they pass, so
+    it refuses with the layer's own status, challenge and `on_reject` body; a
+    request with no credential behind an `optional()` layer gets the layer's
+    401, one behind `allow_unauthenticated()` a 401 with
+    `DEFAULT_STATIC_CHALLENGE`, and a route no layer covers a 500 (logged at
+    `error`).
+  - `axum::Scoped<S>` and `axum::ScopeSet`: an extractor for an OAuth token
+    carrying every scope of a type-level set, refusing through the layer's
+    own refusal path (a static token gets the 403 too; a set holding an
+    invalid scope, 500).
+  - **Static tokens and scopes.** A static token has no scopes, so every new
+    requirement refuses it with 403 unless `static_token_bypasses_scopes()`
+    opts in (on the layer builders, `RequireScopes` and `McpToolScopes`).
+    Fail-safe by default: in dual mode a static token was never held to the
+    validator's scopes, and it still is not; only a requirement the
+    application now adds by name applies to it.
+  - The `mcp` feature (implies `tower`; adds `http-body` and `bytes`, both
+    already in every build, and no MCP SDK): `mcp::McpToolScopes`, a tower
+    layer requiring scopes per MCP tool (`new().default([..]).tool(name,
+    [..])`) by reading the JSON-RPC `tools/call` in a `POST` body. The body is
+    read under a limit enforced while streaming (`body_limit`,
+    `DEFAULT_BODY_LIMIT` 1 MiB, `MIN_BODY_LIMIT` 4 KiB to `MAX_BODY_LIMIT`
+    64 MiB; larger is 413, unread past the limit) and passed on
+    byte-identical. A batch needs every scope any of its messages needs; a
+    body it cannot classify with certainty (not JSON, a `tools/call` with no
+    readable string `params.name`, a repeated `method`/`params`/`name`)
+    needs every configured scope; non-`POST` requests and other methods need
+    the default. It never logs body content.
 - Several static tokens at once, for rotating a static API key with no
   downtime or for one key per client, with the matched key reported. All
   additive: every existing signature (`authenticate`, `static_token_policy`,
@@ -413,7 +474,11 @@ response body are byte-for-byte what 0.1 sent.
   `cargo deny` and semver checks on the tagged commit. A new `fuzz/` crate
   fuzzes the crate's own parsers, run nightly by `fuzz.yml` (never on pull
   requests); its entry points exist only under `--cfg fuzzing` and are not
-  part of the public API or the published package.
+  part of the public API or the published package. Two fuzz targets cover
+  the per-scope work: `scope_challenge` (the per-request challenge on
+  arbitrary scopes and descriptions) and `mcp_tool_calls` (the `mcp`
+  feature's JSON-RPC classification, against `serde_json::Value` as an
+  oracle). The `feature-powerset` job now also covers `mcp`.
 
 ## [0.1.2] - 2026-09-28
 

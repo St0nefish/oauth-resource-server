@@ -361,11 +361,11 @@ jobs:
         # --at-least-one-of. The three backends are additive and only choose
         # which reqwest feature is on, so they are made mutually exclusive
         # here: each is combined with every subset of
-        # serde/env/tower/axum/testing (96 builds; `axum` implies `tower`,
-        # so an `axum` build without `tower` repeats one with it), and the
+        # serde/env/tower/axum/mcp/testing (160 builds as cargo-hack counts
+        # them; `axum` and `mcp` both imply `tower`), and the
         # all-features combination, which is where the backends meet, is
         # built by the clippy, test and doc steps in `checks`. Without the
-        # exclusion cargo-hack builds all 264
+        # exclusion cargo-hack builds all 440
         # combinations for no extra coverage. --no-dev-deps keeps
         # dev-dependencies (which switch on axum, tokio and serde features)
         # from hiding a feature the library needs and does not enable itself.

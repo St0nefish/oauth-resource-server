@@ -104,6 +104,19 @@
 //! # let _ = app;
 //! ```
 //!
+//! # Per-route and per-handler scopes
+//!
+//! On top of the validator's required scopes, with the same validator and so
+//! the same key cache: [`AuthLayerBuilder::require_scopes`] for everything
+//! behind a layer, the [`RequireScopes`] route layer (behind an
+//! [`AuthLayer`]) for some routes, and the [`Scoped`] extractor for one
+//! handler. Each refuses a token without its scopes with 403 through the
+//! layer's own refusal path — its status, `on_reject` body, and a
+//! `WWW-Authenticate` challenge naming the layer's scopes followed by the
+//! route's ([`crate::refusal_for_scopes`] sends the same bytes). A static
+//! token has no scopes and is refused the same way unless the layer or
+//! [`RequireScopes`] opted in with `static_token_bypasses_scopes`.
+//!
 //! # Optional authentication
 //!
 //! [`AuthLayerBuilder::optional`] builds a layer for routes that serve everyone
@@ -166,7 +179,7 @@ use ::axum::routing::{any, get};
 use http::header::WWW_AUTHENTICATE;
 use http::request::Parts;
 use http::{HeaderValue, Method, StatusCode};
-use tracing::{debug, error, warn};
+use tracing::{debug, error, info, warn};
 use zeroize::Zeroizing;
 
 use crate::authenticate::{Credential, StaticTokenMatch, StaticTokens};
@@ -175,9 +188,11 @@ use crate::policy::StaticTokenDecision;
 use crate::token::{AuthorizedToken, InvalidTokenKind, TokenRejection, for_log};
 use crate::validator::OAuthValidator;
 
-use crate::http_layer::{Admission, Gate};
+use crate::http_layer::{Admission, Gate, GateRan, RefusalBody};
 #[doc(inline)]
-pub use crate::http_layer::{AuthLayerError, CredentialSource, RejectContext};
+pub use crate::http_layer::{
+    AuthLayerError, CredentialSource, RejectContext, RequireScopes, RequireScopesService,
+};
 pub use crate::refusal::DEFAULT_STATIC_CHALLENGE;
 // What the test module (`use super::*`) used from here before these moved to
 // `crate::http_layer`.
@@ -224,7 +239,7 @@ enum Mode {
 /// validator, the sources, the pre-rendered challenges and
 /// [`AuthLayerBuilder::optional`]), plus this layer's axum-typed `on_reject`.
 struct Enforce {
-    gate: Gate,
+    gate: Arc<Gate>,
     on_reject: Option<RejectFn>,
 }
 
@@ -354,6 +369,8 @@ pub struct AuthLayerBuilder {
     /// `None`: not set, so [`DEFAULT_STATIC_CHALLENGE`].
     static_challenge: Option<Option<HeaderValue>>,
     optional: bool,
+    required_scopes: Vec<String>,
+    static_bypasses_scopes: bool,
 }
 
 impl std::fmt::Debug for AuthLayerBuilder {
@@ -369,6 +386,8 @@ impl std::fmt::Debug for AuthLayerBuilder {
             .field("on_reject", &self.on_reject.as_ref().map(|_| "<fn>"))
             .field("static_challenge", &self.static_challenge)
             .field("optional", &self.optional)
+            .field("required_scopes", &self.required_scopes)
+            .field("static_bypasses_scopes", &self.static_bypasses_scopes)
             .finish()
     }
 }
@@ -582,6 +601,77 @@ impl AuthLayerBuilder {
         self
     }
 
+    /// Require every scope in `scopes` (all-of) of every credential this
+    /// layer accepts, on top of the validator's own `required_scopes` —
+    /// replacing scopes given earlier. It runs after validation, on the same
+    /// validator and so the same key cache: a layer for the routes that
+    /// write needs no second validator, only a second layer built from the
+    /// same `Arc<OAuthValidator>` (or, simpler, a [`RequireScopes`] route
+    /// layer, or the [`Scoped`] extractor, behind this one).
+    ///
+    /// - An OAuth token missing one is refused with 403 and a challenge
+    ///   naming the validator's required scopes followed by these — the
+    ///   scopes this request needs, which is what a client re-authorizes for
+    ///   ([`crate::refusal_for_scopes`] sends the same bytes).
+    /// - A static token has no scopes, so it is refused the same way, with
+    ///   403, unless [`static_token_bypasses_scopes`](Self::static_token_bypasses_scopes).
+    ///   Fail-safe by default: in dual mode a static token was never subject
+    ///   to the validator's scopes, but a route that asks for scopes by name
+    ///   asks for them of every credential.
+    /// - An [`optional`](Self::optional) layer still passes a request that
+    ///   presents no credential (its handlers must treat that as
+    ///   unauthenticated); a presented one is checked.
+    /// - A layer that lets everything through
+    ///   ([`AuthLayer::allow_unauthenticated`], or an `Unauthenticated`
+    ///   decision in [`build_with_decision`](Self::build_with_decision))
+    ///   checks nothing, this included: that decision is the explicit opt-out
+    ///   of authentication.
+    ///
+    /// [`build`](Self::build) refuses an entry that is not an RFC 6749 §3.3
+    /// scope-token ([`AuthLayerError::InvalidScope`]), and scopes with no
+    /// OAuth validator unless static tokens bypass them
+    /// ([`AuthLayerError::ScopesNeedOAuth`]).
+    ///
+    /// # Examples
+    ///
+    /// ```no_run
+    /// use std::sync::Arc;
+    ///
+    /// use axum::{Router, routing::{get, post}};
+    /// use oauth_resource_server::OAuthValidator;
+    /// use oauth_resource_server::axum::AuthLayer;
+    ///
+    /// # fn app(oauth: Arc<OAuthValidator>) -> Router {
+    /// let reads = AuthLayer::builder().oauth(Arc::clone(&oauth)).build().unwrap();
+    /// // The same validator: one key cache for both.
+    /// let writes = AuthLayer::builder()
+    ///     .oauth(oauth)
+    ///     .require_scopes(["docs:write"])
+    ///     .build()
+    ///     .unwrap();
+    /// Router::new()
+    ///     .merge(Router::new().route("/docs", get(|| async { "read" })).route_layer(reads))
+    ///     .merge(Router::new().route("/docs/new", post(|| async { "written" })).route_layer(writes))
+    /// # }
+    /// ```
+    pub fn require_scopes(mut self, scopes: impl IntoIterator<Item = impl Into<String>>) -> Self {
+        self.required_scopes = scopes.into_iter().map(Into::into).collect();
+        self
+    }
+
+    /// Let a static token pass [`require_scopes`](Self::require_scopes)
+    /// instead of refusing it with 403: the static token counts as holding
+    /// every scope, as it did before per-route scopes existed. Without
+    /// `require_scopes` it changes nothing.
+    ///
+    /// # Security
+    ///
+    /// Opt in only where the static token is meant to be a full-access key.
+    pub fn static_token_bypasses_scopes(mut self) -> Self {
+        self.static_bypasses_scopes = true;
+        self
+    }
+
     /// Build the body and any extra headers of a refusal — for an API whose
     /// errors are, say, JSON. Without it a refusal has an empty body. The
     /// [`RejectContext`] carries the rejection, the status and the request's
@@ -666,7 +756,9 @@ impl AuthLayerBuilder {
     /// [`AuthLayerError::NoSources`] with an empty
     /// source list; [`AuthLayerError::InvalidChallenge`] when the validator's
     /// challenge is not a valid header value (only reachable from a
-    /// hand-edited resolved config).
+    /// hand-edited resolved config); [`AuthLayerError::InvalidScope`] and
+    /// [`AuthLayerError::ScopesNeedOAuth`] as
+    /// [`require_scopes`](Self::require_scopes) says.
     pub fn build(self) -> Result<AuthLayer, AuthLayerError> {
         // The fail-closed checks, shared with the `tower` feature's
         // `HttpAuthLayerBuilder::build`.
@@ -677,10 +769,12 @@ impl AuthLayerBuilder {
             self.sources,
             self.static_challenge,
             self.optional,
+            self.required_scopes,
+            self.static_bypasses_scopes,
         )?;
         Ok(AuthLayer {
             inner: Arc::new(Mode::Enforce(Enforce {
-                gate,
+                gate: Arc::new(gate),
                 on_reject: self.on_reject,
             })),
         })
@@ -709,7 +803,18 @@ impl Enforce {
     /// [`crate::refusal()`] (`refusal::select`, through `Gate`), so an
     /// integration built on `refusal()` sends exactly what this layer sends.
     fn reject(&self, rejection: &TokenRejection, request: &Parts) -> Response {
-        let (status, _) = self.gate.status_and_challenge(rejection);
+        self.reject_with(rejection, request, None)
+    }
+
+    /// [`Enforce::reject`], with a per-request 403 challenge
+    /// (`Gate::scope_challenge`) in place of the layer's own when `Some`.
+    fn reject_with(
+        &self,
+        rejection: &TokenRejection,
+        request: &Parts,
+        insufficient: Option<&HeaderValue>,
+    ) -> Response {
+        let (status, _) = self.gate.status_and_challenge_with(rejection, insufficient);
         let response = match &self.on_reject {
             Some(f) => f(RejectContext {
                 rejection,
@@ -718,9 +823,40 @@ impl Enforce {
             }),
             None => Response::new(Body::empty()),
         };
-        // `finish` sets the status and `insert`s the challenge, replacing every
-        // value the callback set.
-        self.gate.finish(rejection, response)
+        // `finish_with` sets the status and `insert`s the challenge, replacing
+        // every value the callback set.
+        self.gate.finish_with(rejection, insufficient, response)
+    }
+
+    /// The refusal for a [`Scoped`] extractor whose credential lacks
+    /// `required`: 403 with the layer's own body and a challenge naming the
+    /// layer's scopes followed by `required` — the same bytes the
+    /// [`RequireScopes`] route layer sends for the same scopes. A layer with
+    /// no OAuth validator can never satisfy it, which is logged at `error`.
+    fn refuse_scoped(&self, request: &Parts, required: &[String]) -> Response {
+        let path = request.uri.path();
+        let rejection = TokenRejection::InsufficientScope;
+        if self.gate.oauth.is_none() {
+            error!(
+                path = %path,
+                required = ?required,
+                "Server misconfiguration: the handler requires scopes, but its AuthLayer has no \
+                 OAuth validator, so no credential can carry them; refusing the request"
+            );
+            return self.reject(&rejection, request);
+        }
+        let present = match request.extensions.get::<Credential>() {
+            Some(Credential::OAuth(token)) => token.scopes.clone(),
+            _ => Vec::new(),
+        };
+        info!(
+            path = %path,
+            required = ?required,
+            present = ?present,
+            "The credential lacks the scopes this handler requires"
+        );
+        let insufficient = self.gate.scope_challenge(required);
+        self.reject_with(&rejection, request, insufficient.as_ref())
     }
 
     /// Log a refusal at the level the [module docs](self#logging) give, then
@@ -752,6 +888,36 @@ impl Enforce {
 #[derive(Clone)]
 struct LayerRan(AuthLayer);
 
+/// [`RefusalBody::build`] for an [`AuthLayer`]: its `on_reject`, if any.
+fn axum_refusal_body(
+    source: &(dyn std::any::Any + Send + Sync),
+    cx: RejectContext<'_>,
+) -> Option<Response> {
+    match source.downcast_ref::<Mode>()? {
+        Mode::Enforce(Enforce {
+            on_reject: Some(f), ..
+        }) => Some(f(cx)),
+        _ => None,
+    }
+}
+
+impl AuthLayer {
+    /// Insert the markers a route-level scope check behind this layer reads
+    /// (`http_layer::GateRan`, and this layer's refusal builder), shared with
+    /// the `tower` feature's layer.
+    fn mark(&self, extensions: &mut http::Extensions) {
+        let gate = match &*self.inner {
+            Mode::Enforce(enforce) => Some(Arc::clone(&enforce.gate)),
+            Mode::AllowUnauthenticated => None,
+        };
+        extensions.insert(GateRan(gate));
+        extensions.insert(RefusalBody::<Body> {
+            source: Arc::clone(&self.inner) as Arc<dyn std::any::Any + Send + Sync>,
+            build: axum_refusal_body,
+        });
+    }
+}
+
 impl AuthLayer {
     /// Authenticate `request`: the request to pass on (with the credential in
     /// its extensions), or the refusal to answer with. The one implementation
@@ -761,6 +927,7 @@ impl AuthLayer {
         let enforce = match &*self.inner {
             Mode::AllowUnauthenticated => {
                 request.extensions_mut().insert(LayerRan(self.clone()));
+                self.mark(request.extensions_mut());
                 return Ok(request);
             }
             Mode::Enforce(enforce) => enforce,
@@ -792,6 +959,7 @@ impl AuthLayer {
             Admission::Refused(rejection) => return Err(enforce.refuse(&rejection, &parts)),
         }
         parts.extensions.insert(LayerRan(self.clone()));
+        self.mark(&mut parts.extensions);
         Ok(Request::from_parts(parts, body))
     }
 
@@ -1085,6 +1253,157 @@ impl<S: Send + Sync> OptionalFromRequestParts<S> for StaticTokenMatch {
     }
 }
 
+/// A set of scopes a handler requires, named as a type so the requirement is
+/// part of the handler's signature: see [`Scoped`].
+///
+/// Implement it on a unit type of your own, once per distinct requirement.
+/// Every entry must be an RFC 6749 §3.3 scope-token (printable ASCII with no
+/// space, `"` or `\`); a set holding any other entry can never be satisfied,
+/// and [`Scoped`] answers it with 500 (a wiring mistake, logged at `error`).
+///
+/// ```
+/// use oauth_resource_server::axum::ScopeSet;
+///
+/// struct DocsWrite;
+/// impl ScopeSet for DocsWrite {
+///     const SCOPES: &'static [&'static str] = &["docs:write"];
+/// }
+/// ```
+pub trait ScopeSet: Send + Sync + 'static {
+    /// The scopes required, all-of.
+    const SCOPES: &'static [&'static str];
+}
+
+/// An axum extractor for the OAuth token an [`AuthLayer`] accepted, refusing
+/// unless it carries every scope in `S` ([`ScopeSet::SCOPES`]) — a
+/// per-handler scope requirement written in the handler's signature, checked
+/// with [`AuthorizedToken::require_scopes`] on top of the layer's own.
+///
+/// Derefs to the [`AuthorizedToken`]. Refuses exactly as the layer and the
+/// other extractors do, through the layer's own refusal path (status,
+/// `WWW-Authenticate` and [`on_reject`](AuthLayerBuilder::on_reject) body):
+///
+/// | The request… | Answer |
+/// |---|---|
+/// | carries an OAuth token with every scope in `S` | the token |
+/// | carries an OAuth token missing one | 403, with a challenge naming the layer's scopes followed by `S`'s — the same bytes as a [`RequireScopes`] layer with those scopes |
+/// | was accepted with a static token (it has no scopes) | 403 the same way (logged at `error` when the layer has no OAuth validator: nothing can satisfy it) |
+/// | carries no credential (an [`optional`](AuthLayerBuilder::optional) or [`allow_unauthenticated`](AuthLayer::allow_unauthenticated) layer passed it) | the layer's own 401, as the [`AuthorizedToken`] extractor answers |
+/// | never went through an [`AuthLayer`] | 500, logged at `error` |
+///
+/// There is no static-token opt-in here, since a static token has no
+/// [`AuthorizedToken`] to extract: for a route a static key may also reach,
+/// use a [`RequireScopes`] layer with
+/// [`static_token_bypasses_scopes`](RequireScopes::static_token_bypasses_scopes)
+/// and the [`Credential`] extractor.
+///
+/// # Examples
+///
+/// ```
+/// use axum::{Router, routing::post};
+/// use oauth_resource_server::axum::{AuthLayer, ScopeSet, Scoped};
+///
+/// struct DocsWrite;
+/// impl ScopeSet for DocsWrite {
+///     const SCOPES: &'static [&'static str] = &["docs:write"];
+/// }
+///
+/// async fn write(token: Scoped<DocsWrite>) -> String {
+///     format!("written by {:?}", token.subject)
+/// }
+///
+/// # fn app(auth: AuthLayer) -> Router {
+/// Router::new().route("/docs", post(write)).route_layer(auth)
+/// # }
+/// ```
+pub struct Scoped<S: ScopeSet> {
+    token: AuthorizedToken,
+    _scopes: std::marker::PhantomData<fn() -> S>,
+}
+
+impl<S: ScopeSet> Scoped<S> {
+    /// The token.
+    pub fn token(&self) -> &AuthorizedToken {
+        &self.token
+    }
+
+    /// The token, by value.
+    pub fn into_token(self) -> AuthorizedToken {
+        self.token
+    }
+}
+
+impl<S: ScopeSet> std::ops::Deref for Scoped<S> {
+    type Target = AuthorizedToken;
+
+    fn deref(&self) -> &AuthorizedToken {
+        &self.token
+    }
+}
+
+impl<S: ScopeSet> Clone for Scoped<S> {
+    fn clone(&self) -> Self {
+        Self {
+            token: self.token.clone(),
+            _scopes: std::marker::PhantomData,
+        }
+    }
+}
+
+/// The token's own `Debug` (claim names only, never values), plus the scope
+/// set required.
+impl<S: ScopeSet> std::fmt::Debug for Scoped<S> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Scoped")
+            .field("required", &S::SCOPES)
+            .field("token", &self.token)
+            .finish()
+    }
+}
+
+#[cfg_attr(docsrs, doc(cfg(feature = "axum")))]
+impl<S: ScopeSet, St: Send + Sync> FromRequestParts<St> for Scoped<S> {
+    type Rejection = Response;
+
+    async fn from_request_parts(parts: &mut Parts, _state: &St) -> Result<Self, Response> {
+        let Some(required) = crate::http_layer::checked_scopes(S::SCOPES.iter().copied()) else {
+            error!(
+                path = %parts.uri.path(),
+                extractor = std::any::type_name::<S>(),
+                "Server misconfiguration: a ScopeSet holds an entry that is not a valid scope, \
+                 which no token can carry; refusing the request"
+            );
+            return Err(StatusCode::INTERNAL_SERVER_ERROR.into_response());
+        };
+        match find::<Credential>(parts) {
+            Found::Present(Credential::OAuth(token)) if token.require_scopes(S::SCOPES).is_ok() => {
+                Ok(Self {
+                    token,
+                    _scopes: std::marker::PhantomData,
+                })
+            }
+            // Valid, but insufficient: a token missing a scope, or a static
+            // token, which has none.
+            Found::Present(_) => Err(
+                match parts.extensions.get::<LayerRan>().map(|l| &*l.0.inner) {
+                    Some(Mode::Enforce(enforce)) => enforce.refuse_scoped(parts, &required),
+                    // Accepted by the `tower` feature's layer, or by an outer
+                    // layer around an `allow_unauthenticated` one: the same
+                    // shared refusal path, through the gate marker.
+                    _ => crate::http_layer::scope_refusal::<Body>(
+                        parts,
+                        &TokenRejection::InsufficientScope,
+                        &required,
+                        "Scoped",
+                    ),
+                },
+            ),
+            Found::Absent(layer) => Err(refuse_absent(&layer, parts, Wants::OAuthToken)),
+            Found::NoLayer => Err(no_layer(parts, "Scoped")),
+        }
+    }
+}
+
 /// The authentication middleware, for [`axum::middleware::from_fn_with_state`]
 /// with an [`AuthLayer`] as state. Equivalent to using the [`AuthLayer`] as a
 /// `tower::Layer` directly.
@@ -1280,6 +1599,9 @@ fn method_not_allowed() -> Response {
     )
         .into_response()
 }
+
+#[cfg(test)]
+mod scope_tests;
 
 #[cfg(test)]
 mod tests {

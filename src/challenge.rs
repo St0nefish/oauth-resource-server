@@ -126,6 +126,67 @@ pub(crate) fn insufficient_scope(required_scopes: &str, resource_metadata_url: &
     )
 }
 
+/// The longest `error_description` a per-request challenge carries, in bytes;
+/// a longer one is cut here (it is ASCII by then, so any byte is a boundary).
+pub(crate) const MAX_ERROR_DESCRIPTION_BYTES: usize = 256;
+
+/// A per-request 403 challenge (`OAuthValidator::insufficient_scope_challenge_for`):
+/// `Bearer error="insufficient_scope", scope="…", resource_metadata="…",
+/// error_description="…"`, each attribute present only when there is
+/// something to put in it.
+///
+/// Built to be a valid header value whatever the input:
+/// - `scopes`: each entry is kept only if it is an RFC 6749 §3.3 scope-token
+///   (printable ASCII, no space, `"` or `\`), so none needs escaping and none
+///   can split into two; duplicates are dropped, order kept. With none left
+///   the attribute is omitted (RFC 6749 §3.3 requires at least one).
+/// - `resource_metadata_url`: `None` for a validator on its fallback
+///   challenges (its URL is what was invalid). Escaped with [`quoted`].
+/// - `description`: RFC 6750 §3 allows only `%x20-21 / %x23-5B / %x5D-7E` in
+///   `error_description` — no `"`, no `\`, nothing outside printable ASCII —
+///   so every other character (a CR or LF above all) is replaced by a space,
+///   never escaped or passed through; the result is trimmed, cut to
+///   [`MAX_ERROR_DESCRIPTION_BYTES`], and omitted when blank.
+pub(crate) fn insufficient_scope_for(
+    scopes: &[&str],
+    resource_metadata_url: Option<&str>,
+    description: Option<&str>,
+) -> String {
+    let mut kept: Vec<&str> = Vec::new();
+    for scope in scopes {
+        if crate::config::is_scope_token(scope) && !kept.contains(scope) {
+            kept.push(scope);
+        }
+    }
+    let mut out = String::from("Bearer error=\"insufficient_scope\"");
+    if !kept.is_empty() {
+        out.push_str(&format!(", scope=\"{}\"", kept.join(" ")));
+    }
+    if let Some(url) = resource_metadata_url {
+        out.push_str(&format!(", resource_metadata=\"{}\"", quoted(url)));
+    }
+    if let Some(description) = description.map(error_description).filter(|d| !d.is_empty()) {
+        out.push_str(&format!(", error_description=\"{description}\""));
+    }
+    out
+}
+
+/// `description` reduced to RFC 6750 §3's `error_description` character set
+/// (see [`insufficient_scope_for`]).
+pub(crate) fn error_description(description: &str) -> String {
+    let allowed = |c: char| c == ' ' || c == '!' || matches!(c, '#'..='[' | ']'..='~');
+    let replaced: String = description
+        .chars()
+        .map(|c| if allowed(c) { c } else { ' ' })
+        .collect();
+    let mut trimmed = replaced.trim().to_string();
+    if trimmed.len() > MAX_ERROR_DESCRIPTION_BYTES {
+        trimmed.truncate(MAX_ERROR_DESCRIPTION_BYTES);
+        trimmed.truncate(trimmed.trim_end().len());
+    }
+    trimmed
+}
+
 /// Escape a value for an HTTP `quoted-string` (RFC 9110 §5.6.4).
 ///
 /// Every value in a `WWW-Authenticate` auth-param here is config-derived, so this

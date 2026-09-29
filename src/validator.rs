@@ -21,7 +21,7 @@ use crate::jwks::{
 };
 use crate::token::{
     AuthorizedToken, InvalidTokenKind, MAX_TOKEN_BYTES, TokenRejection, check_typ, client_id_of,
-    extract_principal, extract_scopes, for_log, numeric_date_secs,
+    extract_principal, extract_scopes, for_log, missing_scopes, numeric_date_secs,
 };
 
 /// Why an [`OAuthValidator`] could not be built.
@@ -641,6 +641,103 @@ impl OAuthValidator {
         self.insufficient_scope_challenge.clone()
     }
 
+    /// A 403 challenge for ONE request, naming the scopes that request needs
+    /// rather than the validator's fixed set:
+    /// `Bearer error="insufficient_scope", scope="…", resource_metadata="…",
+    /// error_description="…"` (the shape the MCP authorization spec asks for
+    /// on a per-operation refusal). [`insufficient_scope_challenge`](Self::insufficient_scope_challenge)
+    /// is exactly this with the configured `required_scopes` and no
+    /// description.
+    ///
+    /// `scopes` is named verbatim, deduplicated, in order — pass every scope
+    /// the request needs, the validator's own required scopes included, so a
+    /// client that re-authorizes for exactly this set gets a token that
+    /// passes ([`crate::refusal_for_scopes`] and the layers add them for
+    /// you). With no scope to name, `scope` is omitted.
+    ///
+    /// # Security
+    ///
+    /// Always a valid header value, whatever the arguments:
+    ///
+    /// - a `scopes` entry that is not an RFC 6749 §3.3 scope-token (empty,
+    ///   or holding a space, `"`, `\`, a control or non-ASCII character) is
+    ///   left out of `scope` — no token can carry such a scope anyway;
+    /// - `description` is reduced to RFC 6750 §3's `error_description`
+    ///   character set: every `"`, `\`, control (CR and LF included) and
+    ///   non-ASCII character becomes a space, so it can neither close the
+    ///   quoted string nor split the header. It is then trimmed, cut to 256
+    ///   bytes, and left out when blank. It is still sent to the client:
+    ///   never put a token-derived or secret value in it;
+    /// - a validator built from a hand-edited config whose challenges fell
+    ///   back (see [`invalid_token_challenge`](Self::invalid_token_challenge))
+    ///   leaves `resource_metadata` out here too.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// # use oauth_resource_server::{KeyNaming, OAuthConfig, OAuthValidator};
+    /// # let config = OAuthConfig {
+    /// #     enabled: true,
+    /// #     issuer: "https://auth.example.com/".into(),
+    /// #     audience: "example-api".into(),
+    /// #     resource: "https://api.example.com/v1".into(),
+    /// #     required_scope: Some("api:read".into()),
+    /// #     ..OAuthConfig::default()
+    /// # }
+    /// # .resolve(KeyNaming::Dotted("oauth"))
+    /// # .unwrap()
+    /// # .unwrap();
+    /// # let validator = OAuthValidator::new(&config).unwrap();
+    /// assert_eq!(
+    ///     validator.insufficient_scope_challenge_for(
+    ///         &["api:read", "api:write"],
+    ///         Some("writing needs api:write"),
+    ///     ),
+    ///     "Bearer error=\"insufficient_scope\", scope=\"api:read api:write\", \
+    ///      resource_metadata=\"https://api.example.com/.well-known/oauth-protected-resource/v1\", \
+    ///      error_description=\"writing needs api:write\""
+    /// );
+    ///
+    /// // A description cannot inject an attribute or split the header.
+    /// let challenge = validator
+    ///     .insufficient_scope_challenge_for(&["api:write"], Some("x\", scope=\"admin\r\nX: y"));
+    /// assert!(challenge.ends_with("error_description=\"x , scope= admin  X: y\""));
+    /// ```
+    pub fn insufficient_scope_challenge_for(
+        &self,
+        scopes: &[&str],
+        description: Option<&str>,
+    ) -> String {
+        let url = (!self.challenge_fallback).then_some(self.resource_metadata_url.as_str());
+        let challenge = challenge::insufficient_scope_for(scopes, url, description);
+        // Unreachable (every part is filtered above), but the guarantee is
+        // "always a header value", so it is checked, not assumed.
+        if challenge::is_header_value(&challenge) {
+            challenge
+        } else {
+            challenge::fallback("insufficient_scope", "")
+        }
+    }
+
+    /// The validator's own `required_scopes` followed by `extra`,
+    /// deduplicated: every scope a request needs that must pass both the
+    /// validator's floor and a per-route or per-operation requirement.
+    pub(crate) fn scopes_with_floor<'a>(&'a self, extra: &[&'a str]) -> Vec<&'a str> {
+        let mut all: Vec<&str> = Vec::new();
+        for scope in self
+            .config
+            .required_scopes
+            .iter()
+            .map(String::as_str)
+            .chain(extra.iter().copied())
+        {
+            if !all.contains(&scope) {
+                all.push(scope);
+            }
+        }
+        all
+    }
+
     /// Whether the configured challenges were not valid header values and the
     /// fallbacks are in use; the layers refuse to build with such a validator.
     #[cfg_attr(not(any(feature = "tower", test)), allow(dead_code))] // read by the layers only
@@ -894,11 +991,13 @@ impl OAuthValidator {
 
         // All-of: every required scope must be present. An empty requirement
         // passes every token.
-        if !self
-            .config
-            .required_scopes
-            .iter()
-            .all(|required| scopes.contains(required))
+        // `missing_scopes` is the one matching rule, shared with
+        // `AuthorizedToken::require_scopes`.
+        if !missing_scopes(
+            &scopes,
+            self.config.required_scopes.iter().map(String::as_str),
+        )
+        .is_empty()
         {
             // Info, not debug: this is the refusal an operator wiring up a new
             // authorization server hits first (Authelia's `scp`-only tokens were
@@ -1875,6 +1974,126 @@ mod tests {
             validator_with(cfg).insufficient_scope_challenge(),
             "Bearer error=\"insufficient_scope\", scope=\"mcp:read mcp:write\", \
              resource_metadata=\"https://kb.example.test/.well-known/oauth-protected-resource/mcp\""
+        );
+    }
+
+    const METADATA: &str = "https://kb.example.test/.well-known/oauth-protected-resource/mcp";
+
+    #[test]
+    fn the_per_request_challenge_with_the_configured_scopes_is_the_fixed_one() {
+        for required in [vec![], vec!["mcp:read"], vec!["mcp:read", "mcp:write"]] {
+            let mut cfg = oauth_config("http://127.0.0.1:1/jwks");
+            cfg.required_scopes = required.iter().map(|s| s.to_string()).collect();
+            let v = validator_with(cfg);
+            assert_eq!(
+                v.insufficient_scope_challenge_for(&required, None),
+                v.insufficient_scope_challenge(),
+                "{required:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn the_per_request_challenge_names_the_given_scopes_and_description() {
+        let v = validator("http://127.0.0.1:1/jwks");
+        assert_eq!(
+            v.insufficient_scope_challenge_for(&["mcp:read", "mcp:write", "mcp:read"], None),
+            format!(
+                "Bearer error=\"insufficient_scope\", scope=\"mcp:read mcp:write\", \
+                 resource_metadata=\"{METADATA}\""
+            )
+        );
+        assert_eq!(
+            v.insufficient_scope_challenge_for(&["files:write"], Some("  Write access needed ")),
+            format!(
+                "Bearer error=\"insufficient_scope\", scope=\"files:write\", \
+                 resource_metadata=\"{METADATA}\", error_description=\"Write access needed\""
+            )
+        );
+        // Nothing to name: no `scope`; a blank description: none either.
+        assert_eq!(
+            v.insufficient_scope_challenge_for(&[], Some(" \r\n ")),
+            format!("Bearer error=\"insufficient_scope\", resource_metadata=\"{METADATA}\"")
+        );
+    }
+
+    #[test]
+    fn the_per_request_challenge_cannot_be_injected_into() {
+        let v = validator("http://127.0.0.1:1/jwks");
+        let attempts = [
+            "x\", scope=\"admin",
+            "x\r\nSet-Cookie: session=1",
+            "x\\\", error=\"invalid_token",
+            "caf\u{e9} \u{0}\u{7f}\u{2028}",
+        ];
+        for description in attempts {
+            let challenge = v.insufficient_scope_challenge_for(&["mcp:write"], Some(description));
+            assert!(challenge::is_header_value(&challenge), "{challenge:?}");
+            let (head, described) = challenge
+                .split_once(", error_description=\"")
+                .expect("a description is kept");
+            // The description cannot close its quoted string early, carry an
+            // escape, or add an attribute: exactly one `"` follows, the last.
+            assert_eq!(described.matches('"').count(), 1, "{challenge:?}");
+            assert!(described.ends_with('"'));
+            assert!(!described.contains('\\'));
+            assert_eq!(
+                head,
+                format!(
+                    "Bearer error=\"insufficient_scope\", scope=\"mcp:write\", \
+                     resource_metadata=\"{METADATA}\""
+                )
+            );
+        }
+        assert!(
+            v.insufficient_scope_challenge_for(&["mcp:write"], Some("x\", scope=\"admin"))
+                .ends_with("error_description=\"x , scope= admin\"")
+        );
+        // Scopes that are not scope-tokens are left out, never escaped in.
+        assert_eq!(
+            v.insufficient_scope_challenge_for(
+                &[
+                    "ok",
+                    "",
+                    "two words",
+                    "q\"uote",
+                    "back\\slash",
+                    "nl\n",
+                    "caf\u{e9}"
+                ],
+                None
+            ),
+            format!(
+                "Bearer error=\"insufficient_scope\", scope=\"ok\", resource_metadata=\"{METADATA}\""
+            )
+        );
+        // A long description is cut to the cap.
+        let long = "a".repeat(1000);
+        let challenge = v.insufficient_scope_challenge_for(&[], Some(&long));
+        assert!(challenge.ends_with(&format!(
+            "error_description=\"{}\"",
+            "a".repeat(challenge::MAX_ERROR_DESCRIPTION_BYTES)
+        )));
+    }
+
+    #[test]
+    fn a_fallback_validator_leaves_resource_metadata_out_of_the_per_request_challenge() {
+        let mut cfg = oauth_config("http://127.0.0.1:1/jwks");
+        cfg.resource = "https://api.example.test/v1\r\nX-Injected: 1".into();
+        let v = validator_with(cfg);
+        assert!(v.challenge_fell_back());
+        assert_eq!(
+            v.insufficient_scope_challenge_for(&["mcp:write"], Some("d")),
+            "Bearer error=\"insufficient_scope\", scope=\"mcp:write\", error_description=\"d\""
+        );
+    }
+
+    #[test]
+    fn the_floor_comes_first_and_is_deduplicated() {
+        let v = validator("http://127.0.0.1:1/jwks");
+        assert_eq!(
+            v.scopes_with_floor(&["mcp:write", "mcp:read", "mcp:write"]),
+            ["mcp:read", "mcp:write"]
         );
     }
 
