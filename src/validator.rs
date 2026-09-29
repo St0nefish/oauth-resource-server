@@ -411,6 +411,9 @@ impl OAuthValidator {
                 naming.key("jwks_uri")
             );
         }
+        for message in non_canonical_warnings(config) {
+            warn!("{message}");
+        }
 
         let metadata = challenge::metadata_document(config);
         let http = http_client(
@@ -1049,6 +1052,45 @@ fn unscoped_posture(config: &ResolvedOAuthConfig) -> UnscopedPosture {
     }
 }
 
+/// One startup warning per URL setting spelled in a form the URL parser has to
+/// repair ([`non_canonical_url`]), naming the setting and giving both spellings
+/// through [`redact_url`]. Not refused by `resolve`: reqwest fetches such a URL
+/// correctly, and refusing it would narrow what 0.1.x accepted.
+pub(crate) fn non_canonical_warnings(config: &ResolvedOAuthConfig) -> Vec<String> {
+    let naming = &config.key_naming;
+    let urls = [
+        ("issuer", Some(config.issuer.as_str())),
+        ("resource", Some(config.resource.as_str())),
+        ("jwks_uri", config.jwks_uri.as_deref()),
+    ];
+    urls.into_iter()
+        .filter_map(|(name, value)| {
+            let value = value?;
+            let canonical = non_canonical_url(value)?;
+            let consequence = match name {
+                "issuer" => {
+                    "a token's `iss` is compared with it byte-for-byte, and no authorization \
+                     server writes its issuer this way, so every token will be refused; \
+                     discovery URLs are built from the raw text too"
+                }
+                "resource" => {
+                    "the `resource_metadata` URL in every challenge, the metadata document \
+                     and the route it is served on are built from the raw text, so clients \
+                     may not find the metadata, or may reject it"
+                }
+                _ => "logs and key-set status show the raw text, not the URL fetched",
+            };
+            Some(format!(
+                "{} {:?} is not canonically spelled — it is read as {:?}; {consequence}. \
+                 Write it in that form.",
+                naming.key(name),
+                redact_url(value),
+                redact_url(&canonical),
+            ))
+        })
+        .collect()
+}
+
 /// Required scopes a client is never told to request: those missing from a
 /// non-empty `scopes_supported`. Empty when `scopes_supported` is empty, since
 /// the challenge then advertises the required scopes themselves.
@@ -1064,18 +1106,68 @@ fn unadvertised_scopes(config: &ResolvedOAuthConfig) -> Vec<&str> {
         .collect()
 }
 
-/// Whether `url` is plain `http://` to a host other than loopback/`localhost`.
+/// Whether `url` is plain `http` to a host other than loopback/`localhost`.
+///
+/// Decided on the PARSED URL — trimmed and parsed exactly as `check_url` and
+/// reqwest parse it — never on the raw text: the parser reads `http:/host`,
+/// `http:host`, `HTTP:\\host\path` and ` http://host` all as
+/// `http://host/...`, which is where reqwest would connect. A value that does
+/// not parse is not a URL anything would fetch, so it is not "plain http".
 pub(crate) fn plain_http_non_loopback(url: &str) -> bool {
-    url.get(..7)
-        .is_some_and(|scheme| scheme.eq_ignore_ascii_case("http://"))
-        && !is_loopback_url(url)
+    reqwest::Url::parse(url.trim()).is_ok_and(|parsed| parsed_plain_http_non_loopback(&parsed))
 }
 
-/// Whether `url`'s host is a loopback address or `localhost`.
-pub(crate) fn is_loopback_url(url: &str) -> bool {
-    let Ok(parsed) = reqwest::Url::parse(url) else {
-        return false;
-    };
+/// [`plain_http_non_loopback`] for a URL that is already parsed — a redirect
+/// target, say — so the decision is made on the very value reqwest uses.
+pub(crate) fn parsed_plain_http_non_loopback(url: &reqwest::Url) -> bool {
+    url.scheme() == "http" && !is_loopback_url(url)
+}
+
+/// The canonical form of `url` when it parses but is spelled in a way the URL
+/// parser has to repair ([`is_canonical_spelling`]); `None` when it is
+/// canonically spelled or does not parse at all. Feeds the startup warnings;
+/// code that takes a URL apart on `://` asks [`is_canonical_url`] instead,
+/// which is false for an unparseable value too.
+pub(crate) fn non_canonical_url(url: &str) -> Option<String> {
+    let value = url.trim();
+    let parsed = reqwest::Url::parse(value).ok()?;
+    (!is_canonical_spelling(value, &parsed)).then(|| parsed.to_string())
+}
+
+/// Whether `url` parses AND is canonically spelled — the only case in which
+/// splitting its raw text on `://` finds the authority the parser finds.
+pub(crate) fn is_canonical_url(url: &str) -> bool {
+    let value = url.trim();
+    reqwest::Url::parse(value).is_ok_and(|parsed| is_canonical_spelling(value, &parsed))
+}
+
+/// Whether `value` (which parsed as `parsed`) is written `scheme://authority`
+/// with a non-empty authority containing no `\`.
+///
+/// The WHATWG parser reqwest uses reads `https:/host`, `https:host`,
+/// `https:\\host` and `https:///host` all as `https://host/...`, so each is
+/// fetched from `host` — but the RAW string is what is compared byte-for-byte
+/// with a token's `iss`, taken apart on `://` to build discovery and
+/// `resource_metadata` URLs, and echoed into every challenge, so such a value
+/// means something different in each of those places. Only the authority is
+/// checked for `\`: one in the path is read as `/`, which moves no host. Case,
+/// a default port and a missing trailing slash are not flagged: they move
+/// neither the authority nor the path, and an issuer must keep the exact
+/// spelling its authorization server stamps into `iss`.
+fn is_canonical_spelling(value: &str, parsed: &reqwest::Url) -> bool {
+    let scheme = parsed.scheme();
+    value
+        .get(..scheme.len())
+        .filter(|s| s.eq_ignore_ascii_case(scheme))
+        .and_then(|_| value[scheme.len()..].strip_prefix("://"))
+        .is_some_and(|rest| {
+            let authority = &rest[..rest.find(['/', '?', '#']).unwrap_or(rest.len())];
+            !authority.is_empty() && !authority.contains('\\')
+        })
+}
+
+/// Whether the parsed `url`'s host is a loopback address or `localhost`.
+fn is_loopback_url(parsed: &reqwest::Url) -> bool {
     let Some(host) = parsed.host_str() else {
         return false;
     };
@@ -1239,6 +1331,34 @@ mod tests {
         assert!(!plain_http_non_loopback("https://idp.example.com/jwks"));
         assert!(!plain_http_non_loopback("http://127.0.0.1:9000/jwks"));
         assert!(!plain_http_non_loopback("http://localhost/jwks"));
+        assert!(!plain_http_non_loopback("http://[::1]:9000/jwks"));
+    }
+
+    #[test]
+    fn plain_http_detection_decides_on_the_parsed_url_not_the_raw_prefix() {
+        // Each of these is fetched by reqwest as http://idp.example.com/jwks.
+        for spelling in [
+            "http:/idp.example.com/jwks",
+            "http:idp.example.com/jwks",
+            "HTTP:\\\\idp.example.com\\jwks",
+            " http://idp.example.com/jwks",
+            "http:///idp.example.com/jwks",
+            "\thttp://idp.example.com/jwks",
+        ] {
+            assert!(plain_http_non_loopback(spelling), "{spelling:?}");
+        }
+        // The same spellings to a loopback host, or over https, are not.
+        for spelling in [
+            "http:/localhost/jwks",
+            "http:127.0.0.1:9000/jwks",
+            "HTTP:\\\\[::1]\\jwks",
+            " http://localhost/jwks",
+            "https:/idp.example.com/jwks",
+            "https:idp.example.com/jwks",
+            "not a url",
+        ] {
+            assert!(!plain_http_non_loopback(spelling), "{spelling:?}");
+        }
     }
 
     #[test]
@@ -1254,6 +1374,67 @@ mod tests {
             "/.well-known/oauth-protected-resource/mcp"
         );
         assert_eq!(v.config().issuer, ISSUER);
+    }
+
+    #[test]
+    fn a_hand_edited_unparseable_or_non_canonical_url_never_reaches_another_host() {
+        // `resolve` refuses an unparseable issuer/resource, but
+        // `ResolvedOAuthConfig`'s fields are public. Split on `://`, `https://`
+        // and `https:///host` would put `.well-known` where the host goes.
+        let host = |url: &str| {
+            reqwest::Url::parse(url)
+                .ok()
+                .and_then(|u| u.host_str().map(str::to_owned))
+        };
+        for (value, expected_host) in [
+            ("https://", None),
+            ("https:///", None),
+            ("https:", None),
+            ("https:///idp.example.test/app/", Some("idp.example.test")),
+        ] {
+            let mut cfg = resolved_config("http://127.0.0.1:1/jwks");
+            cfg.issuer = value.into();
+            cfg.resource = value.into();
+            let v = OAuthValidator::new(&cfg).unwrap();
+            assert_eq!(
+                host(v.resource_metadata_url()).as_deref(),
+                expected_host,
+                "{value:?}: {}",
+                v.resource_metadata_url()
+            );
+            assert!(v.metadata_path().starts_with('/'), "{value:?}");
+            for url in crate::jwks::discovery_urls(&cfg.issuer) {
+                assert_eq!(host(&url).as_deref(), expected_host, "{value:?}: {url}");
+            }
+        }
+        assert!(!is_canonical_url("https://"));
+        assert!(!is_canonical_url("https:///idp.example.test/"));
+        assert!(non_canonical_url("https://").is_none());
+    }
+
+    #[test]
+    fn a_backslash_only_in_the_path_is_canonical_for_splitting() {
+        // The parser reads `\` in the path as `/`, which moves no host, so the
+        // issuer still gets both discovery forms, on its own host.
+        let issuer = "https://idp.example.test/app\\tenant/";
+        assert!(is_canonical_url(issuer));
+        assert_eq!(
+            crate::jwks::discovery_urls(issuer),
+            [
+                "https://idp.example.test/app\\tenant/.well-known/openid-configuration",
+                "https://idp.example.test/.well-known/oauth-authorization-server/app\\tenant",
+            ]
+        );
+        assert_eq!(
+            crate::challenge::resource_metadata_url("https://api.example.test/v1\\x"),
+            "https://api.example.test/.well-known/oauth-protected-resource/v1\\x"
+        );
+        // In the authority it is not: the parser ends the host at the `\`.
+        assert!(!is_canonical_url("https://idp.example.test\\app"));
+        assert_eq!(
+            crate::jwks::discovery_urls("https://idp.example.test\\app").len(),
+            1
+        );
     }
 
     // ── the metadata document and the challenge headers ──────────────────────
@@ -2810,11 +2991,15 @@ mod tests {
 
     #[test]
     fn loopback_detection() {
-        assert!(is_loopback_url("http://127.0.0.1:8080/x"));
-        assert!(is_loopback_url("http://[::1]:8080/x"));
-        assert!(is_loopback_url("http://localhost/x"));
-        assert!(!is_loopback_url("http://auth.example.com/x"));
-        assert!(!is_loopback_url("not a url"));
+        let url = |s: &str| reqwest::Url::parse(s).unwrap();
+        assert!(is_loopback_url(&url("http://127.0.0.1:8080/x")));
+        assert!(is_loopback_url(&url("http://[::1]:8080/x")));
+        assert!(is_loopback_url(&url("http://localhost/x")));
+        assert!(is_loopback_url(&url("http:/localhost/x")));
+        assert!(is_loopback_url(&url("http://app.localhost/x")));
+        assert!(!is_loopback_url(&url("http://auth.example.com/x")));
+        assert!(!is_loopback_url(&url("http:auth.example.com/x")));
+        assert!(!is_loopback_url(&url("data:text/plain,x")));
     }
 
     #[tokio::test]

@@ -803,7 +803,7 @@ error messages spell them (`KeyNaming::Dotted("oauth")` gives `oauth.issuer`,
 | Field | Type | Default | Meaning |
 |---|---|---|---|
 | `enabled` | `bool` | `false` | Master switch. While `false`, `resolve` returns `Ok(None)` and checks nothing else. |
-| `issuer` | `String` | required | The authorization server's issuer identifier. Compared byte for byte with each token's `iss` and published in the metadata document. Copy it from the server's discovery document, including any trailing slash. Must be an absolute URL with no query, fragment, space, control or non-ASCII character, and `https` (RFC 8414 §2) unless its host is loopback or `allow_insecure_http` is set. |
+| `issuer` | `String` | required | The authorization server's issuer identifier. Compared byte for byte with each token's `iss` and published in the metadata document. Copy it from the server's discovery document, including any trailing slash. Must be an absolute URL with no query, fragment, space, control or non-ASCII character, and `https` (RFC 8414 §2) unless its host is loopback or `allow_insecure_http` is set, however it is spelled (`http:/host` is plain `http` too). Write it `https://host/…`: a spelling the URL parser has to repair (`https:/host`, a `\` in the host) is accepted but logged as a startup `warn`, and can never match a token's `iss`. |
 | `jwks_uri` | `Option<String>` | `None` | Where to fetch the signing keys. When absent or blank, it is discovered from the issuer's metadata (OpenID Connect Discovery, then RFC 8414), and the discovered document's `issuer` must equal `issuer` exactly. Same URL rules as `issuer`, except that a query is allowed. |
 | `audience` | `String` | required, unless `audiences` is set | A value the token's `aud` must contain. There is no default; see [Audience](#audience-which-value-to-configure). |
 | `audiences` | `Vec<String>` | `[]` | More accepted audiences. A token matching any configured value passes. Useful while migrating from one audience to another. |
@@ -1045,7 +1045,9 @@ verified claims and token metadata) or a
   plain-`http` `issuer`, `jwks_uri` or `resource` on a non-loopback host, a
   config that would accept ID tokens (no required scope and no `typ` check),
   a scope that is not a valid scope-token, and a URL with a space, control or
-  non-ASCII character. The first two have explicit opt-ins
+  non-ASCII character. Whether a URL is plain `http` is decided on the URL as
+  parsed, so `http:/host` or `HTTP:\\host` needs the opt-in exactly as
+  `http://host` does. The first two have explicit opt-ins
   (`allow_insecure_http`, `allow_unscoped_tokens`).
 - **Network use is bounded.** Only the configured `jwks_uri`, the discovery
   URLs derived from the configured `issuer`, or (with no `jwks_uri` configured)

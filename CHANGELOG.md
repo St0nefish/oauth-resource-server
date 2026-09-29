@@ -160,6 +160,29 @@ Before 1.0, a breaking change increments the minor version.
   credential (or a secret query parameter) to the log. The fetch still uses
   the URL unchanged. The new `KeySetStatus::jwks_uri` is redacted the same
   way.
+- A plain-`http` `issuer`, `jwks_uri` or `resource` on a non-loopback host
+  now needs `allow_insecure_http` however it is spelled. The check tested
+  whether the raw string began with `http://`, while the URL parser, and
+  reqwest's fetch, read `http:/host/…`, `http:host/…` and `HTTP:\\host\…` as
+  `http://host/…`. Up to 0.1.2 `resolve` accepted such an `issuer`,
+  `jwks_uri` or `resource` without the opt-in: for the first two, signing
+  keys were then fetched over cleartext, where anyone on the path could
+  substitute them; for `resource`, clients were told to send their bearer
+  tokens to it over cleartext, where they can be read in transit. A `jwks_uri`
+  discovered from a loopback `http` issuer had the same gap at run time. Both
+  checks, the redirect check and the startup warnings now decide on the parsed
+  URL. This narrows accepted input: only plain-`http` non-loopback URLs
+  spelled that way, without the opt-in, are newly refused. It ships under the
+  security-fix exception.
+- A URL setting spelled in a form the parser has to repair (`https:/host`,
+  `https:host`, `https:///host`, a `\` in the host part) is still accepted,
+  and is now logged as a startup `warn` naming the setting and its canonical
+  form. Such an
+  `issuer` can never match a token's `iss`, and a `resource`'s challenge and
+  metadata URLs are built from the raw text. The discovery and
+  `resource_metadata` URLs built from such a value now stay on the host the
+  parser reads in it: before, `https:///host/app` made the RFC 8414 discovery
+  URL, and the `resource_metadata` URL, point at the host `.well-known`.
 
 ### Changed
 

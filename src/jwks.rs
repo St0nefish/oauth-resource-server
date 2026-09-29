@@ -28,7 +28,7 @@ use tracing::{debug, info, warn};
 use crate::algorithms::{Algorithm, key_algorithms, signing_algorithm};
 use crate::config::{KeyNamingBuf, ResolvedOAuthConfig};
 use crate::token::{TokenRejection, describe_kid, for_log};
-use crate::validator::plain_http_non_loopback;
+use crate::validator::{is_canonical_url, parsed_plain_http_non_loopback, plain_http_non_loopback};
 
 /// How long an unknown `kid` is allowed to trigger a JWKS refetch again.
 ///
@@ -310,7 +310,7 @@ fn judge_redirect(
     if next.scheme() != "https" && previous.iter().any(|u| u.scheme() == "https") {
         return Hop::Refuse("redirect from https to a non-https URL refused".to_string());
     }
-    let insecure = plain_http_non_loopback(next.as_str());
+    let insecure = parsed_plain_http_non_loopback(next);
     if insecure && !allow_insecure_http {
         return Hop::Refuse(format!(
             "redirect to plain http on a non-loopback host ({}) refused — set {opt_in_key} \
@@ -920,9 +920,25 @@ fn lookup(keys: &[CachedKey], kid: Option<&str>, alg: Algorithm) -> Option<Decod
 /// and Kanidm's), then RFC 8414 §3.1's form (the well-known segment inserted
 /// between host and path).
 pub(crate) fn discovery_urls(issuer: &str) -> Vec<String> {
+    const OIDC: &str = "/.well-known/openid-configuration";
+    if reqwest::Url::parse(issuer.trim()).is_err() {
+        // Reachable only from a hand-edited `ResolvedOAuthConfig` (`resolve`
+        // refuses it). Appending to, say, `https://` would parse with
+        // `.well-known` as its host; the bare path names no host, and its
+        // fetch fails closed as a relative URL.
+        return vec![OIDC.to_string()];
+    }
     let trimmed = issuer.trim_end_matches('/');
-    let mut urls = vec![format!("{trimmed}/.well-known/openid-configuration")];
-    if let Some((scheme, rest)) = trimmed.split_once("://") {
+    let mut urls = vec![format!("{trimmed}{OIDC}")];
+    // The RFC 8414 form takes the raw issuer apart on `://`, which only means
+    // what the parser means for a canonically spelled URL: `https:///host/app`
+    // would put `.well-known` where the host goes and send the fetch to a host
+    // nobody configured. A non-canonical issuer (warned about at startup) never
+    // matches a token's `iss` anyway, so it gets the OIDC form only, which the
+    // parser keeps on the issuer's own host.
+    if is_canonical_url(issuer)
+        && let Some((scheme, rest)) = trimmed.split_once("://")
+    {
         let (authority, path) = match rest.find('/') {
             Some(i) => (&rest[..i], &rest[i..]),
             None => (rest, ""),
@@ -971,14 +987,19 @@ fn jwks_uri_from_metadata(
         .get("jwks_uri")
         .and_then(Value::as_str)
         .ok_or_else(|| "metadata has no jwks_uri".to_string())?;
-    let parsed =
-        reqwest::Url::parse(uri).map_err(|e| context("jwks_uri is not an absolute URL", &e))?;
+    // Both are judged as parsed — as reqwest will fetch them — never by their
+    // raw prefix: `http:/host`, `HTTP:\\host` and ` http://host` all go to
+    // `http://host/`.
+    let parsed = reqwest::Url::parse(uri.trim())
+        .map_err(|e| context("jwks_uri is not an absolute URL", &e))?;
+    let issuer_is_http =
+        reqwest::Url::parse(issuer.trim()).is_ok_and(|issuer| issuer.scheme() == "http");
     match parsed.scheme() {
         "https" => {}
         // Plain http only when the issuer itself is plain http (a loopback test
         // setup); an https issuer must never hand us keys over http.
-        "http" if issuer.starts_with("http://") => {
-            if !allow_insecure_http && plain_http_non_loopback(uri) {
+        "http" if issuer_is_http => {
+            if !allow_insecure_http && parsed_plain_http_non_loopback(&parsed) {
                 return Err(format!(
                     "jwks_uri {:?} uses plain http on a non-loopback host — refused \
                      (RFC 8414 §2) unless {opt_in_key} is set",
@@ -1065,6 +1086,43 @@ mod tests {
             "http://idp.internal.test/jwks"
         );
         // A loopback http jwks_uri never needs the opt-in.
+        let doc = serde_json::json!({"issuer": issuer, "jwks_uri": "http://127.0.0.1:9000/jwks"});
+        assert!(jwks_uri_from_metadata(&doc, issuer, key, false, OPT_IN).is_ok());
+    }
+
+    #[test]
+    fn a_non_canonical_cleartext_jwks_uri_is_judged_by_where_it_really_goes() {
+        let key = "mcp.oauth.issuer";
+        let issuer = "http://localhost:9000/app/";
+        // Each is fetched by reqwest as http://idp.internal.test/jwks.
+        for uri in [
+            "http:/idp.internal.test/jwks",
+            "http:idp.internal.test/jwks",
+            "HTTP:\\\\idp.internal.test\\jwks",
+            " http://idp.internal.test/jwks",
+        ] {
+            let doc = serde_json::json!({"issuer": issuer, "jwks_uri": uri});
+            let err = jwks_uri_from_metadata(&doc, issuer, key, false, OPT_IN)
+                .expect_err(&format!("{uri:?} must be refused"));
+            assert!(
+                err.contains("plain http on a non-loopback host"),
+                "{uri:?}: {err}"
+            );
+        }
+        // An https issuer never accepts one either, however it is spelled.
+        let issuer = "https://auth.example.com";
+        for uri in [
+            "http:/idp.internal.test/jwks",
+            "HTTP:idp.internal.test/jwks",
+        ] {
+            let doc = serde_json::json!({"issuer": issuer, "jwks_uri": uri});
+            assert!(
+                jwks_uri_from_metadata(&doc, issuer, key, true, OPT_IN).is_err(),
+                "{uri:?}"
+            );
+        }
+        // An upper-case loopback http issuer may discover a loopback http one.
+        let issuer = "HTTP://localhost:9000/app/";
         let doc = serde_json::json!({"issuer": issuer, "jwks_uri": "http://127.0.0.1:9000/jwks"});
         assert!(jwks_uri_from_metadata(&doc, issuer, key, false, OPT_IN).is_ok());
     }
