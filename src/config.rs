@@ -115,6 +115,155 @@ impl KeyNamingBuf {
     }
 }
 
+/// What kind of problem a [`ConfigProblem`] is, so a caller can react to it —
+/// or write its own sentence for it — without matching the crate's prose.
+///
+/// `#[non_exhaustive]`: a new kind is an additive change, so match with a
+/// wildcard arm. Every problem [`OAuthConfig::resolve`] and the
+/// [`env`](crate::env) loader find has a specific kind; [`Other`](Self::Other)
+/// is what a problem built from a plain `String` (an application loader's own)
+/// gets.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[non_exhaustive]
+pub enum ProblemKind {
+    /// A required setting is empty: `issuer`, `resource`, or both `audience`
+    /// and `audiences`.
+    MissingRequired,
+    /// A URL setting (`issuer`, `resource`, `jwks_uri`) failed a `check_url`
+    /// check: not an absolute `http(s)` URL, a query or fragment in an
+    /// identifier (`issuer`, `resource`), leading or trailing whitespace, or a
+    /// control or non-ASCII character.
+    InvalidUrl,
+    /// A plain-`http` URL on a non-loopback host without
+    /// `allow_insecure_http`.
+    InsecureHttp,
+    /// `required_scope`, or an entry of `required_scopes`, is blank.
+    BlankRequiredScope,
+    /// `required_scope`, or an entry of `required_scopes`, holds more than one
+    /// scope (whitespace inside it).
+    MultiWordScope,
+    /// A required or advertised scope is not an RFC 6749 §3.3 scope-token.
+    InvalidScopeToken,
+    /// A list setting (`audiences`, `scopes_supported`, `principal_claims`) has
+    /// a blank entry.
+    EmptyListEntry,
+    /// No required scope is configured, `require_at_jwt` is off and
+    /// `allow_unscoped_tokens` is not set.
+    NoRequiredScope,
+    /// `scope_claims` is empty or has a blank entry.
+    EmptyScopeClaims,
+    /// `algorithms` has an entry that is unknown or refused (HMAC, `none`).
+    BadAlgorithm,
+    /// `algorithms` is empty.
+    NoAlgorithms,
+    /// `leeway_secs` is over [`MAX_LEEWAY_SECS`].
+    LeewayTooLarge,
+    /// The env loader could not read a variable or its `_FILE` (both set, an
+    /// unreadable or empty file).
+    EnvLoad,
+    /// The env loader read a value it could not parse (a bool other than
+    /// `"true"`/`"false"`, a non-integer `leeway_secs`).
+    EnvParse,
+    /// Anything else, including every problem converted from a `String`.
+    Other,
+}
+
+impl ProblemKind {
+    /// A stable, lowercase `snake_case` label for the kind (`"missing_required"`,
+    /// `"invalid_url"`, ...), for logs and metrics. Unlike a problem's message,
+    /// it does not change between releases for an existing kind.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::MissingRequired => "missing_required",
+            Self::InvalidUrl => "invalid_url",
+            Self::InsecureHttp => "insecure_http",
+            Self::BlankRequiredScope => "blank_required_scope",
+            Self::MultiWordScope => "multi_word_scope",
+            Self::InvalidScopeToken => "invalid_scope_token",
+            Self::EmptyListEntry => "empty_list_entry",
+            Self::NoRequiredScope => "no_required_scope",
+            Self::EmptyScopeClaims => "empty_scope_claims",
+            Self::BadAlgorithm => "bad_algorithm",
+            Self::NoAlgorithms => "no_algorithms",
+            Self::LeewayTooLarge => "leeway_too_large",
+            Self::EnvLoad => "env_load",
+            Self::EnvParse => "env_parse",
+            Self::Other => "other",
+        }
+    }
+}
+
+impl fmt::Display for ProblemKind {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
+/// One configuration problem: its [`ProblemKind`], the settings it names, and
+/// the human-readable sentence.
+///
+/// [`kind`](Self::kind) and [`keys`](Self::keys) are what a caller matches on;
+/// [`message`](Self::message) (also its `Display`) is for people, and its
+/// wording may change in any release. `#[non_exhaustive]`.
+///
+/// An application loader mixes its own problems in with
+/// `ConfigProblem::from(String)` (kind [`ProblemKind::Other`]) or
+/// [`ConfigProblem::new`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+#[non_exhaustive]
+pub struct ConfigProblem {
+    kind: ProblemKind,
+    keys: Vec<String>,
+    message: String,
+}
+
+impl ConfigProblem {
+    /// A problem of `kind` naming `keys` (already spelled the way the error's
+    /// [`KeyNaming`] spells them), described by `message`.
+    pub fn new(
+        kind: ProblemKind,
+        keys: impl IntoIterator<Item = impl Into<String>>,
+        message: impl Into<String>,
+    ) -> Self {
+        Self {
+            kind,
+            keys: keys.into_iter().map(Into::into).collect(),
+            message: message.into(),
+        }
+    }
+
+    /// What kind of problem this is.
+    pub fn kind(&self) -> ProblemKind {
+        self.kind
+    }
+
+    /// The settings this problem names, rendered via [`KeyNaming`] (a dotted
+    /// key or an environment variable). Empty for a problem converted from a
+    /// `String`.
+    pub fn keys(&self) -> &[String] {
+        &self.keys
+    }
+
+    /// The human-readable sentence. Not a stable API: match on
+    /// [`kind`](Self::kind) instead.
+    pub fn message(&self) -> &str {
+        &self.message
+    }
+}
+
+impl From<String> for ConfigProblem {
+    /// A problem of kind [`ProblemKind::Other`] with no keys.
+    fn from(message: String) -> Self {
+        Self::new(ProblemKind::Other, Vec::<String>::new(), message)
+    }
+}
+
+impl fmt::Display for ConfigProblem {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(&self.message)
+    }
+}
+
 /// An enabled config that cannot be used, with every problem found.
 ///
 /// `Display` renders all of them under one header naming the block the way
@@ -126,29 +275,102 @@ impl KeyNamingBuf {
 ///   - <problem>
 /// Fix these, or set mcp.oauth.enabled: false.
 /// ```
-#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+///
+/// Each problem is available two ways.
+/// [`problem_details`](Self::problem_details) is the structured list
+/// ([`ConfigProblem`]: a [`ProblemKind`], the settings named, the message); the
+/// public [`problems`](Self::problems) field holds the same messages as plain
+/// strings, kept for compatibility. Prefer matching on [`ProblemKind`] to
+/// matching text: message wording is not a stable API.
+#[derive(Debug, Clone, thiserror::Error)]
 pub struct ConfigError {
     /// One human-readable sentence per problem, each naming its setting.
+    ///
+    /// Kept for compatibility; the structured form is
+    /// [`problem_details`](Self::problem_details). Both are filled from one
+    /// list at construction, in the same order. Editing this field in place
+    /// does not update `problem_details()`; `Display` renders this field.
     pub problems: Vec<String>,
+    details: Vec<ConfigProblem>,
     naming: KeyNamingBuf,
 }
 
 impl ConfigError {
     /// An error listing `problems`, whose header names settings per `naming`.
     /// For loaders that add their own problems (parse errors, say) alongside the
-    /// ones [`OAuthConfig::resolve`] finds.
+    /// ones [`OAuthConfig::resolve`] finds. Each string becomes a
+    /// [`ProblemKind::Other`] problem in
+    /// [`problem_details`](Self::problem_details); use
+    /// [`from_problems`](Self::from_problems) to give them kinds.
     ///
     /// `problems` must not be empty: an error with nothing to fix would display
     /// as a header over one blank bullet. Debug builds assert it.
     pub fn new(naming: KeyNaming<'_>, problems: Vec<String>) -> Self {
-        debug_assert!(
-            !problems.is_empty(),
-            "ConfigError::new called with no problems"
-        );
+        let details = problems.iter().cloned().map(ConfigProblem::from).collect();
+        Self::assemble(naming, problems, details)
+    }
+
+    /// An error listing structured `problems`, whose header names settings per
+    /// `naming`. [`problems`](Self::problems) is rendered from their messages,
+    /// so the two views agree. A `String` converts with `.into()` (kind
+    /// [`ProblemKind::Other`]), so an application loader can mix its own
+    /// problems in with the crate's.
+    ///
+    /// `problems` must not be empty; debug builds assert it.
+    pub fn from_problems(
+        naming: KeyNaming<'_>,
+        problems: impl IntoIterator<Item = ConfigProblem>,
+    ) -> Self {
+        let details: Vec<ConfigProblem> = problems.into_iter().collect();
+        let text = details.iter().map(|p| p.message.clone()).collect();
+        Self::assemble(naming, text, details)
+    }
+
+    /// `problems` and `details` are the same length, element for element.
+    fn assemble(naming: KeyNaming<'_>, problems: Vec<String>, details: Vec<ConfigProblem>) -> Self {
+        debug_assert!(!problems.is_empty(), "ConfigError built with no problems");
+        debug_assert_eq!(problems.len(), details.len());
         Self {
             problems,
+            details,
             naming: naming.to_buf(),
         }
+    }
+
+    /// The structured problems, in the order [`problems`](Self::problems) lists
+    /// them. Match on [`ProblemKind`] rather than on message text:
+    ///
+    /// ```
+    /// use oauth_resource_server::{KeyNaming, OAuthConfig, ProblemKind};
+    ///
+    /// let err = OAuthConfig {
+    ///     enabled: true,
+    ///     leeway_secs: 3600,
+    ///     ..OAuthConfig::default()
+    /// }
+    /// .resolve(KeyNaming::Env("MYAPP_OAUTH_"))
+    /// .unwrap_err();
+    ///
+    /// for problem in err.problem_details() {
+    ///     match problem.kind() {
+    ///         ProblemKind::MissingRequired => {
+    ///             assert!(problem.keys().contains(&"MYAPP_OAUTH_ISSUER".to_string()));
+    ///         }
+    ///         ProblemKind::LeewayTooLarge => {
+    ///             assert_eq!(problem.keys(), ["MYAPP_OAUTH_LEEWAY_SECS"]);
+    ///         }
+    ///         // `ProblemKind` is `#[non_exhaustive]`: keep a wildcard arm.
+    ///         _ => {}
+    ///     }
+    /// }
+    /// ```
+    ///
+    /// An error built with [`ConfigError::new`] reports every problem as
+    /// [`ProblemKind::Other`]. The list is fixed at construction: editing the
+    /// public `problems` field in place does not change it (that field is kept
+    /// for compatibility).
+    pub fn problem_details(&self) -> &[ConfigProblem] {
+        &self.details
     }
 
     /// How this error names settings.
@@ -156,6 +378,17 @@ impl ConfigError {
         self.naming.as_naming()
     }
 }
+
+/// Equality is over [`problems`](ConfigError::problems) and the naming only,
+/// as before structured details existed: an error rebuilt with
+/// [`ConfigError::new`] from another's `problems` compares equal to it.
+impl PartialEq for ConfigError {
+    fn eq(&self, other: &Self) -> bool {
+        self.problems == other.problems && self.naming == other.naming
+    }
+}
+
+impl Eq for ConfigError {}
 
 impl fmt::Display for ConfigError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
@@ -544,26 +777,45 @@ impl OAuthConfig {
             return Ok(None);
         }
         let key = |field: &str| naming.key(field);
-        let mut problems: Vec<String> = Vec::new();
+        let mut problems: Vec<ConfigProblem> = Vec::new();
 
-        let mut blank = Vec::new();
+        let mut blank_fields: Vec<&str> = Vec::new();
         for (name, value) in [("issuer", &self.issuer), ("resource", &self.resource)] {
             if value.trim().is_empty() {
-                blank.push(key(name));
+                blank_fields.push(name);
             }
         }
         if self.audience.trim().is_empty() && self.audiences.is_empty() {
-            blank.push(format!("{} (or {})", key("audience"), key("audiences")));
+            blank_fields.push("audience");
         }
-        if !blank.is_empty() {
-            problems.push(format!(
-                "these required settings are empty: {}. Set issuer to the authorization \
-                 server's issuer (byte-exact, including any trailing slash), resource to \
-                 this server's public URL, and audience to what that server puts in \
-                 an access token's `aud` — the resource URL if it honours RFC 8707 or \
-                 lets you configure an audience (e.g. Authelia), or the OAuth client_id \
-                 if it stamps that (e.g. Authentik, Kanidm)",
-                blank.join(", ")
+        if !blank_fields.is_empty() {
+            // `audience` and `audiences` are one requirement: named together.
+            let blank: Vec<String> = blank_fields
+                .iter()
+                .map(|&f| match f {
+                    "audience" => format!("{} (or {})", key("audience"), key("audiences")),
+                    _ => key(f),
+                })
+                .collect();
+            let blank_keys: Vec<String> = blank_fields
+                .iter()
+                .flat_map(|&f| match f {
+                    "audience" => vec![key("audience"), key("audiences")],
+                    _ => vec![key(f)],
+                })
+                .collect();
+            problems.push(ConfigProblem::new(
+                ProblemKind::MissingRequired,
+                blank_keys,
+                format!(
+                    "these required settings are empty: {}. Set issuer to the authorization \
+                     server's issuer (byte-exact, including any trailing slash), resource to \
+                     this server's public URL, and audience to what that server puts in \
+                     an access token's `aud` — the resource URL if it honours RFC 8707 or \
+                     lets you configure an audience (e.g. Authelia), or the OAuth client_id \
+                     if it stamps that (e.g. Authentik, Kanidm)",
+                    blank.join(", ")
+                ),
             ));
         }
 
@@ -577,82 +829,112 @@ impl OAuthConfig {
                 continue;
             };
             match check_url(&key(name), value, identifier) {
-                Err(e) => problems.push(e),
+                Err(e) => {
+                    problems.push(ConfigProblem::new(ProblemKind::InvalidUrl, [key(name)], e));
+                }
                 Ok(()) if !self.allow_insecure_http && plain_http_non_loopback(value) => {
-                    problems.push(format!(
-                        "{} {value:?} uses plain http on a non-loopback host — {}. Use https, \
-                         or set {} if this address is on a network you trust",
-                        key(name),
-                        if name == "resource" {
-                            "bearer tokens sent to it can be read in transit (RFC 9728 §1.2 \
-                             requires https)"
-                        } else {
-                            "signing keys fetched over it can be substituted by anyone on the \
-                             path (RFC 8414 §2 requires https)"
-                        },
-                        key("allow_insecure_http")
+                    problems.push(ConfigProblem::new(
+                        ProblemKind::InsecureHttp,
+                        [key(name), key("allow_insecure_http")],
+                        format!(
+                            "{} {value:?} uses plain http on a non-loopback host — {}. Use \
+                             https, or set {} if this address is on a network you trust",
+                            key(name),
+                            if name == "resource" {
+                                "bearer tokens sent to it can be read in transit (RFC 9728 \
+                                 §1.2 requires https)"
+                            } else {
+                                "signing keys fetched over it can be substituted by anyone on \
+                                 the path (RFC 8414 §2 requires https)"
+                            },
+                            key("allow_insecure_http")
+                        ),
                     ));
                 }
                 Ok(()) => {}
             }
         }
         if self.audiences.iter().any(|a| a.trim().is_empty()) {
-            problems.push(format!("{} contains an empty entry", key("audiences")));
+            problems.push(ConfigProblem::new(
+                ProblemKind::EmptyListEntry,
+                [key("audiences")],
+                format!("{} contains an empty entry", key("audiences")),
+            ));
         }
 
         if let Some(required_scope) = &self.required_scope {
+            let k = key("required_scope");
             if required_scope.trim().is_empty() {
-                problems.push(format!(
-                    "{} must not be empty — a blank required scope would let any signed \
-                     token through unscoped. Use a scope your authorization server \
-                     actually issues",
-                    key("required_scope")
+                problems.push(ConfigProblem::new(
+                    ProblemKind::BlankRequiredScope,
+                    [k.clone()],
+                    format!(
+                        "{k} must not be empty — a blank required scope would let any signed \
+                         token through unscoped. Use a scope your authorization server \
+                         actually issues"
+                    ),
                 ));
             } else if required_scope.split_whitespace().count() != 1 {
-                problems.push(format!(
-                    "{} {:?} must be a single scope (no spaces) — scopes are matched one \
-                     token at a time",
-                    key("required_scope"),
-                    required_scope
+                problems.push(ConfigProblem::new(
+                    ProblemKind::MultiWordScope,
+                    [k.clone()],
+                    format!(
+                        "{k} {required_scope:?} must be a single scope (no spaces) — scopes \
+                         are matched one token at a time"
+                    ),
                 ));
             } else if !is_scope_token(required_scope.trim()) {
-                problems.push(scope_token_problem(&key("required_scope"), required_scope));
+                problems.push(ConfigProblem::new(
+                    ProblemKind::InvalidScopeToken,
+                    [k.clone()],
+                    scope_token_problem(&k, required_scope),
+                ));
             }
         }
         for scope in &self.required_scopes {
+            let k = key("required_scopes");
             if scope.trim().is_empty() {
-                problems.push(format!(
-                    "{} contains an empty entry — a blank required scope would let a \
-                     token through without it. Remove the entry or name a scope your \
-                     authorization server actually issues",
-                    key("required_scopes")
+                problems.push(ConfigProblem::new(
+                    ProblemKind::BlankRequiredScope,
+                    [k.clone()],
+                    format!(
+                        "{k} contains an empty entry — a blank required scope would let a \
+                         token through without it. Remove the entry or name a scope your \
+                         authorization server actually issues"
+                    ),
                 ));
             } else if scope.split_whitespace().count() != 1 {
-                problems.push(format!(
-                    "{} entry {:?} must be a single scope (no spaces) — scopes are matched \
-                     one token at a time; list each one as its own entry",
-                    key("required_scopes"),
-                    scope
+                problems.push(ConfigProblem::new(
+                    ProblemKind::MultiWordScope,
+                    [k.clone()],
+                    format!(
+                        "{k} entry {scope:?} must be a single scope (no spaces) — scopes are \
+                         matched one token at a time; list each one as its own entry"
+                    ),
                 ));
             } else if !is_scope_token(scope.trim()) {
-                problems.push(scope_token_problem(
-                    &format!("{} entry", key("required_scopes")),
-                    scope,
+                problems.push(ConfigProblem::new(
+                    ProblemKind::InvalidScopeToken,
+                    [k.clone()],
+                    scope_token_problem(&format!("{k} entry"), scope),
                 ));
             }
         }
         if let Some(supported) = &self.scopes_supported {
+            let k = key("scopes_supported");
             if supported.iter().any(|s| s.trim().is_empty()) {
-                problems.push(format!(
-                    "{} contains an empty entry",
-                    key("scopes_supported")
+                problems.push(ConfigProblem::new(
+                    ProblemKind::EmptyListEntry,
+                    [k.clone()],
+                    format!("{k} contains an empty entry"),
                 ));
             }
             for scope in supported.iter().filter(|s| !s.trim().is_empty()) {
                 if !is_scope_token(scope.trim()) {
-                    problems.push(scope_token_problem(
-                        &format!("{} entry", key("scopes_supported")),
-                        scope,
+                    problems.push(ConfigProblem::new(
+                        ProblemKind::InvalidScopeToken,
+                        [k.clone()],
+                        scope_token_problem(&format!("{k} entry"), scope),
                     ));
                 }
             }
@@ -662,31 +944,45 @@ impl OAuthConfig {
             && !self.require_at_jwt
             && !self.allow_unscoped_tokens
         {
-            problems.push(format!(
-                "no required scope is configured ({} and {} are unset) and {} is off — \
-                 nothing would tell an access token from an OIDC ID token minted for the \
-                 same client, so any token this issuer signs for the audience would be \
-                 accepted. Set {} to a scope only access tokens carry, turn on {} if the \
-                 authorization server emits typ at+jwt, or set {} to accept that",
-                key("required_scope"),
-                key("required_scopes"),
-                key("require_at_jwt"),
-                key("required_scope"),
-                key("require_at_jwt"),
-                key("allow_unscoped_tokens")
+            problems.push(ConfigProblem::new(
+                ProblemKind::NoRequiredScope,
+                [
+                    key("required_scope"),
+                    key("required_scopes"),
+                    key("require_at_jwt"),
+                    key("allow_unscoped_tokens"),
+                ],
+                format!(
+                    "no required scope is configured ({} and {} are unset) and {} is off — \
+                     nothing would tell an access token from an OIDC ID token minted for the \
+                     same client, so any token this issuer signs for the audience would be \
+                     accepted. Set {} to a scope only access tokens carry, turn on {} if the \
+                     authorization server emits typ at+jwt, or set {} to accept that",
+                    key("required_scope"),
+                    key("required_scopes"),
+                    key("require_at_jwt"),
+                    key("required_scope"),
+                    key("require_at_jwt"),
+                    key("allow_unscoped_tokens")
+                ),
             ));
         }
         if self.scope_claims.is_empty() || self.scope_claims.iter().any(|c| c.trim().is_empty()) {
-            problems.push(format!(
-                "{} must list at least one non-empty claim name (default: [\"scope\", \
-                 \"scp\"])",
-                key("scope_claims")
+            problems.push(ConfigProblem::new(
+                ProblemKind::EmptyScopeClaims,
+                [key("scope_claims")],
+                format!(
+                    "{} must list at least one non-empty claim name (default: [\"scope\", \
+                     \"scp\"])",
+                    key("scope_claims")
+                ),
             ));
         }
         if self.principal_claims.iter().any(|c| c.trim().is_empty()) {
-            problems.push(format!(
-                "{} contains an empty entry",
-                key("principal_claims")
+            problems.push(ConfigProblem::new(
+                ProblemKind::EmptyListEntry,
+                [key("principal_claims")],
+                format!("{} contains an empty entry", key("principal_claims")),
             ));
         }
 
@@ -700,30 +996,39 @@ impl OAuthConfig {
             }
         }
         if !bad_algorithms.is_empty() {
-            problems.push(format!(
-                "{} has unacceptable entries: {}",
-                key("algorithms"),
-                bad_algorithms.join("; ")
+            problems.push(ConfigProblem::new(
+                ProblemKind::BadAlgorithm,
+                [key("algorithms")],
+                format!(
+                    "{} has unacceptable entries: {}",
+                    key("algorithms"),
+                    bad_algorithms.join("; ")
+                ),
             ));
         } else if algorithms.is_empty() {
-            problems.push(format!(
-                "{} must list at least one algorithm",
-                key("algorithms")
+            problems.push(ConfigProblem::new(
+                ProblemKind::NoAlgorithms,
+                [key("algorithms")],
+                format!("{} must list at least one algorithm", key("algorithms")),
             ));
         }
 
         if self.leeway_secs > MAX_LEEWAY_SECS {
-            problems.push(format!(
-                "{} {} is over the {}-second cap — leeway is for clock drift, not for \
-                 extending token lifetimes",
-                key("leeway_secs"),
-                self.leeway_secs,
-                MAX_LEEWAY_SECS
+            problems.push(ConfigProblem::new(
+                ProblemKind::LeewayTooLarge,
+                [key("leeway_secs")],
+                format!(
+                    "{} {} is over the {}-second cap — leeway is for clock drift, not for \
+                     extending token lifetimes",
+                    key("leeway_secs"),
+                    self.leeway_secs,
+                    MAX_LEEWAY_SECS
+                ),
             ));
         }
 
         if !problems.is_empty() {
-            return Err(ConfigError::new(naming, problems));
+            return Err(ConfigError::from_problems(naming, problems));
         }
 
         // `required_scope` first, then `required_scopes` in order, trimmed and
@@ -1617,5 +1922,316 @@ resource: \"https://kb.example.test/mcp\"
                 .any(|p| p.contains("set APP_OAUTH_ALLOW_UNSCOPED_TOKENS")),
             "{err}"
         );
+    }
+
+    // ── structured problems ──────────────────────────────────────────────────
+
+    /// A field's name spelled by hand for `naming`, independent of
+    /// `KeyNaming::key`, so a wrong key in a problem cannot cancel out.
+    fn spelled(naming: KeyNaming<'_>, field: &str) -> String {
+        match naming {
+            KeyNaming::Dotted(p) => format!("{p}.{field}"),
+            KeyNaming::Env(p) => format!("{p}{}", field.to_uppercase()),
+        }
+    }
+
+    type Edit = fn(&mut OAuthConfig);
+
+    /// One config per kind `resolve` can produce, with the fields the problem
+    /// must name.
+    fn one_problem_per_kind() -> Vec<(ProblemKind, Edit, &'static [&'static str])> {
+        vec![
+            (
+                ProblemKind::MissingRequired,
+                |c| c.issuer.clear(),
+                &["issuer"],
+            ),
+            (
+                ProblemKind::MissingRequired,
+                |c| {
+                    c.audience.clear();
+                    c.audiences.clear();
+                },
+                &["audience", "audiences"],
+            ),
+            (
+                ProblemKind::InvalidUrl,
+                |c| c.jwks_uri = Some("not a url".into()),
+                &["jwks_uri"],
+            ),
+            (
+                ProblemKind::InsecureHttp,
+                |c| c.resource = "http://kb.example.test/mcp".into(),
+                &["resource", "allow_insecure_http"],
+            ),
+            (
+                ProblemKind::BlankRequiredScope,
+                |c| c.required_scope = Some(" ".into()),
+                &["required_scope"],
+            ),
+            (
+                ProblemKind::BlankRequiredScope,
+                |c| c.required_scopes = vec!["".into()],
+                &["required_scopes"],
+            ),
+            (
+                ProblemKind::MultiWordScope,
+                |c| c.required_scope = Some("a b".into()),
+                &["required_scope"],
+            ),
+            (
+                ProblemKind::MultiWordScope,
+                |c| c.required_scopes = vec!["a b".into()],
+                &["required_scopes"],
+            ),
+            (
+                ProblemKind::InvalidScopeToken,
+                |c| c.required_scope = Some("a\"b".into()),
+                &["required_scope"],
+            ),
+            (
+                ProblemKind::InvalidScopeToken,
+                |c| c.required_scopes = vec!["a\\b".into()],
+                &["required_scopes"],
+            ),
+            (
+                ProblemKind::InvalidScopeToken,
+                |c| c.scopes_supported = Some(vec!["a\"b".into()]),
+                &["scopes_supported"],
+            ),
+            (
+                ProblemKind::EmptyListEntry,
+                |c| c.audiences = vec!["".into()],
+                &["audiences"],
+            ),
+            (
+                ProblemKind::EmptyListEntry,
+                |c| c.scopes_supported = Some(vec!["".into()]),
+                &["scopes_supported"],
+            ),
+            (
+                ProblemKind::EmptyListEntry,
+                |c| c.principal_claims = vec!["".into()],
+                &["principal_claims"],
+            ),
+            (
+                ProblemKind::NoRequiredScope,
+                |c| c.allow_unscoped_tokens = false,
+                &[
+                    "required_scope",
+                    "required_scopes",
+                    "require_at_jwt",
+                    "allow_unscoped_tokens",
+                ],
+            ),
+            (
+                ProblemKind::EmptyScopeClaims,
+                |c| c.scope_claims.clear(),
+                &["scope_claims"],
+            ),
+            (
+                ProblemKind::BadAlgorithm,
+                |c| c.algorithms = vec!["HS256".into()],
+                &["algorithms"],
+            ),
+            (
+                ProblemKind::NoAlgorithms,
+                |c| c.algorithms.clear(),
+                &["algorithms"],
+            ),
+            (
+                ProblemKind::LeewayTooLarge,
+                |c| c.leeway_secs = MAX_LEEWAY_SECS + 1,
+                &["leeway_secs"],
+            ),
+        ]
+    }
+
+    #[test]
+    fn every_kind_resolve_can_produce_is_produced_and_names_its_settings() {
+        let mut seen = std::collections::HashSet::new();
+        for naming in [WIKI, KeyNaming::Env("APP_OAUTH_")] {
+            for (kind, edit, fields) in one_problem_per_kind() {
+                let err = enabled(edit).resolve(naming).unwrap_err();
+                let details = err.problem_details();
+                assert_eq!(details.len(), 1, "{kind:?}: {err}");
+                let p = &details[0];
+                assert_eq!(p.kind(), kind, "{err}");
+                let want: Vec<String> = fields.iter().map(|f| spelled(naming, f)).collect();
+                assert_eq!(p.keys(), want.as_slice(), "{kind:?} under {naming:?}");
+                assert_eq!(p.message(), err.problems[0]);
+                assert_eq!(p.to_string(), p.message());
+                seen.insert(kind);
+            }
+        }
+        // Every kind but the env loader's two and the catch-all is covered.
+        for kind in [
+            ProblemKind::MissingRequired,
+            ProblemKind::InvalidUrl,
+            ProblemKind::InsecureHttp,
+            ProblemKind::BlankRequiredScope,
+            ProblemKind::MultiWordScope,
+            ProblemKind::InvalidScopeToken,
+            ProblemKind::EmptyListEntry,
+            ProblemKind::NoRequiredScope,
+            ProblemKind::EmptyScopeClaims,
+            ProblemKind::BadAlgorithm,
+            ProblemKind::NoAlgorithms,
+            ProblemKind::LeewayTooLarge,
+        ] {
+            assert!(seen.contains(&kind), "{kind:?} is never produced");
+        }
+        // Exhaustive over today's kinds: a new one must be classified here.
+        for kind in seen {
+            match kind {
+                ProblemKind::EnvLoad | ProblemKind::EnvParse | ProblemKind::Other => {
+                    panic!("resolve produced {kind:?}")
+                }
+                _ => {}
+            }
+        }
+    }
+
+    #[test]
+    fn a_missing_required_problem_names_every_blank_setting() {
+        let err = enabled(|c| {
+            c.issuer.clear();
+            c.resource.clear();
+            c.audience.clear();
+        })
+        .resolve(KeyNaming::Env("APP_OAUTH_"))
+        .unwrap_err();
+        assert_eq!(
+            err.problem_details()[0].keys(),
+            [
+                "APP_OAUTH_ISSUER",
+                "APP_OAUTH_RESOURCE",
+                "APP_OAUTH_AUDIENCE",
+                "APP_OAUTH_AUDIENCES"
+            ]
+        );
+    }
+
+    #[test]
+    fn problems_and_problem_details_agree_across_a_multi_problem_config() {
+        let cfg = OAuthConfig {
+            enabled: true,
+            leeway_secs: MAX_LEEWAY_SECS + 1,
+            required_scope: Some("a b".into()),
+            algorithms: vec!["none".into()],
+            principal_claims: vec![" ".into()],
+            ..OAuthConfig::default()
+        };
+        for naming in [WIKI, KeyNaming::Env("APP_OAUTH_")] {
+            let err = cfg.clone().resolve(naming).unwrap_err();
+            let details = err.problem_details();
+            assert_eq!(details.len(), 5, "{err}");
+            let texts: Vec<&str> = details.iter().map(ConfigProblem::message).collect();
+            assert_eq!(texts, err.problems);
+            let kinds: Vec<ProblemKind> = details.iter().map(ConfigProblem::kind).collect();
+            assert_eq!(
+                kinds,
+                [
+                    ProblemKind::MissingRequired,
+                    ProblemKind::MultiWordScope,
+                    ProblemKind::EmptyListEntry,
+                    ProblemKind::BadAlgorithm,
+                    ProblemKind::LeewayTooLarge,
+                ]
+            );
+        }
+    }
+
+    #[test]
+    fn config_error_new_is_unchanged_and_wraps_strings_as_other() {
+        let err = ConfigError::new(WIKI, vec!["first".to_string(), "second".to_string()]);
+        assert_eq!(err.problems, ["first", "second"]);
+        let details = err.problem_details();
+        assert_eq!(details.len(), 2);
+        assert!(details.iter().all(|p| p.kind() == ProblemKind::Other));
+        assert!(details.iter().all(|p| p.keys().is_empty()));
+        assert_eq!(details[1].message(), "second");
+        assert_eq!(
+            err.to_string(),
+            "mcp.oauth.enabled is true but the OAuth config is not usable:\n  - first\n  - second\n\
+             Fix these, or set mcp.oauth.enabled: false."
+        );
+        // Inference through `collect()` keeps working (an existing caller's shape).
+        let collected = ConfigError::new(WIKI, ["a", "b"].iter().map(|s| s.to_string()).collect());
+        assert_eq!(collected.problems, ["a", "b"]);
+    }
+
+    #[test]
+    fn from_problems_and_from_string_mix_structured_and_plain_problems() {
+        let p = ConfigProblem::from("app problem".to_string());
+        assert_eq!(p.kind(), ProblemKind::Other);
+        assert!(p.keys().is_empty());
+        assert_eq!(p.message(), "app problem");
+        assert_eq!(p.to_string(), "app problem");
+
+        let own = ConfigProblem::new(ProblemKind::InvalidUrl, ["my.key"], "my.key is bad");
+        assert_eq!(own.keys(), ["my.key"]);
+        let err = ConfigError::from_problems(WIKI, [own.clone(), p.clone()]);
+        assert_eq!(err.problems, ["my.key is bad", "app problem"]);
+        assert_eq!(err.problem_details(), [own, p]);
+        assert!(
+            err.to_string()
+                .contains("\n  - my.key is bad\n  - app problem\n")
+        );
+        assert_eq!(err.naming(), WIKI);
+    }
+
+    #[test]
+    fn config_error_equality_ignores_the_structured_details() {
+        let err = enabled(|c| c.leeway_secs = MAX_LEEWAY_SECS + 1)
+            .resolve(WIKI)
+            .unwrap_err();
+        // 0.1.2 semantics: an error rebuilt from the strings is equal.
+        let rebuilt = ConfigError::new(WIKI, err.problems.clone());
+        assert_eq!(rebuilt, err);
+        assert_ne!(rebuilt.problem_details(), err.problem_details());
+        // Different problems or naming are not equal.
+        assert_ne!(ConfigError::new(WIKI, vec!["other".into()]), err);
+        assert_ne!(
+            ConfigError::new(KeyNaming::Env("APP_OAUTH_"), err.problems.clone()),
+            err
+        );
+    }
+
+    #[test]
+    fn editing_the_public_problems_field_does_not_touch_problem_details() {
+        let mut err = enabled(|c| c.leeway_secs = MAX_LEEWAY_SECS + 1)
+            .resolve(WIKI)
+            .unwrap_err();
+        let before = err.problem_details().to_vec();
+        err.problems.push("extra".into());
+        assert_eq!(err.problem_details(), before);
+    }
+
+    #[test]
+    fn problem_kind_labels_are_stable_and_distinct() {
+        let all = [
+            (ProblemKind::MissingRequired, "missing_required"),
+            (ProblemKind::InvalidUrl, "invalid_url"),
+            (ProblemKind::InsecureHttp, "insecure_http"),
+            (ProblemKind::BlankRequiredScope, "blank_required_scope"),
+            (ProblemKind::MultiWordScope, "multi_word_scope"),
+            (ProblemKind::InvalidScopeToken, "invalid_scope_token"),
+            (ProblemKind::EmptyListEntry, "empty_list_entry"),
+            (ProblemKind::NoRequiredScope, "no_required_scope"),
+            (ProblemKind::EmptyScopeClaims, "empty_scope_claims"),
+            (ProblemKind::BadAlgorithm, "bad_algorithm"),
+            (ProblemKind::NoAlgorithms, "no_algorithms"),
+            (ProblemKind::LeewayTooLarge, "leeway_too_large"),
+            (ProblemKind::EnvLoad, "env_load"),
+            (ProblemKind::EnvParse, "env_parse"),
+            (ProblemKind::Other, "other"),
+        ];
+        for (kind, label) in all {
+            assert_eq!(kind.as_str(), label);
+            assert_eq!(kind.to_string(), label);
+        }
+        let labels: std::collections::HashSet<_> = all.iter().map(|(_, l)| *l).collect();
+        assert_eq!(labels.len(), all.len());
     }
 }

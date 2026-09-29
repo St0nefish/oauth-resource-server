@@ -830,6 +830,33 @@ oauth.enabled is true but the OAuth config is not usable:
 Fix these, or set oauth.enabled: false.
 ```
 
+The same problems are available structured, so code can react to them without
+reading the sentences. `ConfigError::problem_details()` returns
+`ConfigProblem`s, each with a `kind()` (a `#[non_exhaustive]` `ProblemKind`,
+with a stable `as_str()` label), the `keys()` it names (already spelled through
+your `KeyNaming`) and its `message()`:
+
+```rust
+use oauth_resource_server::{KeyNaming, OAuthConfig, ProblemKind};
+
+let err = OAuthConfig { enabled: true, leeway_secs: 3600, ..OAuthConfig::default() }
+    .resolve(KeyNaming::Env("MYAPP_OAUTH_"))
+    .unwrap_err();
+for problem in err.problem_details() {
+    match problem.kind() {
+        ProblemKind::MissingRequired => eprintln!("set one of {:?}", problem.keys()),
+        ProblemKind::LeewayTooLarge => eprintln!("lower {}", problem.keys()[0]),
+        _ => eprintln!("{problem}"), // keep a wildcard arm: the enum grows
+    }
+}
+```
+
+`ConfigError::problems` (plain strings) stays for compatibility and is filled
+from the same list, in the same order. Editing that field in place does not
+update `problem_details()`. `ConfigError::from_problems` builds an error from
+`ConfigProblem`s, and `ConfigProblem::from(String)` (kind `Other`) lets your own
+loader mix its problems in; `ConfigError::new` still takes plain strings.
+
 `ResolvedOAuthConfig` has one setting you may want to set by hand that
 `OAuthConfig` does not: `resource_name`, a human-readable name published in the
 metadata document. Set it on the resolved value if you want one. (It also
@@ -906,7 +933,14 @@ ways:
   unset, but a `_FILE` whose contents are empty after trimming is an error.
   Setting both `VAR` and `VAR_FILE` is an error.
 - **Every problem is reported at once.** Load and parse problems are listed in
-  one `ConfigError` together with the problems `resolve` finds.
+  one `ConfigError` together with the problems `resolve` finds. Loader
+  problems have kind `ProblemKind::EnvLoad` (a variable or `_FILE` that could
+  not be read) or `ProblemKind::EnvParse` (a value that did not parse), and
+  `keys()` names the variables to look at (`VAR` and `VAR_FILE` when both were
+  set, `VAR_FILE` when its file could not be read or was empty, the variable
+  itself for a parse problem); `EnvOAuthConfig::problem_details()` lists them
+  before `resolve`. A `problems` entry you edit or add on the loaded value
+  reaches the `ConfigError` as `ProblemKind::Other`.
 
 To apply your own defaults before validation, call
 `unresolved_oauth_config_from_env`, change the returned `config`, then call
@@ -1664,7 +1698,11 @@ A new minor release is required for:
 change in any release, a patch included. The troubleshooting table above is
 for reading logs; do not string-match these messages in code. Match on the
 types instead (`TokenRejection`, `ValidatorError`, `AuthLayerError`, and so
-on).
+on) and, for configuration problems, on `ConfigProblem::kind()`
+(`ProblemKind`) and `keys()`, which are the durable alternative to matching
+the sentence. The `ProblemKind` a given problem carries is part of the
+contract (reclassifying one is a breaking change; adding a variant is not),
+while its message text is not.
 
 ## License
 
