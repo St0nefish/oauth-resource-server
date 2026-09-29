@@ -29,7 +29,8 @@
 //! Identical to the axum layer, because both run the same code: every
 //! configured [`CredentialSource`] contributes one candidate to
 //! [`crate::authenticate()`]; an accepted request gets the [`Credential`] (and,
-//! for an OAuth token, the [`AuthorizedToken`]) inserted into its extensions;
+//! for an OAuth token, the [`AuthorizedToken`]; for a static token, the
+//! [`StaticTokenMatch`] naming which one) inserted into its extensions;
 //! a refused one gets the status and `WWW-Authenticate` challenge
 //! [`crate::refusal()`] describes — the validator's challenge on every 401 and
 //! 403 when OAuth is configured, otherwise the
@@ -49,7 +50,8 @@
 //! [`HttpAuthLayerBuilder::build_with_decision`]). Every configured source
 //! header is marked sensitive (`http::HeaderValue::set_sensitive`) on the
 //! request before the callback and the inner service see it, and the layer's
-//! `Debug` prints the static token as `<redacted>`.
+//! `Debug` never prints a static token (the builder's single one shows as
+//! `<redacted>`, a [`StaticTokens`] set as its count and labels).
 //!
 //! # Logging
 //!
@@ -82,8 +84,11 @@ use http::header::{AUTHORIZATION, WWW_AUTHENTICATE};
 use http::request::Parts;
 use http::{HeaderMap, HeaderName, HeaderValue, Request, Response, StatusCode};
 use tracing::{debug, warn};
+use zeroize::Zeroizing;
 
-use crate::authenticate::{Credential, authenticate};
+use crate::authenticate::{
+    Credential, StaticTokenMatch, StaticTokens, authenticate_with_static_tokens,
+};
 use crate::policy::StaticTokenDecision;
 use crate::refusal::{DEFAULT_STATIC_CHALLENGE, select};
 use crate::token::{AuthorizedToken, TokenRejection, for_log};
@@ -288,6 +293,19 @@ pub enum AuthLayerError {
          the resource URL and scopes for control or non-ASCII characters"
     )]
     InvalidChallenge,
+    // Added last: a new variant before an existing one would renumber its
+    // implicit discriminant.
+    /// `build_with_decision`: the builder was given a non-empty
+    /// `static_tokens` set, but the decision carries no static token and does
+    /// not ignore one (`OAuthOnly` or `Unauthenticated`), so
+    /// [`crate::static_token_policy`] was never told a static token exists.
+    /// Pass the current token to the policy too; a decision that carries it
+    /// then accepts the whole set.
+    #[error(
+        "static tokens were given, but the static-token decision was made without a static \
+         token: pass the current static token to static_token_policy as well"
+    )]
+    DecisionWithoutStaticToken,
 }
 
 /// The enforcing part of a layer, shared by [`HttpAuthLayer`] and the axum
@@ -295,7 +313,10 @@ pub enum AuthLayerError {
 /// the pre-rendered challenges. Built only by [`Gate::build`], so the
 /// fail-closed checks cannot be skipped by either layer.
 pub(crate) struct Gate {
-    pub(crate) static_token: Option<String>,
+    /// Every accepted static token: the builder's `static_token` and
+    /// `static_tokens`, merged ([`StaticTokens::merged`]); `None` when neither
+    /// holds a (non-empty) token.
+    pub(crate) static_tokens: Option<StaticTokens>,
     pub(crate) oauth: Option<Arc<OAuthValidator>>,
     pub(crate) sources: Vec<CredentialSource>,
     /// The validator's pre-rendered challenges, `(invalid_token,
@@ -312,7 +333,8 @@ pub(crate) struct Gate {
 
 /// What [`Gate::admit`] decided about a request.
 pub(crate) enum Admission {
-    /// The static token was accepted (and inserted).
+    /// A static token was accepted (and inserted, with its
+    /// [`StaticTokenMatch`]).
     Static,
     /// An OAuth token was accepted (and inserted); returned for the caller's
     /// log line.
@@ -325,15 +347,20 @@ pub(crate) enum Admission {
 
 impl Gate {
     /// The fail-closed build both layers' builders end in.
+    ///
+    /// `static_token` and `static_tokens` are merged into one set (a repeated
+    /// secret counts once); an empty string and an empty set both count as
+    /// no static token, so neither satisfies the fail-closed check.
     pub(crate) fn build(
-        static_token: Option<String>,
+        static_token: Option<Zeroizing<String>>,
+        static_tokens: Option<StaticTokens>,
         oauth: Option<Arc<OAuthValidator>>,
         sources: Option<Vec<CredentialSource>>,
         static_challenge: Option<Option<HeaderValue>>,
         optional: bool,
     ) -> Result<Self, AuthLayerError> {
-        let static_token = static_token.filter(|t| !t.is_empty());
-        if static_token.is_none() && oauth.is_none() {
+        let static_tokens = StaticTokens::merged(static_tokens, static_token);
+        if static_tokens.is_none() && oauth.is_none() {
             return Err(AuthLayerError::NoCredential);
         }
         let sources = sources.unwrap_or_else(|| vec![CredentialSource::authorization_bearer()]);
@@ -362,7 +389,7 @@ impl Gate {
         let static_challenge = static_challenge
             .unwrap_or_else(|| Some(HeaderValue::from_static(DEFAULT_STATIC_CHALLENGE)));
         Ok(Self {
-            static_token,
+            static_tokens,
             oauth,
             sources,
             oauth_challenges,
@@ -384,6 +411,36 @@ impl Gate {
         }
     }
 
+    /// The static tokens `build_with_decision` builds with: the decision's
+    /// token (it replaces the builder's `static_token`, as it always has),
+    /// and the builder's `static_tokens` set according to the decision.
+    ///
+    /// - `StaticOnly`/`StaticAndOAuth`: the set is kept, and merged with the
+    ///   decision's token by [`Gate::build`].
+    /// - `StaticIgnored` (`accept_static_bearer: false`): the set is dropped
+    ///   with the token — the setting wins over every static token.
+    /// - `OAuthOnly`/`Unauthenticated` with a non-empty set:
+    ///   [`AuthLayerError::DecisionWithoutStaticToken`]. The policy decided
+    ///   without being told a static token exists, so the decision cannot
+    ///   speak for the set: honouring it would silently drop configured keys
+    ///   (or, for `Unauthenticated`, open the routes despite them).
+    ///
+    /// Call after [`Gate::check_decision`], so its errors come first.
+    pub(crate) fn decision_tokens(
+        decision: StaticTokenDecision,
+        static_tokens: Option<StaticTokens>,
+    ) -> Result<(Option<Zeroizing<String>>, Option<StaticTokens>), AuthLayerError> {
+        let static_tokens = static_tokens.filter(|s| !s.is_empty());
+        match decision {
+            StaticTokenDecision::StaticOnly(t) | StaticTokenDecision::StaticAndOAuth(t) => {
+                Ok((Some(Zeroizing::new(t)), static_tokens))
+            }
+            StaticTokenDecision::StaticIgnored => Ok((None, None)),
+            _ if static_tokens.is_some() => Err(AuthLayerError::DecisionWithoutStaticToken),
+            _ => Ok((None, None)),
+        }
+    }
+
     /// Authenticate the request whose `parts` these are: mark the source
     /// headers sensitive, run [`authenticate`] over one candidate per source,
     /// and insert what was accepted into the extensions. Logs nothing; each
@@ -396,6 +453,7 @@ impl Gate {
         if self.optional {
             parts.extensions.remove::<Credential>();
             parts.extensions.remove::<AuthorizedToken>();
+            parts.extensions.remove::<StaticTokenMatch>();
         }
         // The credential must not reach a `Debug` of the request — ours
         // (`RejectContext`), a tracing layer's, or a handler's.
@@ -407,19 +465,27 @@ impl Gate {
         let result = {
             let headers = &parts.headers;
             let candidates = self.sources.iter().filter_map(|s| s.candidate(headers));
-            authenticate(
+            authenticate_with_static_tokens(
                 candidates,
-                self.static_token.as_deref(),
+                self.static_tokens.as_ref(),
                 self.oauth.as_deref(),
             )
             .await
         };
         match result {
-            Ok(Credential::StaticToken) => {
+            Ok((Credential::StaticToken, matched)) => {
                 parts.extensions.insert(Credential::StaticToken);
+                // Always `Some` for a static match; the fallback keeps the
+                // pairing (a `StaticTokenMatch` whenever `StaticToken`) even so.
+                parts
+                    .extensions
+                    .insert(matched.unwrap_or_else(StaticTokenMatch::unlabeled));
                 Admission::Static
             }
-            Ok(Credential::OAuth(token)) => {
+            Ok((Credential::OAuth(token), _)) => {
+                // `StaticTokenMatch` describes the innermost accepted
+                // `Credential`, so an outer layer's must not outlive it.
+                parts.extensions.remove::<StaticTokenMatch>();
                 parts.extensions.insert(token.clone());
                 parts.extensions.insert(Credential::OAuth(token.clone()));
                 Admission::OAuth(token)
@@ -560,10 +626,7 @@ impl<R> std::fmt::Debug for HttpAuthLayer<R> {
                 .finish(),
             HttpMode::Enforce(g) => f
                 .debug_struct("HttpAuthLayer")
-                .field(
-                    "static_token",
-                    &g.static_token.as_ref().map(|_| "<redacted>"),
-                )
+                .field("static_tokens", &g.static_tokens)
                 .field("oauth", &g.oauth)
                 .field("sources", &g.sources)
                 .field("on_reject", &std::any::type_name::<R>())
@@ -714,7 +777,8 @@ impl<R> HttpAuthLayer<R> {
 
 /// Builder for an enforcing [`HttpAuthLayer`]; see [`HttpAuthLayer::builder`].
 pub struct HttpAuthLayerBuilder<R = EmptyRefusal> {
-    static_token: Option<String>,
+    static_token: Option<Zeroizing<String>>,
+    static_tokens: Option<StaticTokens>,
     oauth: Option<Arc<OAuthValidator>>,
     sources: Option<Vec<CredentialSource>>,
     /// `None`: not set, so [`DEFAULT_STATIC_CHALLENGE`].
@@ -727,6 +791,7 @@ impl Default for HttpAuthLayerBuilder {
     fn default() -> Self {
         Self {
             static_token: None,
+            static_tokens: None,
             oauth: None,
             sources: None,
             static_challenge: None,
@@ -744,6 +809,7 @@ impl<R> std::fmt::Debug for HttpAuthLayerBuilder<R> {
                 "static_token",
                 &self.static_token.as_ref().map(|_| "<redacted>"),
             )
+            .field("static_tokens", &self.static_tokens)
             .field("oauth", &self.oauth)
             .field("sources", &self.sources)
             .field("on_reject", &std::any::type_name::<R>())
@@ -764,13 +830,59 @@ impl<R> HttpAuthLayerBuilder<R> {
     /// [`HttpAuthLayerBuilder::build_with_decision`]. The token's length is not
     /// hidden by the comparison, and `Debug` output shows it as `<redacted>`.
     pub fn static_token(mut self, token: impl Into<String>) -> Self {
-        self.static_token = Some(token.into());
+        self.static_token = Some(Zeroizing::new(token.into()));
         self
     }
 
     /// [`HttpAuthLayerBuilder::static_token`] when `Some`.
     pub fn optional_static_token(mut self, token: Option<String>) -> Self {
-        self.static_token = token;
+        self.static_token = token.map(Zeroizing::new);
+        self
+    }
+
+    /// Accept every token in `tokens` (each compared in constant time, every
+    /// entry every time; see [`StaticTokens`]), replacing a set given
+    /// earlier. On a match the request's extensions get
+    /// [`Credential::StaticToken`] and the [`StaticTokenMatch`] naming the
+    /// entry's label.
+    ///
+    /// Combines with the other static-token settings exactly as the axum
+    /// layer's `AuthLayerBuilder::static_tokens` does: with
+    /// [`static_token`](Self::static_token), both are accepted (a secret in
+    /// both counts once, under the set's label); with
+    /// [`build_with_decision`](Self::build_with_decision), see that method.
+    /// An empty set counts as no static token, so it does not satisfy the
+    /// fail-closed build on its own.
+    ///
+    /// # Security
+    ///
+    /// Like [`static_token`](Self::static_token), this bypasses
+    /// `accept_static_bearer` unless the layer is built with
+    /// [`build_with_decision`](Self::build_with_decision). `Debug` output
+    /// shows the count and labels, never a secret.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use oauth_resource_server::StaticTokens;
+    /// use oauth_resource_server::http_layer::HttpAuthLayer;
+    ///
+    /// let tokens = StaticTokens::new()
+    ///     .with(Some("current"), "example-key-old")
+    ///     .and_then(|t| t.with(Some("next"), "example-key-new"))
+    ///     .unwrap();
+    /// let auth = HttpAuthLayer::builder().static_tokens(tokens).build().unwrap();
+    /// # let _ = auth;
+    /// ```
+    pub fn static_tokens(mut self, tokens: StaticTokens) -> Self {
+        self.static_tokens = Some(tokens);
+        self
+    }
+
+    /// [`HttpAuthLayerBuilder::static_tokens`] when `Some`; `None` clears a
+    /// set given earlier.
+    pub fn optional_static_tokens(mut self, tokens: Option<StaticTokens>) -> Self {
+        self.static_tokens = tokens;
         self
     }
 
@@ -863,6 +975,7 @@ impl<R> HttpAuthLayerBuilder<R> {
     {
         HttpAuthLayerBuilder {
             static_token: self.static_token,
+            static_tokens: self.static_tokens,
             oauth: self.oauth,
             sources: self.sources,
             static_challenge: self.static_challenge,
@@ -878,25 +991,37 @@ impl<R> HttpAuthLayerBuilder<R> {
     /// [`allow_unauthenticated`](HttpAuthLayer::allow_unauthenticated)
     /// pass-through.
     ///
+    /// A [`static_tokens`](Self::static_tokens) set follows the decision, as
+    /// for the axum layer's `AuthLayerBuilder::build_with_decision`: kept, and
+    /// merged with the decision's token, when the decision carries one
+    /// (`StaticOnly`/`StaticAndOAuth`); dropped with it on `StaticIgnored`
+    /// (`accept_static_bearer: false` wins); refused alongside `OAuthOnly` or
+    /// `Unauthenticated`, which were decided without any static token.
+    ///
     /// # Errors
     ///
     /// [`AuthLayerError::DecisionNeedsOAuth`] when the decision was made with
     /// OAuth on and no validator was given,
     /// [`AuthLayerError::DecisionWithoutOAuth`] when it was made with OAuth off
-    /// (including `Unauthenticated`) and one was given. Otherwise as
-    /// [`HttpAuthLayerBuilder::build`].
+    /// (including `Unauthenticated`) and one was given, then
+    /// [`AuthLayerError::DecisionWithoutStaticToken`] for a non-empty
+    /// `static_tokens` set with an `OAuthOnly` or `Unauthenticated` decision.
+    /// Otherwise as [`HttpAuthLayerBuilder::build`].
     pub fn build_with_decision(
         mut self,
         decision: StaticTokenDecision,
     ) -> Result<HttpAuthLayer<R>, AuthLayerError> {
         Gate::check_decision(&decision, self.oauth.is_some())?;
-        if decision == StaticTokenDecision::Unauthenticated {
+        let unauthenticated = decision == StaticTokenDecision::Unauthenticated;
+        let (token, tokens) = Gate::decision_tokens(decision, self.static_tokens.take())?;
+        if unauthenticated {
             return Ok(HttpAuthLayer {
                 mode: Arc::new(HttpMode::AllowUnauthenticated),
                 on_reject: Arc::new(self.on_reject),
             });
         }
-        self.static_token = decision.into_static_token();
+        self.static_token = token;
+        self.static_tokens = tokens;
         self.build()
     }
 
@@ -905,13 +1030,16 @@ impl<R> HttpAuthLayerBuilder<R> {
     /// # Errors
     ///
     /// [`AuthLayerError::NoCredential`] with neither a non-empty static token
-    /// nor an OAuth validator; [`AuthLayerError::NoSources`] with an empty
+    /// (from [`static_token`](Self::static_token) or a non-empty
+    /// [`static_tokens`](Self::static_tokens) set) nor an OAuth validator;
+    /// [`AuthLayerError::NoSources`] with an empty
     /// source list; [`AuthLayerError::InvalidChallenge`] when the validator's
     /// challenge is not a valid header value (only reachable from a
     /// hand-edited resolved config).
     pub fn build(self) -> Result<HttpAuthLayer<R>, AuthLayerError> {
         let gate = Gate::build(
             self.static_token,
+            self.static_tokens,
             self.oauth,
             self.sources,
             self.static_challenge,
@@ -1351,6 +1479,309 @@ mod tests {
         let rendered = format!("{layer:?}");
         assert!(
             !rendered.contains("hunter2") && rendered.contains("<redacted>"),
+            "{rendered}"
+        );
+        let service = tower_layer::Layer::layer(&layer, "inner");
+        assert!(!format!("{service:?}").contains("hunter2"));
+    }
+
+    // ── static_tokens ────────────────────────────────────────────────────────
+
+    fn rotation() -> StaticTokens {
+        StaticTokens::new()
+            .with(Some("current"), "key-current")
+            .and_then(|t| t.with(Some("next"), "key-next"))
+            .unwrap()
+    }
+
+    /// Status, every header, and a body naming the credential and the static
+    /// match the layer inserted.
+    type Seen = (u16, Vec<(String, String)>, String);
+
+    async fn seen<R>(layer: &HttpAuthLayer<R>, headers: &[(&str, &str)]) -> Seen
+    where
+        R: RefusalResponse<String> + Send + Sync + 'static,
+    {
+        let mut request = Request::builder().uri("/test");
+        for (name, value) in headers {
+            request = request.header(*name, *value);
+        }
+        let service = tower_layer::Layer::layer(
+            layer,
+            service_fn(|request: Request<String>| async move {
+                let body = format!(
+                    "{:?} {:?}",
+                    request.extensions().get::<Credential>(),
+                    request.extensions().get::<StaticTokenMatch>(),
+                );
+                Ok::<_, std::convert::Infallible>(Response::new(body))
+            }),
+        );
+        let response = service
+            .oneshot(request.body(String::new()).unwrap())
+            .await
+            .unwrap();
+        let headers = response
+            .headers()
+            .iter()
+            .map(|(k, v)| (k.to_string(), v.to_str().unwrap().to_string()))
+            .collect();
+        (response.status().as_u16(), headers, response.into_body())
+    }
+
+    #[tokio::test]
+    async fn a_one_entry_set_answers_exactly_like_static_token() {
+        let jwks = testing::spawn_jwks_server("200 OK", testing::jwks_body()).await;
+        let v = validator(&jwks.url);
+        let valid = format!("Bearer {}", testing::valid_token());
+        let unscoped = format!("Bearer {}", unscoped_token());
+        let requests: Vec<Vec<(&str, &str)>> = vec![
+            vec![],
+            vec![("authorization", "Bearer secret")],
+            vec![("authorization", "bearer secret")],
+            vec![("authorization", "Bearer wrong")],
+            vec![("authorization", "Bearer ")],
+            vec![("x-api-key", "secret")],
+            vec![("authorization", "Bearer wrong"), ("x-api-key", "secret")],
+            vec![("authorization", valid.as_str())],
+            vec![("authorization", unscoped.as_str())],
+        ];
+        for (oauth, optional) in [(None, false), (Some(&v), false), (None, true)] {
+            let sources = [
+                CredentialSource::authorization_bearer(),
+                CredentialSource::Raw(HeaderName::from_static("x-api-key")),
+            ];
+            let mut old = HttpAuthLayer::builder()
+                .static_token(STATIC)
+                .optional_oauth(oauth.cloned())
+                .sources(sources.clone());
+            let mut new = HttpAuthLayer::builder()
+                .static_tokens(StaticTokens::single(STATIC).unwrap())
+                .optional_oauth(oauth.cloned())
+                .sources(sources);
+            if optional {
+                old = old.optional();
+                new = new.optional();
+            }
+            let (old, new) = (old.build().unwrap(), new.build().unwrap());
+            for headers in &requests {
+                let a = seen(&old, headers).await;
+                let b = seen(&new, headers).await;
+                assert_eq!(a, b, "oauth={} {headers:.40?}", oauth.is_some());
+                if a.2.starts_with("Some(StaticToken)") {
+                    assert!(
+                        a.2.ends_with("Some(StaticTokenMatch { label: None })"),
+                        "{a:?}"
+                    );
+                }
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn every_token_in_a_set_is_accepted_with_its_label() {
+        let layer = HttpAuthLayer::builder()
+            .static_tokens(rotation())
+            .build()
+            .unwrap();
+        for (secret, label) in [("key-current", "current"), ("key-next", "next")] {
+            let (status, _, body) =
+                seen(&layer, &[("authorization", &format!("Bearer {secret}"))]).await;
+            assert_eq!(status, 200);
+            assert_eq!(
+                body,
+                format!("Some(StaticToken) Some(StaticTokenMatch {{ label: Some({label:?}) }})")
+            );
+        }
+        let (status, headers, _) = seen(&layer, &[("authorization", "Bearer key-old")]).await;
+        assert_eq!(status, 401);
+        assert!(headers.contains(&(
+            "www-authenticate".to_string(),
+            DEFAULT_STATIC_CHALLENGE.to_string()
+        )));
+    }
+
+    #[tokio::test]
+    async fn static_token_and_static_tokens_are_merged() {
+        let layer = HttpAuthLayer::builder()
+            .static_token("key-next")
+            .static_tokens(rotation())
+            .build()
+            .unwrap();
+        // The secret given both ways counts once, under the set's label.
+        let (_, _, body) = seen(&layer, &[("authorization", "Bearer key-next")]).await;
+        assert!(body.ends_with("label: Some(\"next\") })"), "{body}");
+        let layer = HttpAuthLayer::builder()
+            .static_token("key-extra")
+            .static_tokens(rotation())
+            .build()
+            .unwrap();
+        for secret in ["key-current", "key-next", "key-extra"] {
+            let (status, _, _) =
+                seen(&layer, &[("authorization", &format!("Bearer {secret}"))]).await;
+            assert_eq!(status, 200, "{secret}");
+        }
+        let (_, _, body) = seen(&layer, &[("authorization", "Bearer key-extra")]).await;
+        assert!(body.ends_with("label: None })"), "{body}");
+    }
+
+    #[test]
+    fn an_empty_set_is_no_credential() {
+        for builder in [
+            HttpAuthLayer::builder().static_tokens(StaticTokens::new()),
+            HttpAuthLayer::builder()
+                .static_tokens(StaticTokens::new())
+                .static_token(""),
+            HttpAuthLayer::builder()
+                .static_tokens(StaticTokens::new())
+                .optional(),
+            HttpAuthLayer::builder()
+                .static_tokens(rotation())
+                .optional_static_tokens(None),
+        ] {
+            assert_eq!(builder.build().unwrap_err(), AuthLayerError::NoCredential);
+        }
+    }
+
+    #[tokio::test]
+    async fn static_tokens_follow_the_decision() {
+        let v = validator("http://127.0.0.1:1/jwks");
+        let accepts = |layer: HttpAuthLayer| async move {
+            let mut accepted = Vec::new();
+            for secret in ["key-current", "key-next", "decided"] {
+                let (status, _, body) =
+                    seen(&layer, &[("authorization", &format!("Bearer {secret}"))]).await;
+                if status == 200 {
+                    accepted.push(format!(
+                        "{secret}={}",
+                        body.rsplit("label: ").next().unwrap()
+                    ));
+                }
+            }
+            accepted
+        };
+
+        // A decision carrying a token keeps the set and merges the token.
+        for (decision, oauth) in [
+            (StaticTokenDecision::StaticOnly("decided".into()), None),
+            (
+                StaticTokenDecision::StaticAndOAuth("decided".into()),
+                Some(Arc::clone(&v)),
+            ),
+        ] {
+            let layer = HttpAuthLayer::builder()
+                .optional_oauth(oauth)
+                .static_tokens(rotation())
+                .build_with_decision(decision)
+                .unwrap();
+            assert_eq!(
+                accepts(layer).await,
+                [
+                    "key-current=Some(\"current\") })",
+                    "key-next=Some(\"next\") })",
+                    "decided=None })"
+                ]
+            );
+        }
+        // The decision's token already in the set counts once, labeled.
+        let layer = HttpAuthLayer::builder()
+            .static_tokens(rotation())
+            .build_with_decision(StaticTokenDecision::StaticOnly("key-current".into()))
+            .unwrap();
+        assert_eq!(
+            accepts(layer).await,
+            [
+                "key-current=Some(\"current\") })",
+                "key-next=Some(\"next\") })"
+            ]
+        );
+
+        // `accept_static_bearer: false` drops the set with the token.
+        let layer = HttpAuthLayer::builder()
+            .oauth(Arc::clone(&v))
+            .static_tokens(rotation())
+            .build_with_decision(StaticTokenDecision::StaticIgnored)
+            .unwrap();
+        assert!(accepts(layer).await.is_empty());
+
+        // A decision made without any static token cannot speak for a set.
+        assert_eq!(
+            HttpAuthLayer::builder()
+                .oauth(Arc::clone(&v))
+                .static_tokens(rotation())
+                .build_with_decision(StaticTokenDecision::OAuthOnly)
+                .unwrap_err(),
+            AuthLayerError::DecisionWithoutStaticToken
+        );
+        assert_eq!(
+            HttpAuthLayer::builder()
+                .static_tokens(rotation())
+                .build_with_decision(StaticTokenDecision::Unauthenticated)
+                .unwrap_err(),
+            AuthLayerError::DecisionWithoutStaticToken
+        );
+        // The validator mismatch is reported first.
+        assert_eq!(
+            HttpAuthLayer::builder()
+                .static_tokens(rotation())
+                .build_with_decision(StaticTokenDecision::OAuthOnly)
+                .unwrap_err(),
+            AuthLayerError::DecisionNeedsOAuth
+        );
+        // An empty set is no set.
+        assert!(
+            HttpAuthLayer::builder()
+                .static_tokens(StaticTokens::new())
+                .build_with_decision(StaticTokenDecision::Unauthenticated)
+                .unwrap()
+                .allows_unauthenticated()
+        );
+        assert!(
+            HttpAuthLayer::builder()
+                .oauth(Arc::clone(&v))
+                .static_tokens(StaticTokens::new())
+                .build_with_decision(StaticTokenDecision::OAuthOnly)
+                .is_ok()
+        );
+    }
+
+    #[tokio::test]
+    async fn an_optional_layer_with_several_tokens() {
+        let layer = HttpAuthLayer::builder()
+            .static_tokens(rotation())
+            .optional()
+            .build()
+            .unwrap();
+        let (status, _, body) = seen(&layer, &[]).await;
+        assert_eq!((status, body.as_str()), (200, "None None"));
+        for (secret, label) in [("key-current", "current"), ("key-next", "next")] {
+            let (status, _, body) =
+                seen(&layer, &[("authorization", &format!("Bearer {secret}"))]).await;
+            assert_eq!(status, 200);
+            assert!(body.ends_with(&format!("Some({label:?}) }})")), "{body}");
+        }
+        let (status, _, _) = seen(&layer, &[("authorization", "Bearer key-old")]).await;
+        assert_eq!(status, 401);
+    }
+
+    #[test]
+    fn debug_never_prints_a_token_from_a_set() {
+        let builder = HttpAuthLayer::builder()
+            .static_token("hunter2-single")
+            .static_tokens(
+                StaticTokens::new()
+                    .with(Some("current"), "hunter2-current")
+                    .unwrap(),
+            );
+        let rendered = format!("{builder:?}");
+        assert!(
+            !rendered.contains("hunter2") && rendered.contains("current"),
+            "{rendered}"
+        );
+        let layer = builder.build().unwrap();
+        let rendered = format!("{layer:?}");
+        assert!(
+            !rendered.contains("hunter2") && rendered.contains("len: 2"),
             "{rendered}"
         );
         let service = tower_layer::Layer::layer(&layer, "inner");

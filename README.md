@@ -31,7 +31,8 @@ that decides whether the bearer token on a request is good enough.
   challenge pointing at the metadata document, which names your authorization
   server.
 - It accepts a static API key alongside OAuth, or instead of it, so an
-  existing deployment can move to OAuth without an outage.
+  existing deployment can move to OAuth without an outage — and several keys
+  at once, so a key can be rotated without one either.
 - It fails closed, down to the middleware refusing to build with no
   credential configured.
 
@@ -209,8 +210,10 @@ starts a fake authorization server on a loopback port, so it needs no network.
 ### Reading the caller in a handler
 
 On success the layer inserts a `Credential` into the request extensions and,
-for an OAuth token, the `AuthorizedToken` as well. Both are axum extractors,
-so a handler takes them as arguments:
+for an OAuth token, the `AuthorizedToken` as well (for a static key, a
+`StaticTokenMatch` naming which key; see
+[Rotating a static API key](#rotating-a-static-api-key-with-zero-downtime)).
+All three are axum extractors, so a handler takes them as arguments:
 
 ```rust
 use oauth_resource_server::Credential;
@@ -236,6 +239,7 @@ and never pass it to the handler:
 | was accepted by the layer | the value | `Some(value)` |
 | passed an `optional()` layer with no credential, or an `allow_unauthenticated()` layer | the layer's own 401 and `WWW-Authenticate` challenge | `None` |
 | was accepted with the static token (`AuthorizedToken` only, unless an outer layer inserted one; see below) | the layer's own 401 and challenge | `None` |
+| was accepted with an OAuth token (`StaticTokenMatch` only) | the layer's own 401 and challenge | `None` |
 | is on a route no `AuthLayer` covers | 500, logged at `error` | 500, logged at `error` |
 
 "The layer's own 401" comes from the same code as the layer's refusals, so it
@@ -518,6 +522,75 @@ Always go through `static_token_policy`. It is the only thing that reads
 `AuthLayer::builder().static_token(..)` would make that setting do nothing. It
 contains no logging and no message text, so your application can explain the
 decision at startup in its own words.
+
+### Rotating a static API key with zero downtime
+
+A layer can hold several static keys at once, as a `StaticTokens` set, and
+tells the handler which one a request used. Rotating a key then needs no
+window in which clients are locked out:
+
+1. **Add the new key next to the old one.** With the `env` feature,
+   `static_tokens_from_env("MYAPP_API_KEY")` reads `MYAPP_API_KEY` (the
+   current key, labeled `"current"`) and `MYAPP_API_KEY_NEXT` (the new one,
+   labeled `"next"`), each also as a `_FILE`. Restart: both keys work.
+2. **Move every client to the new key.** The `StaticTokenMatch` label shows
+   which clients still send the old one.
+3. **Promote the new key.** Set `MYAPP_API_KEY` to it and unset
+   `MYAPP_API_KEY_NEXT` (a restart with both holding the same value is fine:
+   it is one key). Restart: only the new key works.
+
+`<VAR>_NEXT` without `<VAR>` is an error (a half-done rotation), as is setting
+both a variable and its `_FILE`. There is deliberately no whitespace-separated
+list form: it could not carry labels.
+
+`accept_static_bearer` still applies, through `static_token_policy`, which
+decides on the current key. The layer's `static_tokens` set follows that
+decision: kept when it carries a static token, dropped with it on
+`StaticIgnored`, and refused (`AuthLayerError::DecisionWithoutStaticToken`)
+alongside a decision the policy made without any static token.
+
+```rust
+use std::sync::Arc;
+
+use oauth_resource_server::axum::AuthLayer;
+use oauth_resource_server::env::{secret_from_env, static_tokens_from_env};
+use oauth_resource_server::{
+    OAuthValidator, ResolvedOAuthConfig, StaticTokenMatch, static_token_policy,
+};
+
+fn auth_layer(
+    oauth_config: Option<&ResolvedOAuthConfig>,
+    oauth: Option<Arc<OAuthValidator>>,
+) -> Result<AuthLayer, Box<dyn std::error::Error>> {
+    // The current key alone is what the policy decides on...
+    let current = secret_from_env("MYAPP_API_KEY")?;
+    // ...and the layer accepts it plus MYAPP_API_KEY_NEXT during a rotation.
+    let keys = static_tokens_from_env("MYAPP_API_KEY")?;
+    let decision = static_token_policy(current, oauth_config, false)?;
+    Ok(AuthLayer::builder()
+        .optional_oauth(oauth)
+        .optional_static_tokens(keys)
+        .build_with_decision(decision)?)
+}
+
+// `None` for an OAuth request; `Some` with the key's label for a static one.
+async fn audit(matched: Option<StaticTokenMatch>) -> String {
+    match matched.as_ref().map(StaticTokenMatch::label) {
+        Some(Some(label)) => format!("static key {label}"),
+        Some(None) => "static key".to_string(),
+        None => "not a static key".to_string(),
+    }
+}
+```
+
+For one key per client, build the set yourself and label each entry:
+`StaticTokens::new().with(Some("ci"), ci_key)?.with(Some("backup-job"), backup_key)?`.
+`with` refuses a blank secret, a secret already in the set, a repeated label,
+and a label that is not 1 to 64 visible ASCII characters, so every label is
+safe to log. `AuthLayerBuilder::static_tokens` (and `HttpAuthLayerBuilder`'s)
+takes the set; `static_token(..)` alongside it adds that key too. Outside the
+layers, `authenticate_with_static_tokens` returns the `StaticTokenMatch` next
+to the `Credential`.
 
 ### Several credential sources
 
@@ -946,6 +1019,17 @@ To apply your own defaults before validation, call
 `unresolved_oauth_config_from_env`, change the returned `config`, then call
 `resolve()` on it.
 
+A static API key is not an `OAuthConfig` field; it is read on its own:
+
+| Function | Variables | Returns |
+|---|---|---|
+| `secret_from_env(var)` | `<VAR>` or `<VAR>_FILE` | the one key, or `None` |
+| `static_tokens_from_env(var)` | the above, plus `<VAR>_NEXT` or `<VAR>_NEXT_FILE` | a `StaticTokens` set: `"current"`, and `"next"` while a rotation is under way (one entry when the two are equal), or `None`; `<VAR>_NEXT` without `<VAR>` is an error |
+
+Both trim values, treat a blank variable as unset, refuse an empty `_FILE`,
+and refuse a variable set together with its `_FILE`. See
+[Rotating a static API key](#rotating-a-static-api-key-with-zero-downtime).
+
 ## Security model
 
 ### What is checked, in order
@@ -1058,9 +1142,11 @@ verified claims and token metadata) or a
   10 seconds, at most three redirects are followed, a redirect from `https`
   to `http` is refused, and one to plain `http` on a non-loopback host is
   refused without `allow_insecure_http`.
-- **Secrets stay out of logs.** Tokens and the static token are never logged,
+- **Secrets stay out of logs.** Tokens and the static tokens are never logged,
   and the `Debug` output of the layer, its builder and the policy decision
-  redacts the static token. `RejectContext`'s `Debug` prints no header
+  redacts the static token; a `StaticTokens` set prints its count and labels
+  only. Labels are not secrets: `StaticTokens::with` accepts only 1 to 64
+  visible ASCII characters, so a label is always safe in a log line. `RejectContext`'s `Debug` prints no header
   values, and the layer marks the configured credential headers sensitive on
   the request, so a tracing layer or a handler's `Debug` of the headers shows
   `Sensitive` instead of the token. The token-derived `kid`, `typ`, subject and
@@ -1069,7 +1155,17 @@ verified claims and token metadata) or a
   accepted token at `debug`), bounded only by the 16 KiB credential cap.
   Rejection reasons go to the log, never to the client.
 - **The static token is compared in constant time** (with `subtle`). Its
-  length is not hidden.
+  length is not hidden. With several static tokens, every candidate is
+  compared with every entry, with no early exit once one matches, and the
+  matching entry is selected without a data-dependent branch, so the time
+  does not depend on which entry matched. It does depend on how many entries
+  have the candidate's length (each comparison ends early on a length
+  mismatch, as with one token); keys of one fixed length reveal nothing by it.
+  A `StaticTokens` set, the layer builders' single static token and the
+  `env` loaders' intermediate copies are wiped (`zeroize`) when dropped.
+  Strings your code passes in or keeps, `secret_from_env`'s returned
+  `String`, a `StaticTokenDecision`'s payload and the process environment
+  are not.
 - **Configuration is validated at startup,** all of it at once, so a broken
   deployment refuses to start rather than answering 401 to everyone.
 
@@ -1256,9 +1352,9 @@ axum layer, the tower layer and a hand-built integration all get the status and
 With the `tower` feature, `oauth_resource_server::http_layer::HttpAuthLayer` wraps
 any `tower` service over `http::Request<ReqBody>` / `http::Response<ResBody>`,
 for any body types. It is the axum layer's check without axum: the same
-builder (`static_token`, `oauth`, `sources`, `static_challenge`, `optional`,
+builder (`static_token`, `static_tokens`, `oauth`, `sources`, `static_challenge`, `optional`,
 `build_with_decision`), the same fail-closed build, the same refusals, and the
-same `Credential`/`AuthorizedToken` request extensions. A refusal's body is
+same `Credential`/`AuthorizedToken`/`StaticTokenMatch` request extensions. A refusal's body is
 `ResBody::default()` unless `on_reject` builds a response, whose status and
 challenge the layer then sets:
 
