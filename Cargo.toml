@@ -101,6 +101,10 @@ tokio = { version = "1.15", features = ["sync", "time", "rt"] }
 tracing = "0.1.29"
 subtle = "2.5"
 thiserror = "2"
+# Wipes `StaticTokens`' copies of its secrets on drop. Already in every build
+# (each TLS feature pulls in `rustls-pki-types`, which depends on it; `rustls`
+# itself asks for 1.8), so it adds no crate. Never part of the public API.
+zeroize = "1.8"
 
 # Always built: `AuthorizedToken::claims_as` is bounded by `serde::de::DeserializeOwned`,
 # and `serde` is already in every build of this crate, through `jsonwebtoken` and
