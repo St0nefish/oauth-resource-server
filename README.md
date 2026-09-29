@@ -69,7 +69,7 @@ or in `Cargo.toml`:
 
 ```toml
 [dependencies]
-oauth-resource-server = { version = "0.1", features = ["axum", "serde"] }
+oauth-resource-server = { version = "0.2", features = ["axum", "serde"] }
 ```
 
 ### Features
@@ -154,10 +154,10 @@ crate over as well, so the binary carries one TLS stack instead of two:
 
 ```toml
 [dependencies]
-oauth-resource-server = { version = "0.1", default-features = false, features = ["native-tls", "axum", "serde"] }
+oauth-resource-server = { version = "0.2", default-features = false, features = ["native-tls", "axum", "serde"] }
 
 [dev-dependencies]
-oauth-resource-server = { version = "0.1", default-features = false, features = ["native-tls", "testing"] }
+oauth-resource-server = { version = "0.2", default-features = false, features = ["native-tls", "testing"] }
 ```
 
 Repeat `default-features = false` in `[dev-dependencies]`. Cargo merges a
@@ -923,6 +923,9 @@ error messages spell them (`KeyNaming::Dotted("oauth")` gives `oauth.issuer`,
 | `allow_unscoped_tokens` | `bool` | `false` | Accept a config with no required scope and `require_at_jwt` off. Without it, `resolve` refuses that combination, because it would accept OIDC ID tokens as access tokens. |
 | `allow_insecure_http` | `bool` | `false` | Accept a plain-`http` `issuer`, `jwks_uri` or `resource` on a non-loopback host, for an in-cluster address on a trusted network. Also governs a `jwks_uri` discovered from a plain-`http` issuer and every redirect followed while fetching keys. Loopback hosts never need it. |
 | `accept_static_bearer` | `bool` | `true` | Whether a separately configured static token keeps working while OAuth is on. Read only by `static_token_policy`. |
+| `allowed_client_ids` | `Vec<String>` | `[]` (no check) | The OAuth clients whose tokens are accepted. A token's client is its `client_id` claim (RFC 9068 §2.2), else its `azp` (the first that is a non-empty string, as `AuthorizedToken::client_id` reads it), and it must equal an entry byte for byte; `client_id` wins, so a listed `azp` does not rescue an unlisted `client_id`. No client, or another one, is a 401 (`ClientNotAllowed`). Use it where the audience is shared by several clients (see [Client identity](#what-is-not-covered)). No blank entries. |
+| `max_token_age_secs` | `Option<u64>` | `None` (no check) | Refuse a token issued more than this many seconds ago (`now - iat`, plus `leeway_secs` of slack): `TokenTooOld`. With it set, `iat` is required (`MissingClaim`) and must be a NumericDate (`MalformedClaim`), and an `iat` more than `leeway_secs` in the future is `NotYetValid`. `1` to `MAX_TOKEN_AGE_SECS` (2 592 000, 30 days); `0` or more is an error. All 401. |
+| `required_claims` | map of claim name to value | `{}` (no check) | Claims every token must carry with a value: the token's claim must equal it (JSON equality, so `"1"` is not `1`), or be an array containing it (for `groups`, `roles` and the like). A missing claim is `MissingClaim`; any other value (including `null`, an object, or an array without it) is `ClaimMismatch`; both 401. Values must be a string, number or boolean; top-level claims only (no paths into nested objects); names must not be blank nor one of `iss`, `aud`, `exp`, `nbf`, `iat` and `cnf`, which this crate already checks. |
 
 `resolve` is all-or-nothing. An enabled config either resolves completely or
 fails with a `ConfigError` listing **every** problem, each naming its setting:
@@ -976,13 +979,12 @@ config format; these are wired in code). `OAuthValidator::new(&resolved)` is
 the builder with nothing set. Every option is checked by `build()`, and a
 refused one is a `ValidatorError`, never silently dropped.
 
-| Builder method | Default | Meaning |
-|---|---|---|
-| `add_root_certificate_pem(&[u8])` | none | Adds the certificate(s) in a PEM file (one, or a bundle) as TLS trust anchors, on top of the TLS feature's own roots. Works with every TLS feature. Pass CA certificates only. Error: `ValidatorError::InvalidRootCertificate` (no certificate in it, one the backend cannot use, or a private-key block). |
-| `proxy(url)` | reqwest's own proxy handling (environment variables, and system settings where reqwest's `system-proxy` feature is on), for non-loopback fetches | An explicit `http://` or `https://` proxy for every non-loopback metadata and JWKS fetch, `user:password@` sent as proxy Basic auth. Setting it turns the environment and system proxies off, `NO_PROXY` included. No path, query, fragment, SOCKS scheme, space, control or non-ASCII character, and no credential in a plain-`http` proxy URL on a non-loopback host unless `allow_insecure_http` is set. Error: `ValidatorError::InvalidProxy` (never showing the URL). |
-
-| `fetch_timeout(Duration)` | `DEFAULT_FETCH_TIMEOUT`, 10 s | Timeout for one metadata or JWKS request, connect through last body byte. `MIN_FETCH_TIMEOUT` (1 s) to `MAX_FETCH_TIMEOUT` (60 s); zero or anything outside is `ValidatorError::FetchTimeoutOutOfRange`. |
-| `initial_jwks(&str)` | none | A JWK Set (`{"keys": [...]}`) the key cache starts with, parsed and narrowed exactly like a fetched one (256 KiB and 64-key caps, no `oct`/`use: enc`/non-`verify` key, each key limited to the configured algorithms). Refreshed normally: the first successful refresh replaces it, a failed one keeps it. Error: `ValidatorError::InvalidInitialJwks`. |
+| Builder method                    | Default                                                                                                                                          | Meaning                                                                                                                                                                                                                                                                                                                                                                                                                                                                    |
+| --------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------ | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `add_root_certificate_pem(&[u8])` | none                                                                                                                                             | Adds the certificate(s) in a PEM file (one, or a bundle) as TLS trust anchors, on top of the TLS feature's own roots. Works with every TLS feature. Pass CA certificates only. Error: `ValidatorError::InvalidRootCertificate` (no certificate in it, one the backend cannot use, or a private-key block).                                                                                                                                                                 |
+| `proxy(url)`                      | reqwest's own proxy handling (environment variables, and system settings where reqwest's `system-proxy` feature is on), for non-loopback fetches | An explicit `http://` or `https://` proxy for every non-loopback metadata and JWKS fetch, `user:password@` sent as proxy Basic auth. Setting it turns the environment and system proxies off, `NO_PROXY` included. No path, query, fragment, SOCKS scheme, space, control or non-ASCII character, and no credential in a plain-`http` proxy URL on a non-loopback host unless `allow_insecure_http` is set. Error: `ValidatorError::InvalidProxy` (never showing the URL). |
+| `fetch_timeout(Duration)`         | `DEFAULT_FETCH_TIMEOUT`, 10 s                                                                                                                    | Timeout for one metadata or JWKS request, connect through last body byte. `MIN_FETCH_TIMEOUT` (1 s) to `MAX_FETCH_TIMEOUT` (60 s); zero or anything outside is `ValidatorError::FetchTimeoutOutOfRange`.                                                                                                                                                                                                                                                                   |
+| `initial_jwks(&str)`              | none                                                                                                                                             | A JWK Set (`{"keys": [...]}`) the key cache starts with, parsed and narrowed exactly like a fetched one (256 KiB and 64-key caps, no `oct`/`use: enc`/non-`verify` key, each key limited to the configured algorithms). Refreshed normally: the first successful refresh replaces it, a failed one keeps it. Error: `ValidatorError::InvalidInitialJwks`.                                                                                                                  |
 
 Every fetch whose URL is on a loopback host (`localhost`, `*.localhost`,
 `127.0.0.0/8`, `::1`) uses a separate client with no proxy of any kind, so a
@@ -1075,10 +1077,15 @@ ways:
   setting: neither defaults it to the required scopes "instead of" the
   other leaving it empty.
 - **Lists** (`AUDIENCES`, `REQUIRED_SCOPES`, `SCOPES_SUPPORTED`,
-  `SCOPE_CLAIMS`, `PRINCIPAL_CLAIMS`, `ALGORITHMS`) are split on whitespace.
+  `SCOPE_CLAIMS`, `PRINCIPAL_CLAIMS`, `ALGORITHMS`, `ALLOWED_CLIENT_IDS`) are
+  split on whitespace.
 - **Booleans** accept exactly `true` or `false`. Anything else is an error, so
   a typo cannot silently read as `false`.
-- **`LEEWAY_SECS`** is a decimal integer.
+- **`LEEWAY_SECS`** and **`MAX_TOKEN_AGE_SECS`** are decimal integers
+  (`MAX_TOKEN_AGE_SECS` unset means no age check).
+- **`REQUIRED_CLAIMS`** is one JSON object:
+  `MYAPP_OAUTH_REQUIRED_CLAIMS='{"tid": "<tenant id>", "groups": "api-users"}'`.
+  Anything but a JSON object is an `EnvParse` problem.
 - **Values are trimmed.** A variable that is empty after trimming counts as
   unset, but a `_FILE` whose contents are empty after trimming is an error.
   Setting both `VAR` and `VAR_FILE` is an error.
@@ -1125,8 +1132,16 @@ For each candidate credential, `OAuthValidator::validate`:
    confirmation claim is refused, since it is bound to a DPoP key (RFC 9449)
    or an mTLS certificate (RFC 8705) whose proof this crate cannot check, and
    those RFCs forbid accepting it as a plain bearer token.
-5. **Checks scopes.** The token must carry every required scope, or it is
-   refused with `InsufficientScope` (403), not 401.
+5. **Applies the optional claim policy**, each check off unless configured,
+   in this order: the client (`client_id`, else `azp`) must be in
+   `allowed_client_ids`; `iat` must be no older than `max_token_age_secs`
+   (and not in the future); every `required_claims` entry must match. These
+   read only claims the signature already covered, and each refusal is a 401
+   with its own kind (`ClientNotAllowed`, `TokenTooOld`, `NotYetValid`,
+   `MissingClaim`, `MalformedClaim`, `ClaimMismatch`).
+6. **Checks scopes.** The token must carry every required scope, or it is
+   refused with `InsufficientScope` (403), not 401. A token that fails step 5
+   is a 401 whatever its scopes.
 
 The result is an `AuthorizedToken` (`subject`, `principal`, `scopes`, plus the
 verified claims and token metadata) or a
@@ -1265,13 +1280,24 @@ an `InvalidToken`'s `kind()` names the check that failed).
   (one carrying `cnf`) is refused, not downgraded to a bearer token. Tokens
   are accepted from headers only (`bearer_methods_supported` is
   `["header"]`), never from query strings or form bodies.
-- **Replay and token age.** There is no `jti` tracking and no maximum age from
-  `iat`.
-- **Client identity.** `azp` and `client_id` are not checked. Any client of the
-  authorization server whose tokens carry an accepted `aud` and the required
-  scopes is accepted, so choose `audience` accordingly (see
-  [Audience](#audience-which-value-to-configure) for what a client_id audience
-  means).
+- **Replay.** There is no `jti` tracking: a token is usable until `exp` by
+  whoever holds it. Token *age* can be bounded independently of `exp` with
+  `max_token_age_secs` (off by default), which limits how long a stolen token
+  stays useful when the authorization server issues long-lived ones.
+- **Client identity, unless you list the clients.** By default `azp` and
+  `client_id` are not checked: any client of the authorization server whose
+  tokens carry an accepted `aud` and the required scopes is accepted. That is
+  the whole story when the audience identifies this API alone, but not when
+  the authorization server stamps an audience shared by many clients (an
+  Auth0 API identifier, an Okta custom authorization server's audience, an
+  Entra ID app ID URI): then every client granted that API gets in. Set
+  `allowed_client_ids` to the clients you mean to serve (it reads
+  `client_id`, else `azp`; for a client named in another claim, such as
+  Okta's `cid`, require that claim with `required_claims`; see the [provider
+  guide](https://github.com/St0nefish/oauth-resource-server/blob/master/docs/providers.md#shared-audiences-restrict-the-clients)), and see
+  [Audience](#audience-which-value-to-configure) for what a client_id
+  audience means. Any further claim policy (a tenant, a group) can be
+  required with `required_claims`.
 - **Per-route or per-operation scopes, and scope hierarchies.** Each validator
   has one set of required scopes, matched exactly: there is no way to say
   "`api:write` implies `api:read`". Finer and hierarchy-aware checks are the
@@ -1717,6 +1743,9 @@ logs; in code, match `InvalidToken::kind()` instead. The validator and key-set m
 | `token header lists critical extensions (crit), ...` | The authorization server marked the token with a JWS extension this crate cannot process (RFC 7515 §4.1.11). Configure it not to. |
 | `token nbf is not a NumericDate ...` | The token's `nbf` is a string or out-of-range number. The authorization server is emitting a malformed token. |
 | `token is sender-constrained (cnf); ...` | The token is DPoP- or mTLS-bound, which this crate cannot verify. Configure the client or server to issue plain bearer tokens for this API. |
+| `token client "..." is not in ...allowed_client_ids`, or `token names no client (client_id or azp) ...` | The token was issued to a client you did not list, or names its client in another claim (Okta: `cid`; require that with `required_claims` instead). |
+| `token was issued ...s ago, over ...max_token_age_secs`, or `token has no iat and ...max_token_age_secs is set` | The token is older than you allow, or carries no `iat`. Lower the authorization server's token lifetime, or unset `max_token_age_secs` if it cannot emit `iat`. |
+| `token has no "..." claim, which ...required_claims requires`, or `token claim "..." does not match ...required_claims` | A `required_claims` entry failed. Decode a real token and compare the claim's name, type and value (`"1"` is not `1`). |
 | `credential is not a JWT (...)` | The token is opaque, or it is a mistyped static token. Configure the authorization server to issue JWT access tokens (Authelia: `access_token_signed_response_alg`; Ory Hydra: `strategies.access_token: jwt`; Zitadel: the JWT token type). |
 | `token rejected: InvalidAudience` | `aud` contains none of the configured audiences. Decode a real token and copy its `aud` into `audience`; see [Audience](#audience-which-value-to-configure). |
 | `token rejected: InvalidIssuer`, or `token iss is not a single string equal to ...` | `issuer` differs from the token's `iss`, most often by a trailing slash. Copy it from the discovery document exactly. |
@@ -1747,7 +1776,7 @@ keys are public, so anything that trusts them trusts everyone):
 
 ```toml
 [dev-dependencies]
-oauth-resource-server = { version = "0.1", features = ["testing"] }
+oauth-resource-server = { version = "0.2", features = ["testing"] }
 ```
 
 `testing::TestAuthority` is a fake authorization server on a loopback port. It
@@ -1859,8 +1888,8 @@ a vulnerability, where a forged, expired, wrongly-audienced or otherwise
 out-of-policy token was being accepted, ships as a patch release even though
 it refuses tokens that were accepted before. It comes with a `CHANGELOG.md`
 entry and a security advisory. Holding such a fix for the next minor release
-would leave everyone on the usual `"0.1"` requirement unprotected. If you pin
-an exact version (`=0.1.x`), expect a patch to narrow what is accepted when it
+would leave everyone on the usual `"0.2"` requirement unprotected. If you pin
+an exact version (`=0.2.x`), expect a patch to narrow what is accepted when it
 fixes a vulnerability.
 
 A new minor release is required for:

@@ -47,6 +47,39 @@ response body are byte-for-byte what 0.1 sent.
   crate made now fails (the hand-built one is kind `Other`): assert
   `kind()` instead, or compare the detail. Stop string-matching reasons:
   match `kind()`, and use `kind().as_str()` as a metrics label.
+- **`OAuthConfig` has three new fields, all default-off**, so a config that
+  sets none of them validates exactly as in 0.1. Breaking only for an
+  exhaustive `OAuthConfig { .. }` literal or pattern that names every field:
+  add `..OAuthConfig::default()` (functional-record update and serde/env
+  configs are unaffected). Each is also on `ResolvedOAuthConfig`, has an env
+  variable, and is checked in `OAuthValidator::verify` after the single
+  signature-and-claims `decode` and the existing `iss`/`nbf`/`cnf` rechecks,
+  before the scope check (so each refusal is a 401, never a 403). Closes
+  oauth-resource-server#7.
+  - `allowed_client_ids: Vec<String>` (`<PREFIX>ALLOWED_CLIENT_IDS`,
+    whitespace-split): the token's `client_id`, else `azp` (the same reading
+    as `AuthorizedToken::client_id`, now shared), must be listed; no client
+    or another one is `InvalidTokenKind::ClientNotAllowed`. For
+    authorization servers that stamp an audience shared by many clients.
+  - `max_token_age_secs: Option<u64>` (`<PREFIX>MAX_TOKEN_AGE_SECS`):
+    `now - iat` may not exceed it plus `leeway_secs` (`TokenTooOld`); with
+    it set, a missing `iat` is `MissingClaim`, a non-NumericDate one
+    `MalformedClaim`, and one more than the leeway in the future
+    `NotYetValid`. `resolve` refuses `0` and anything over the new
+    `MAX_TOKEN_AGE_SECS` (30 days) with `ProblemKind::TokenAgeOutOfRange`.
+  - `required_claims: BTreeMap<String, serde_json::Value>`
+    (`<PREFIX>REQUIRED_CLAIMS`, one JSON object): each claim must equal the
+    value (JSON equality) or, when the token's claim is an array, contain it.
+    Missing is `MissingClaim`, anything else (`null`, an object, an array
+    without it) `ClaimMismatch`. `resolve` refuses a blank name, one of
+    `iss`/`aud`/`exp`/`nbf`/`iat`/`cnf` (already checked by this crate), and
+    a value that is not a string, number or boolean
+    (`ProblemKind::InvalidRequiredClaim`).
+  - New `InvalidTokenKind` variants `ClientNotAllowed`, `TokenTooOld`,
+    `ClaimMismatch`; new `ProblemKind` variants `TokenAgeOutOfRange`,
+    `InvalidRequiredClaim` (a blank `allowed_client_ids` entry is
+    `EmptyListEntry`); new constant `MAX_TOKEN_AGE_SECS`.
+- `Cargo.toml`'s version is `0.2.0`.
 
 ### Added
 

@@ -20,8 +20,8 @@ use crate::jwks::{
     background_retry_delay, http_clients, keyless_retry_delay, redact_url,
 };
 use crate::token::{
-    AuthorizedToken, InvalidTokenKind, MAX_TOKEN_BYTES, TokenRejection, check_typ,
-    extract_principal, extract_scopes, for_log,
+    AuthorizedToken, InvalidTokenKind, MAX_TOKEN_BYTES, TokenRejection, check_typ, client_id_of,
+    extract_principal, extract_scopes, for_log, numeric_date_secs,
 };
 
 /// Why an [`OAuthValidator`] could not be built.
@@ -662,7 +662,11 @@ impl OAuthValidator {
     ///   not-yet-valid token, an `nbf` that is not a NumericDate, or a
     ///   sender-constrained token (a `cnf` claim: DPoP, RFC 9449 §7.2, or
     ///   mTLS, RFC 8705 §3), which this crate cannot verify the binding of and
-    ///   so will not accept as a plain bearer token.
+    ///   so will not accept as a plain bearer token; and, only when configured,
+    ///   a client not in `allowed_client_ids`, a token older than
+    ///   `max_token_age_secs` (or without a readable `iat`), or a
+    ///   `required_claims` entry missing or not matched. Its
+    ///   [`InvalidToken::kind`](crate::InvalidToken::kind) says which.
     /// - [`TokenRejection::InsufficientScope`] for a valid token that lacks a
     ///   required scope.
     ///
@@ -800,7 +804,7 @@ impl OAuthValidator {
 
     /// Signature, then issuer / audience / expiry / not-before, then the
     /// claims the decoder does not police (`iss` shape, `nbf` type, `cnf`),
-    /// then scope, against `key` — which [`OAuthValidator::check_header`]'s
+    /// then the opt-in claim policy, then scope, against `key` — which [`OAuthValidator::check_header`]'s
     /// output selected.
     fn verify(
         &self,
@@ -859,6 +863,12 @@ impl OAuthValidator {
             ));
         }
 
+        // The opt-in claim policy (`allowed_client_ids`, `max_token_age_secs`,
+        // `required_claims`). It reads `claims`, which only exist once `decode`
+        // has verified the signature, and runs before the scope check so a
+        // token that fails it is a 401, never a 403.
+        self.check_claim_policy(&claims)?;
+
         let scopes = extract_scopes(&claims, &self.config.scope_claims);
         let principal = extract_principal(&claims, &self.config.principal_claims);
         let subject = claims
@@ -891,6 +901,93 @@ impl OAuthValidator {
         Ok(AuthorizedToken::from_verified_claims(
             claims, subject, principal, scopes,
         ))
+    }
+
+    /// The default-off checks on verified claims: the client allowlist, the
+    /// maximum token age and the required claims, in that order. Called by
+    /// [`OAuthValidator::verify`] only, on the claim set its `decode` produced.
+    fn check_claim_policy(&self, claims: &Map<String, Value>) -> Result<(), TokenRejection> {
+        let config = &self.config;
+        if !config.allowed_client_ids.is_empty() {
+            match client_id_of(claims) {
+                Some(client) if config.allowed_client_ids.iter().any(|c| c == client) => {}
+                Some(client) => {
+                    return Err(TokenRejection::invalid(
+                        InvalidTokenKind::ClientNotAllowed,
+                        format!(
+                            "token client {:?} is not in {}",
+                            for_log(client),
+                            config.key_naming.key("allowed_client_ids")
+                        ),
+                    ));
+                }
+                None => {
+                    return Err(TokenRejection::invalid(
+                        InvalidTokenKind::ClientNotAllowed,
+                        format!(
+                            "token names no client (client_id or azp) and {} is set",
+                            config.key_naming.key("allowed_client_ids")
+                        ),
+                    ));
+                }
+            }
+        }
+
+        if let Some(max_age) = config.max_token_age_secs {
+            let key = config.key_naming.key("max_token_age_secs");
+            let Some(iat) = claims.get("iat") else {
+                return Err(TokenRejection::invalid(
+                    InvalidTokenKind::MissingClaim,
+                    format!("token has no iat and {key} is set"),
+                ));
+            };
+            let Some(iat) = numeric_date_secs(iat) else {
+                return Err(TokenRejection::invalid(
+                    InvalidTokenKind::MalformedClaim,
+                    "token iat is not a NumericDate (a non-negative number of seconds)",
+                ));
+            };
+            let now = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map_or(0, |d| d.as_secs());
+            let leeway = config.leeway_secs;
+            if iat > now.saturating_add(leeway) {
+                return Err(TokenRejection::invalid(
+                    InvalidTokenKind::NotYetValid,
+                    format!("token iat is {}s in the future", iat - now),
+                ));
+            }
+            let age = now.saturating_sub(iat);
+            if age > max_age.saturating_add(leeway) {
+                return Err(TokenRejection::invalid(
+                    InvalidTokenKind::TokenTooOld,
+                    format!("token was issued {age}s ago, over {key} {max_age}"),
+                ));
+            }
+        }
+
+        for (name, required) in &config.required_claims {
+            let key = config.key_naming.key("required_claims");
+            match claims.get(name) {
+                None => {
+                    return Err(TokenRejection::invalid(
+                        InvalidTokenKind::MissingClaim,
+                        format!(
+                            "token has no {:?} claim, which {key} requires",
+                            for_log(name)
+                        ),
+                    ));
+                }
+                Some(actual) if claim_matches(actual, required) => {}
+                Some(_) => {
+                    return Err(TokenRejection::invalid(
+                        InvalidTokenKind::ClaimMismatch,
+                        format!("token claim {:?} does not match {key}", for_log(name)),
+                    ));
+                }
+            }
+        }
+        Ok(())
     }
 
     /// Load (or reload) the key set now, discovering the JWKS URI first if needed.
@@ -1172,6 +1269,15 @@ fn decode_error_kind(kind: &jsonwebtoken::errors::ErrorKind) -> InvalidTokenKind
         // refusal: the kind only labels it.
         _ => InvalidTokenKind::Other,
     }
+}
+
+/// Whether a token's claim satisfies a `required_claims` value: equal to it
+/// (JSON equality), or an array with an element equal to it. `required` is a
+/// string, number or boolean (`resolve` refuses anything else); a hand-edited
+/// `null`, array or object is matched by the same rule, never widened.
+fn claim_matches(actual: &Value, required: &Value) -> bool {
+    actual == required
+        || matches!(actual, Value::Array(items) if items.iter().any(|item| item == required))
 }
 
 /// Whether `nbf` is a NumericDate jsonwebtoken actually checks: a non-negative
@@ -3825,5 +3931,338 @@ mod tests {
             );
         }
         assert_eq!(jwks.hits.load(Ordering::SeqCst), 1);
+    }
+
+    // ── claim policy: allowed_client_ids, max_token_age_secs, required_claims ─
+
+    /// A validator with `adjust` applied to the fixture config.
+    async fn policy_validator(
+        adjust: impl FnOnce(&mut ResolvedOAuthConfig),
+    ) -> (FakeJwksServer, OAuthValidator) {
+        let jwks = spawn_jwks_server("200 OK", jwks_body()).await;
+        let mut cfg = oauth_config(&jwks.url);
+        adjust(&mut cfg);
+        let v = validator_with(cfg);
+        (jwks, v)
+    }
+
+    async fn outcome(v: &OAuthValidator, extra: serde_json::Value) -> Result<(), InvalidTokenKind> {
+        match v.validate(&mint(KEY_A_PEM, KID_A, &scoped(extra))).await {
+            Ok(_) => Ok(()),
+            Err(TokenRejection::Invalid(invalid)) => Err(invalid.kind()),
+            Err(other) => panic!("expected Ok or Invalid, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn allowed_client_ids_match_client_id_then_azp() {
+        use InvalidTokenKind as K;
+        let (_jwks, v) = policy_validator(|c| {
+            c.allowed_client_ids = vec!["client-a".into(), "client-b".into()];
+        })
+        .await;
+        let cases = [
+            (serde_json::json!({"client_id": "client-a"}), Ok(())),
+            (serde_json::json!({"azp": "client-b"}), Ok(())),
+            // An empty `client_id` is no client_id: `azp` decides.
+            (
+                serde_json::json!({"client_id": "", "azp": "client-a"}),
+                Ok(()),
+            ),
+            // `client_id` wins over `azp`, so a listed `azp` cannot rescue an
+            // unlisted `client_id`.
+            (
+                serde_json::json!({"client_id": "client-x", "azp": "client-a"}),
+                Err(K::ClientNotAllowed),
+            ),
+            (
+                serde_json::json!({"azp": "client-x"}),
+                Err(K::ClientNotAllowed),
+            ),
+            // Exact, case-sensitive.
+            (
+                serde_json::json!({"client_id": "CLIENT-A"}),
+                Err(K::ClientNotAllowed),
+            ),
+            // No client at all, or not as a string.
+            (serde_json::json!({}), Err(K::ClientNotAllowed)),
+            (
+                serde_json::json!({"client_id": 7}),
+                Err(K::ClientNotAllowed),
+            ),
+        ];
+        for (extra, want) in cases {
+            assert_eq!(outcome(&v, extra.clone()).await, want, "{extra}");
+        }
+        // A disallowed client is a 401 even when the scope is missing too:
+        // the claim policy runs before the scope check.
+        let unscoped = mint(
+            KEY_A_PEM,
+            KID_A,
+            &claims(serde_json::json!({"client_id": "client-x"})),
+        );
+        assert_eq!(kind_of(v.validate(&unscoped).await), K::ClientNotAllowed);
+        // And a listed client still needs its scope: 403.
+        let unscoped = mint(
+            KEY_A_PEM,
+            KID_A,
+            &claims(serde_json::json!({"client_id": "client-a"})),
+        );
+        assert_eq!(
+            v.validate(&unscoped).await.unwrap_err(),
+            TokenRejection::InsufficientScope
+        );
+        // The accepted token reports the client the check used.
+        let t = v
+            .validate(&mint(
+                KEY_A_PEM,
+                KID_A,
+                &scoped(serde_json::json!({"client_id": "", "azp": "client-b"})),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(t.client_id.as_deref(), Some("client-b"));
+    }
+
+    #[tokio::test]
+    async fn max_token_age_bounds_iat_with_the_leeway() {
+        use InvalidTokenKind as K;
+        let (_jwks, v) = policy_validator(|c| {
+            c.max_token_age_secs = Some(600);
+            c.leeway_secs = 60;
+        })
+        .await;
+        let t = now();
+        let cases = [
+            (serde_json::json!({"iat": t}), Ok(())),
+            (serde_json::json!({"iat": t - 600}), Ok(())),
+            // Within the leeway past the limit: accepted.
+            (serde_json::json!({"iat": t - 600 - 50}), Ok(())),
+            (
+                serde_json::json!({"iat": t - 600 - 70}),
+                Err(K::TokenTooOld),
+            ),
+            (serde_json::json!({"iat": 0}), Err(K::TokenTooOld)),
+            // A fractional iat is rounded as jsonwebtoken rounds exp.
+            (serde_json::json!({"iat": t as f64 - 0.4}), Ok(())),
+            // Issued in the future: within the leeway is clock skew, beyond it
+            // is refused (it would otherwise dodge the age bound).
+            (serde_json::json!({"iat": t + 50}), Ok(())),
+            (serde_json::json!({"iat": t + 3600}), Err(K::NotYetValid)),
+            (serde_json::json!({"iat": u64::MAX}), Err(K::NotYetValid)),
+            // With the bound set, `iat` is required and must be a NumericDate.
+            (serde_json::json!({}), Err(K::MissingClaim)),
+            (
+                serde_json::json!({"iat": t.to_string()}),
+                Err(K::MalformedClaim),
+            ),
+            (serde_json::json!({"iat": -1}), Err(K::MalformedClaim)),
+            (serde_json::json!({"iat": null}), Err(K::MalformedClaim)),
+        ];
+        for (extra, want) in cases {
+            assert_eq!(outcome(&v, extra.clone()).await, want, "{extra}");
+        }
+    }
+
+    #[tokio::test]
+    async fn required_claims_match_exactly_or_by_array_membership() {
+        use InvalidTokenKind as K;
+        let (_jwks, v) = policy_validator(|c| {
+            c.required_claims = [
+                ("tid".to_string(), serde_json::json!("tenant-1")),
+                ("groups".to_string(), serde_json::json!("api-users")),
+            ]
+            .into_iter()
+            .collect();
+        })
+        .await;
+        let ok = serde_json::json!({"tid": "tenant-1", "groups": ["x", "api-users"]});
+        let cases = [
+            (ok.clone(), Ok(())),
+            (
+                serde_json::json!({"tid": "tenant-1", "groups": "api-users"}),
+                Ok(()),
+            ),
+            (
+                serde_json::json!({"tid": ["tenant-1"], "groups": "api-users"}),
+                Ok(()),
+            ),
+            (
+                serde_json::json!({"tid": "tenant-2", "groups": "api-users"}),
+                Err(K::ClaimMismatch),
+            ),
+            (
+                serde_json::json!({"tid": "tenant-1", "groups": ["admins"]}),
+                Err(K::ClaimMismatch),
+            ),
+            (
+                serde_json::json!({"tid": "tenant-1", "groups": []}),
+                Err(K::ClaimMismatch),
+            ),
+            (
+                serde_json::json!({"tid": "tenant-1", "groups": null}),
+                Err(K::ClaimMismatch),
+            ),
+            (
+                serde_json::json!({"tid": "tenant-1", "groups": {"api-users": true}}),
+                Err(K::ClaimMismatch),
+            ),
+            // Nested arrays are not searched.
+            (
+                serde_json::json!({"tid": "tenant-1", "groups": [["api-users"]]}),
+                Err(K::ClaimMismatch),
+            ),
+            (
+                serde_json::json!({"groups": "api-users"}),
+                Err(K::MissingClaim),
+            ),
+            (serde_json::json!({"tid": "tenant-1"}), Err(K::MissingClaim)),
+        ];
+        for (extra, want) in cases {
+            assert_eq!(outcome(&v, extra.clone()).await, want, "{extra}");
+        }
+
+        // Numbers and booleans: JSON equality, so the type matters.
+        let (_jwks, v) = policy_validator(|c| {
+            c.required_claims = [
+                ("level".to_string(), serde_json::json!(3)),
+                ("mfa".to_string(), serde_json::json!(true)),
+            ]
+            .into_iter()
+            .collect();
+        })
+        .await;
+        let cases = [
+            (serde_json::json!({"level": 3, "mfa": true}), Ok(())),
+            (serde_json::json!({"level": [1, 3], "mfa": true}), Ok(())),
+            (
+                serde_json::json!({"level": "3", "mfa": true}),
+                Err(K::ClaimMismatch),
+            ),
+            (
+                serde_json::json!({"level": 3, "mfa": "true"}),
+                Err(K::ClaimMismatch),
+            ),
+            (
+                serde_json::json!({"level": 3, "mfa": false}),
+                Err(K::ClaimMismatch),
+            ),
+        ];
+        for (extra, want) in cases {
+            assert_eq!(outcome(&v, extra.clone()).await, want, "{extra}");
+        }
+    }
+
+    /// The three checks run in order (client, age, claims), after the
+    /// signature, and every one of them is off by default: a token that
+    /// carries none of `client_id`, `azp`, `iat` or any custom claim
+    /// validates exactly as before.
+    #[tokio::test]
+    async fn the_claim_policy_is_off_by_default_and_never_runs_before_the_signature() {
+        let (_jwks, v) = policy_validator(|_| {}).await;
+        assert!(v.config().allowed_client_ids.is_empty());
+        assert_eq!(v.config().max_token_age_secs, None);
+        assert!(v.config().required_claims.is_empty());
+        let bare = claims(serde_json::json!({"scope": "mcp:read"}));
+        for claim in ["client_id", "azp", "iat"] {
+            assert!(bare.get(claim).is_none());
+        }
+        assert!(v.validate(&mint(KEY_A_PEM, KID_A, &bare)).await.is_ok());
+
+        let (_jwks, v) = policy_validator(|c| {
+            c.allowed_client_ids = vec!["client-a".into()];
+            c.max_token_age_secs = Some(600);
+            c.required_claims = [("tid".to_string(), serde_json::json!("t"))]
+                .into_iter()
+                .collect();
+        })
+        .await;
+        // A forged token carrying every wanted claim is still a bad signature.
+        let wanted = scoped(serde_json::json!({"client_id": "client-a", "iat": now(), "tid": "t"}));
+        assert_eq!(
+            kind_of(v.validate(&mint(KEY_B_PEM, KID_A, &wanted)).await),
+            InvalidTokenKind::BadSignature
+        );
+        assert!(v.validate(&mint(KEY_A_PEM, KID_A, &wanted)).await.is_ok());
+        // An expired token is `Expired`, not judged by the policy.
+        let mut expired = wanted.clone();
+        expired["exp"] = serde_json::json!(now() - 3600);
+        assert_eq!(
+            kind_of(v.validate(&mint(KEY_A_PEM, KID_A, &expired)).await),
+            InvalidTokenKind::Expired
+        );
+        // Order: the client check is reported first, then the age.
+        let mut both = wanted.clone();
+        both["client_id"] = serde_json::json!("client-x");
+        both.as_object_mut().unwrap().remove("iat");
+        assert_eq!(
+            kind_of(v.validate(&mint(KEY_A_PEM, KID_A, &both)).await),
+            InvalidTokenKind::ClientNotAllowed
+        );
+        let mut age_and_claim = wanted.clone();
+        age_and_claim.as_object_mut().unwrap().remove("iat");
+        age_and_claim["tid"] = serde_json::json!("other");
+        assert_eq!(
+            kind_of(v.validate(&mint(KEY_A_PEM, KID_A, &age_and_claim)).await),
+            InvalidTokenKind::MissingClaim
+        );
+    }
+
+    /// Documented-shape fixture, not live-tested: restricting a shared
+    /// audience to known clients. Auth0 names the client in `azp`, which
+    /// `allowed_client_ids` reads; Okta's custom authorization server names it
+    /// in `cid`, which it does not, so an Okta deployment requires `cid` with
+    /// `required_claims` instead.
+    #[tokio::test]
+    async fn documented_shape_fixture_not_live_tested_shared_audience_client_restriction() {
+        let jwks = spawn_jwks_server("200 OK", jwks_body()).await;
+
+        let auth0 = "https://tenant.example.auth0.com/";
+        let mut cfg = oauth_config(&jwks.url);
+        cfg.issuer = auth0.into();
+        cfg.audience = "https://kb.example.com/mcp".into();
+        cfg.allowed_client_ids = vec!["client".into()];
+        let v = validator_with(cfg);
+        let auth0_token = |azp: &str| {
+            mint(
+                KEY_A_PEM,
+                KID_A,
+                &serde_json::json!({
+                    "iss": auth0,
+                    "aud": ["https://kb.example.com/mcp", "https://tenant.example.auth0.com/userinfo"],
+                    "azp": azp, "sub": "auth0|1", "exp": now() + 3600,
+                    "scope": "openid mcp:read",
+                }),
+            )
+        };
+        assert!(v.validate(&auth0_token("client")).await.is_ok());
+        assert_eq!(
+            kind_of(v.validate(&auth0_token("another-client")).await),
+            InvalidTokenKind::ClientNotAllowed
+        );
+
+        let okta = "https://example.okta.com/oauth2/default";
+        let mut cfg = oauth_config(&jwks.url);
+        cfg.issuer = okta.into();
+        cfg.audience = "api://default".into();
+        cfg.required_claims = [("cid".to_string(), serde_json::json!("client"))]
+            .into_iter()
+            .collect();
+        let v = validator_with(cfg);
+        let okta_token = |cid: &str| {
+            mint(
+                KEY_A_PEM,
+                KID_A,
+                &serde_json::json!({
+                    "iss": okta, "aud": "api://default", "cid": cid, "sub": "a@example.com",
+                    "exp": now() + 3600, "scp": ["openid", "mcp:read"],
+                }),
+            )
+        };
+        assert!(v.validate(&okta_token("client")).await.is_ok());
+        assert_eq!(
+            kind_of(v.validate(&okta_token("another-client")).await),
+            InvalidTokenKind::ClaimMismatch
+        );
     }
 }

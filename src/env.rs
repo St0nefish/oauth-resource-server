@@ -196,7 +196,7 @@ pub fn secret_from_lookup(
 
 /// Split a whitespace-separated list value (`required_scopes`,
 /// `scopes_supported`, `scope_claims`, `principal_claims`, `algorithms`,
-/// `audiences`) into its entries.
+/// `audiences`, `allowed_client_ids`) into its entries.
 fn split_list(value: &str) -> Vec<String> {
     value.split_whitespace().map(str::to_string).collect()
 }
@@ -325,7 +325,9 @@ impl IdentifyingVars {
 /// Once on, every field is read (each through [`secret_from_lookup`], so
 /// `<FIELD>_FILE` works too), list-valued fields are split on whitespace,
 /// `bool` fields are parsed strictly (`"true"`/`"false"` only), integer fields
-/// are parsed as decimal, and every problem — a variable that failed to load,
+/// are parsed as decimal (`MAX_TOKEN_AGE_SECS` set to a number means
+/// `Some(number)`), `<PREFIX>REQUIRED_CLAIMS` is one JSON object
+/// (`{"tid": "<tenant id>", "groups": "api-users"}`), and every problem — a variable that failed to load,
 /// a value that failed to parse, or a problem [`OAuthConfig::resolve`] itself
 /// found — is collected into one [`ConfigError`], never reported one at a
 /// time across repeated runs. The loader's own problems come first. A
@@ -715,6 +717,47 @@ where
                 format!(
                     "{} {v:?} is not a valid non-negative integer",
                     naming.key("leeway_secs")
+                ),
+            )),
+        }
+    }
+    if let Some(v) = take(field("allowed_client_ids"), &mut problems) {
+        cfg.allowed_client_ids = split_list(&v);
+    }
+    if let Some(v) = take(field("max_token_age_secs"), &mut problems) {
+        match v.parse::<u64>() {
+            Ok(n) => cfg.max_token_age_secs = Some(n),
+            Err(_) => problems.push(ConfigProblem::new(
+                ProblemKind::EnvParse,
+                [naming.key("max_token_age_secs")],
+                format!(
+                    "{} {v:?} is not a valid non-negative integer",
+                    naming.key("max_token_age_secs")
+                ),
+            )),
+        }
+    }
+    if let Some(v) = take(field("required_claims"), &mut problems) {
+        // One JSON object, `{"claim": value, ...}`: a claim value can be a
+        // string, number or boolean, which a whitespace-split list cannot
+        // carry. `resolve` checks the entries themselves.
+        match serde_json::from_str::<serde_json::Value>(&v) {
+            Ok(serde_json::Value::Object(map)) => cfg.required_claims = map.into_iter().collect(),
+            Ok(_) => problems.push(ConfigProblem::new(
+                ProblemKind::EnvParse,
+                [naming.key("required_claims")],
+                format!(
+                    "{} must be a JSON object, e.g. {{\"tid\": \"<tenant id>\"}}",
+                    naming.key("required_claims")
+                ),
+            )),
+            Err(e) => problems.push(ConfigProblem::new(
+                ProblemKind::EnvParse,
+                [naming.key("required_claims")],
+                format!(
+                    "{} is not valid JSON ({e}); it must be a JSON object, e.g. \
+                     {{\"tid\": \"<tenant id>\"}}",
+                    naming.key("required_claims")
                 ),
             )),
         }
@@ -1697,6 +1740,125 @@ mod tests {
         assert_eq!(
             oauth_config_from_env("OAUTH_RESOURCE_SERVER_ENV_RS_TEST_UNSET_9f3c_"),
             Ok(None)
+        );
+    }
+    // ── allowed_client_ids, max_token_age_secs, required_claims ─────────────
+
+    fn policy_vars() -> HashMap<&'static str, &'static str> {
+        HashMap::from([
+            ("APP_OAUTH_ISSUER", "https://idp.example.test/"),
+            ("APP_OAUTH_AUDIENCE", "client-a"),
+            ("APP_OAUTH_RESOURCE", "https://kb.example.test/"),
+            ("APP_OAUTH_REQUIRED_SCOPE", "api:read"),
+        ])
+    }
+
+    #[test]
+    fn the_claim_policy_settings_load_from_their_variables() {
+        let mut vars = policy_vars();
+        vars.insert("APP_OAUTH_ALLOWED_CLIENT_IDS", "client-a  client-b");
+        vars.insert("APP_OAUTH_MAX_TOKEN_AGE_SECS", "3600");
+        vars.insert(
+            "APP_OAUTH_REQUIRED_CLAIMS",
+            r#"{"tid": "tenant-1", "level": 2, "mfa": true}"#,
+        );
+        let files = HashMap::new();
+        let resolved =
+            oauth_config_from_lookup("APP_OAUTH_", lookup_from(&vars), files_from(&files))
+                .unwrap()
+                .unwrap();
+        assert_eq!(resolved.allowed_client_ids, ["client-a", "client-b"]);
+        assert_eq!(resolved.max_token_age_secs, Some(3600));
+        assert_eq!(
+            resolved.required_claims,
+            [
+                ("level".to_string(), serde_json::json!(2)),
+                ("mfa".to_string(), serde_json::json!(true)),
+                ("tid".to_string(), serde_json::json!("tenant-1")),
+            ]
+            .into_iter()
+            .collect()
+        );
+
+        // Unset: every one stays off.
+        let vars = policy_vars();
+        let resolved =
+            oauth_config_from_lookup("APP_OAUTH_", lookup_from(&vars), files_from(&files))
+                .unwrap()
+                .unwrap();
+        assert!(resolved.allowed_client_ids.is_empty());
+        assert_eq!(resolved.max_token_age_secs, None);
+        assert!(resolved.required_claims.is_empty());
+    }
+
+    #[test]
+    fn claim_policy_parse_and_resolve_problems_are_reported_together() {
+        let mut vars = policy_vars();
+        vars.insert("APP_OAUTH_MAX_TOKEN_AGE_SECS", "an hour");
+        vars.insert("APP_OAUTH_REQUIRED_CLAIMS", r#"["tid"]"#);
+        let files = HashMap::new();
+        let err = oauth_config_from_lookup("APP_OAUTH_", lookup_from(&vars), files_from(&files))
+            .unwrap_err();
+        let got: Vec<_> = err
+            .problem_details()
+            .iter()
+            .map(|p| (p.kind(), p.keys().to_vec()))
+            .collect();
+        assert_eq!(
+            got,
+            [
+                (
+                    ProblemKind::EnvParse,
+                    vec!["APP_OAUTH_MAX_TOKEN_AGE_SECS".to_string()]
+                ),
+                (
+                    ProblemKind::EnvParse,
+                    vec!["APP_OAUTH_REQUIRED_CLAIMS".to_string()]
+                ),
+            ]
+        );
+        assert!(err.problems[1].contains("must be a JSON object"), "{err}");
+
+        // Not JSON at all.
+        let mut vars = policy_vars();
+        vars.insert("APP_OAUTH_REQUIRED_CLAIMS", "tid=tenant-1");
+        let err = oauth_config_from_lookup("APP_OAUTH_", lookup_from(&vars), files_from(&files))
+            .unwrap_err();
+        assert_eq!(err.problem_details()[0].kind(), ProblemKind::EnvParse);
+        assert!(err.problems[0].contains("is not valid JSON"), "{err}");
+
+        // Loaded fine, refused by `resolve`, named as variables — every one at
+        // once.
+        let mut vars = policy_vars();
+        vars.insert("APP_OAUTH_ALLOWED_CLIENT_IDS", "client-a");
+        vars.insert("APP_OAUTH_MAX_TOKEN_AGE_SECS", "0");
+        vars.insert(
+            "APP_OAUTH_REQUIRED_CLAIMS",
+            r#"{"aud": "x", "org": {"id": 1}}"#,
+        );
+        let err = oauth_config_from_lookup("APP_OAUTH_", lookup_from(&vars), files_from(&files))
+            .unwrap_err();
+        let got: Vec<_> = err
+            .problem_details()
+            .iter()
+            .map(|p| (p.kind(), p.keys().to_vec()))
+            .collect();
+        assert_eq!(
+            got,
+            [
+                (
+                    ProblemKind::TokenAgeOutOfRange,
+                    vec!["APP_OAUTH_MAX_TOKEN_AGE_SECS".to_string()]
+                ),
+                (
+                    ProblemKind::InvalidRequiredClaim,
+                    vec!["APP_OAUTH_REQUIRED_CLAIMS".to_string()]
+                ),
+                (
+                    ProblemKind::InvalidRequiredClaim,
+                    vec!["APP_OAUTH_REQUIRED_CLAIMS".to_string()]
+                ),
+            ]
         );
     }
 }

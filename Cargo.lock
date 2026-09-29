@@ -687,7 +687,7 @@ dependencies = [
 
 [[package]]
 name = "oauth-resource-server"
-version = "0.1.2"
+version = "0.2.0"
 dependencies = [
  "axum",
  "base64 0.23.1",

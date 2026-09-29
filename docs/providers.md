@@ -210,15 +210,33 @@ token with the checklist below.
 | Provider | Test | Shape notes |
 |---|---|---|
 | Keycloak | `documented_shape_fixture_not_live_tested_keycloak` | Realm issuer; `typ: JWT` (`at+jwt` is an opt-in client switch since 26.2); `scope` string; `aud` includes the client (set `audience` to it); `azp` names the client; `preferred_username` present. |
-| Okta (custom authorization server) | `documented_shape_fixture_not_live_tested_okta_custom_as` | No `typ` header at all; `scp` array; `aud` is the configured API audience; `cid` names the client. |
+| Okta (custom authorization server) | `documented_shape_fixture_not_live_tested_okta_custom_as` | No `typ` header at all; `scp` array; `aud` is the configured API audience, shared by every client granted it; `cid` names the client, which `allowed_client_ids` does not read, so restrict clients with `required_claims: {cid: "<client id>"}` (see [Shared audiences](#shared-audiences-restrict-the-clients)). |
 | Microsoft Entra ID (v2.0) | `documented_shape_fixture_not_live_tested_entra_id_v2` | `typ: JWT`; `scp` a space-delimited string; `aud` is the API's own client id. |
-| Auth0 | `documented_shape_fixture_not_live_tested_auth0` | Issuer with a trailing slash; `aud` an array (API identifier plus `/userinfo`); `scope` string; both the classic (`typ: JWT`) and RFC 9068 (`at+jwt`) profiles work. |
+| Auth0 | `documented_shape_fixture_not_live_tested_auth0` | Issuer with a trailing slash; `aud` an array (API identifier plus `/userinfo`); `scope` string; both the classic (`typ: JWT`) and RFC 9068 (`at+jwt`) profiles work. The API identifier is shared by every client granted the API; `azp` names the client, so list yours in `allowed_client_ids` (see [Shared audiences](#shared-audiences-restrict-the-clients)). |
 | Ory Hydra (JWT strategy) | `documented_shape_fixture_not_live_tested_ory_hydra_jwt_strategy` | Only with `strategies.access_token: jwt` set (opaque is Hydra's default); `scp` is a list by default, a string with `oauth2.jwt.scope_claim: string`. |
 | Logto | `documented_shape_fixture_not_live_tested_logto_resource_indicator` | `aud` is the registered API resource indicator (RFC 8707); `scope` string; ES256 among its allowed signing algorithms. |
 | Casdoor | `documented_shape_fixture_not_live_tested_casdoor_jwt_standard` | Source-derived. No `typ` beyond the library default; `aud` is `[client_id]` (or `[resource]` under RFC 8707); `scope` string; `preferred_username` present with the JWT-Standard token format. |
 | Rauthy | `documented_shape_fixture_not_live_tested_rauthy_eddsa_at_jwt` | Source-derived. `typ: at+jwt`; `scope` string; EdDSA available per client; no `preferred_username` (the principal chain falls to `sub`). |
 | Dex | `documented_shape_fixture_not_live_tested_dex_needs_a_group_claim_as_scope` | Source-derived. Dex's "access token" is really an ID token: `aud` is the client_id, and there is no `scope`/`scp` claim at all. The only generic way to gate it is to point `scope_claims` at a group claim (`scope_claims: ["groups"]`, `required_scopes: ["<group>"]`; the group name must be a valid scope-token, so no spaces), a deliberate compromise: configuration can approximate a scope check this way, and this crate adds no Dex-specific code path to do better. Set `scopes_supported` to the scopes a client must request for Dex to emit that claim (`["openid", "groups"]`), not to the group: a group is not a requestable scope. The startup `warn` that the required "scope" is not in `scopes_supported` is then expected, and harmless here. Because the tokens are ID tokens, the required group is the only gate: any token Dex signs for the client whose `groups` contains it is accepted. |
 | Zitadel (JWT mode) | `documented_shape_fixture_not_live_tested_zitadel_jwt_mode` | Only with the application's token type switched to JWT (opaque is the alternative). `aud` holds the client ids and the project id. Zitadel's scope-claim shape was not documented where this fixture's author looked, so it exercises only the `aud` array and project id. |
+
+### Shared audiences: restrict the clients
+
+Where the authorization server stamps an audience that names the API rather
+than one client — an Auth0 API identifier, an Okta custom authorization
+server's audience, an Entra ID app ID URI — every client granted that API
+gets a token this crate accepts. Restrict it to the clients you mean to serve:
+
+- **`allowed_client_ids`** when the token names its client in `client_id`
+  (RFC 9068) or `azp` (Auth0, Keycloak): `allowed_client_ids: ["<client id>"]`.
+- **`required_claims`** when the client is in some other claim, such as
+  Okta's `cid`: `required_claims: {cid: "<client id>"}`. A single value only;
+  for several clients there, check `AuthorizedToken::claims()` in the
+  application.
+
+`documented_shape_fixture_not_live_tested_shared_audience_client_restriction`
+exercises both on the Auth0 and Okta shapes above. It is a documented-shape
+fixture, not live-tested.
 
 ## Any other provider: checklist
 
@@ -241,6 +259,10 @@ token with the checklist below.
      whether your server honours RFC 8707 (the resource URL) or stamps the
      client_id. Prefer a resource URL where the server offers one; a
      client_id audience is sound only for a client used by this API alone.
+     If `aud` names the API and several clients can obtain it, also read
+     which claim names the client (`client_id`, `azp`, or something like
+     Okta's `cid`) and restrict it (see [Shared
+     audiences](#shared-audiences-restrict-the-clients)).
    - Where the scopes are: `scope` or `scp`, as a string or an array, all
      work by default. Any other claim goes in `scope_claims`.
    - `typ` in the header: if it is `at+jwt`, turn on `require_at_jwt`.

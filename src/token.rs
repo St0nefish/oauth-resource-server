@@ -83,13 +83,14 @@ pub struct AuthorizedToken {
     /// one later than 9999-12-31T23:59:59Z saturates to that instant. A token built
     /// with [`AuthorizedToken::new`] gets 2100-01-01T00:00:00Z.
     pub expires_at: SystemTime,
-    /// The token's `iat`, when it carried a valid NumericDate. Not otherwise
-    /// checked. Rounded and saturated like
+    /// The token's `iat`, when it carried a valid NumericDate. Checked only
+    /// when [`crate::OAuthConfig::max_token_age_secs`] is set. Rounded and saturated like
     /// [`expires_at`](Self::expires_at); `None` when `iat` is absent or not a
     /// non-negative number (the token is still accepted then). `None` on a token built with [`AuthorizedToken::new`].
     pub issued_at: Option<SystemTime>,
     /// The OAuth client the token was issued to: `client_id` (RFC 9068 §2.2),
-    /// else `azp`, the first that is a non-empty string. `None` when the token
+    /// else `azp`, the first that is a non-empty string — the same reading
+    /// [`crate::OAuthConfig::allowed_client_ids`] is checked against. `None` when the token
     /// carries neither, and on a token built with [`AuthorizedToken::new`].
     pub client_id: Option<String>,
     /// The token's `jti`, when it carried one as a non-empty string. `None` on
@@ -129,6 +130,12 @@ const MAX_TIMESTAMP_SECS: u64 = 253_402_300_799;
 /// [`MAX_TIMESTAMP_SECS`] saturates to it. `None` for anything else (a string, a
 /// negative, a non-finite or out-of-`u64` number). Never panics.
 fn numeric_date(value: &Value) -> Option<SystemTime> {
+    let secs = numeric_date_secs(value)?;
+    Some(UNIX_EPOCH + Duration::from_secs(secs))
+}
+
+/// [`numeric_date`] as whole seconds since the epoch, saturated the same way.
+pub(crate) fn numeric_date_secs(value: &Value) -> Option<u64> {
     let secs = match value.as_u64() {
         Some(secs) => secs,
         None => {
@@ -139,8 +146,19 @@ fn numeric_date(value: &Value) -> Option<SystemTime> {
             f.round() as u64
         }
     };
-    let secs = secs.min(MAX_TIMESTAMP_SECS);
-    Some(UNIX_EPOCH + Duration::from_secs(secs))
+    Some(secs.min(MAX_TIMESTAMP_SECS))
+}
+
+/// The OAuth client a token was issued to: `client_id` (RFC 9068 §2.2), else
+/// `azp`, the first that is a non-empty string. The one reading of it, shared
+/// by [`AuthorizedToken::client_id`] and the `allowed_client_ids` check.
+pub(crate) fn client_id_of(claims: &Map<String, Value>) -> Option<&str> {
+    ["client_id", "azp"].into_iter().find_map(|name| {
+        claims
+            .get(name)
+            .and_then(Value::as_str)
+            .filter(|s| !s.is_empty())
+    })
 }
 
 /// `aud` as a list: a string is one audience, an array contributes its string
@@ -191,7 +209,7 @@ impl AuthorizedToken {
                 .and_then(numeric_date)
                 .unwrap_or(UNIX_EPOCH),
             issued_at: claims.get("iat").and_then(numeric_date),
-            client_id: string_claim("client_id").or_else(|| string_claim("azp")),
+            client_id: client_id_of(&claims).map(str::to_string),
             jti: string_claim("jti"),
             claims: Arc::new(claims),
         }
@@ -645,20 +663,31 @@ pub enum InvalidTokenKind {
     BadSignature,
     /// `exp` is in the past (beyond the configured leeway).
     Expired,
-    /// `nbf` is in the future (beyond the configured leeway).
+    /// `nbf` is in the future (beyond the configured leeway), or, with
+    /// `max_token_age_secs` set, `iat` is.
     NotYetValid,
     /// `iss` is not exactly the configured issuer (including an `iss` array).
     WrongIssuer,
     /// No `aud` entry is an accepted audience.
     WrongAudience,
-    /// A claim the checks need is absent: `exp`, `iss` or `aud`.
+    /// A claim the checks need is absent: `exp`, `iss` or `aud`; `iat` with
+    /// `max_token_age_secs` set; a `required_claims` entry.
     MissingClaim,
-    /// A registered claim has the wrong type: an `nbf` that is not a
-    /// NumericDate.
+    /// A registered claim has the wrong type: an `nbf` (or, with
+    /// `max_token_age_secs` set, an `iat`) that is not a NumericDate.
     MalformedClaim,
     /// The token carries `cnf` (a DPoP or mTLS sender constraint), which this
     /// crate cannot verify and so refuses as a bearer token.
     SenderConstrained,
+    /// `allowed_client_ids` is set and the token's client (`client_id`, else
+    /// `azp`) is absent or not listed.
+    ClientNotAllowed,
+    /// `max_token_age_secs` is set and the token was issued (`iat`) longer ago
+    /// than that, plus the leeway.
+    TokenTooOld,
+    /// A `required_claims` entry is present in the token with another value
+    /// (and, for an array claim, not among its elements).
+    ClaimMismatch,
     /// Only a static token is configured (no OAuth validator) and no
     /// credential is it.
     StaticTokenMismatch,
@@ -695,6 +724,9 @@ impl InvalidTokenKind {
             Self::MissingClaim => "missing_claim",
             Self::MalformedClaim => "malformed_claim",
             Self::SenderConstrained => "sender_constrained",
+            Self::ClientNotAllowed => "client_not_allowed",
+            Self::TokenTooOld => "token_too_old",
+            Self::ClaimMismatch => "claim_mismatch",
             Self::StaticTokenMismatch => "static_token_mismatch",
             Self::NoMechanism => "no_mechanism",
             Self::OAuthTokenRequired => "oauth_token_required",
@@ -1023,6 +1055,9 @@ mod tests {
             K::MissingClaim,
             K::MalformedClaim,
             K::SenderConstrained,
+            K::ClientNotAllowed,
+            K::TokenTooOld,
+            K::ClaimMismatch,
             K::StaticTokenMismatch,
             K::NoMechanism,
             K::OAuthTokenRequired,

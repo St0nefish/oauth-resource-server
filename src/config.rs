@@ -8,7 +8,10 @@
 //! by [`KeyNaming`]. A half-usable OAuth config must fail at startup, with the key
 //! in the message, rather than as a wall of 401s later.
 
+use std::collections::BTreeMap;
 use std::fmt;
+
+use serde_json::Value;
 
 use crate::algorithms::{Algorithm, DEFAULT_ALGORITHMS, parse_algorithm};
 use crate::validator::plain_http_non_loopback;
@@ -35,6 +38,21 @@ pub const DEFAULT_LEEWAY_SECS: u64 = 60;
 /// 900 s tokens) is a way of switching `exp` off, which config must not be able
 /// to do.
 pub const MAX_LEEWAY_SECS: u64 = 300;
+
+/// Ceiling on [`OAuthConfig::max_token_age_secs`]: 30 days. The setting bounds
+/// how long ago a token may have been issued; an access token older than a
+/// month is not something any deployment means to bound *to*, so a larger
+/// value is a typo (seconds meant as minutes, an extra digit), not a policy.
+pub const MAX_TOKEN_AGE_SECS: u64 = 30 * 24 * 3600;
+
+/// Claims [`OAuthConfig::required_claims`] may not name, because this crate
+/// already checks them, or refuses them outright: `iss`, `aud`, `exp` and
+/// `nbf` are validated inside the signature-checking `decode` (an exact-value
+/// requirement on top would either repeat that check or, for `aud`
+/// membership and the time claims, contradict it); `iat` is what
+/// [`OAuthConfig::max_token_age_secs`] bounds (a fixed `iat` would match one
+/// token only); and a token carrying `cnf` is always refused.
+pub(crate) const RESERVED_REQUIRED_CLAIMS: &[&str] = &["iss", "aud", "exp", "nbf", "iat", "cnf"];
 
 /// How problem messages name a setting, so they match how the operator wrote it.
 ///
@@ -158,6 +176,12 @@ pub enum ProblemKind {
     NoAlgorithms,
     /// `leeway_secs` is over [`MAX_LEEWAY_SECS`].
     LeewayTooLarge,
+    /// `max_token_age_secs` is `0` or over [`MAX_TOKEN_AGE_SECS`].
+    TokenAgeOutOfRange,
+    /// A `required_claims` entry has a blank name, names a claim this crate
+    /// already checks (`iss`, `aud`, `exp`, `nbf`, `iat`, `cnf`), or requires
+    /// a value other than a string, number or boolean.
+    InvalidRequiredClaim,
     /// The env loader could not read a variable or its `_FILE` (both set, an
     /// unreadable or empty file).
     EnvLoad,
@@ -186,6 +210,8 @@ impl ProblemKind {
             Self::BadAlgorithm => "bad_algorithm",
             Self::NoAlgorithms => "no_algorithms",
             Self::LeewayTooLarge => "leeway_too_large",
+            Self::TokenAgeOutOfRange => "token_age_out_of_range",
+            Self::InvalidRequiredClaim => "invalid_required_claim",
             Self::EnvLoad => "env_load",
             Self::EnvParse => "env_parse",
             Self::Other => "other",
@@ -660,6 +686,142 @@ pub struct OAuthConfig {
     /// [`crate::static_token_policy`]; the validator itself never looks at it.
     #[cfg_attr(feature = "serde", serde(default = "default_true"))]
     pub accept_static_bearer: bool,
+    /// The OAuth clients whose tokens are accepted. A token's client is its
+    /// `client_id` claim (RFC 9068 §2.2), else its `azp` — the first that is a
+    /// non-empty string, exactly as [`crate::AuthorizedToken::client_id`]
+    /// reads it — and it must equal one entry, byte for byte. A token naming
+    /// no client, or another one, is refused (401,
+    /// [`crate::InvalidTokenKind::ClientNotAllowed`]). `client_id` wins when
+    /// both are present: a token whose `client_id` is not listed is refused
+    /// even if its `azp` is.
+    ///
+    /// Empty (the default) checks nothing. Use it where the audience is
+    /// shared: an authorization server that stamps an API identifier as `aud`
+    /// (Auth0, Okta custom authorization servers, Entra ID app ID URIs) gives
+    /// every client of that API a token this resource server would otherwise
+    /// accept. Entries must not be blank.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// # use oauth_resource_server::{KeyNaming, OAuthConfig};
+    /// let base = OAuthConfig {
+    ///     enabled: true,
+    ///     issuer: "https://auth.example.com/".into(),
+    ///     audience: "https://api.example.com/".into(),
+    ///     resource: "https://api.example.com/".into(),
+    ///     required_scope: Some("api:read".into()),
+    ///     ..OAuthConfig::default()
+    /// };
+    /// let resolved = OAuthConfig {
+    ///     allowed_client_ids: vec!["web-app".into(), "cli".into()],
+    ///     ..base
+    /// }
+    /// .resolve(KeyNaming::Dotted("oauth"))
+    /// .unwrap()
+    /// .unwrap();
+    /// assert_eq!(resolved.allowed_client_ids, ["web-app", "cli"]);
+    /// ```
+    #[cfg_attr(feature = "serde", serde(default))]
+    pub allowed_client_ids: Vec<String>,
+    /// Refuse a token issued more than this many seconds ago: `now - iat`
+    /// must not exceed it, with [`OAuthConfig::leeway_secs`] of slack. With it
+    /// set, a token must carry `iat` as a NumericDate (a missing one is
+    /// [`crate::InvalidTokenKind::MissingClaim`], a malformed one
+    /// [`MalformedClaim`](crate::InvalidTokenKind::MalformedClaim)), and an
+    /// `iat` later than now plus the leeway is refused as
+    /// [`NotYetValid`](crate::InvalidTokenKind::NotYetValid); too old is
+    /// [`TokenTooOld`](crate::InvalidTokenKind::TokenTooOld). All 401.
+    ///
+    /// `None` (the default) checks nothing, and `iat` stays optional. Bounds a
+    /// token's usable age independently of the `exp` the authorization server
+    /// chose — useful when it issues long-lived tokens. `1..=`
+    /// [`MAX_TOKEN_AGE_SECS`] (30 days); `0` is refused.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// # use oauth_resource_server::{KeyNaming, OAuthConfig};
+    /// let base = OAuthConfig {
+    ///     enabled: true,
+    ///     issuer: "https://auth.example.com/".into(),
+    ///     audience: "https://api.example.com/".into(),
+    ///     resource: "https://api.example.com/".into(),
+    ///     required_scope: Some("api:read".into()),
+    ///     ..OAuthConfig::default()
+    /// };
+    /// // Refuse tokens issued more than an hour ago (plus the leeway).
+    /// let one_hour = OAuthConfig { max_token_age_secs: Some(3600), ..base.clone() };
+    /// assert!(one_hour.resolve(KeyNaming::Dotted("oauth")).is_ok());
+    ///
+    /// let zero = OAuthConfig { max_token_age_secs: Some(0), ..base };
+    /// let err = zero.resolve(KeyNaming::Dotted("oauth")).unwrap_err();
+    /// assert!(err.problems[0].contains("oauth.max_token_age_secs"));
+    /// ```
+    #[cfg_attr(
+        feature = "serde",
+        serde(default, skip_serializing_if = "Option::is_none")
+    )]
+    pub max_token_age_secs: Option<u64>,
+    /// Claims every token must carry with a given value, e.g. a tenant
+    /// (`{"tid": "<tenant id>"}`) or a group (`{"groups": "api-users"}`).
+    /// Each entry is checked against the verified claim of that name:
+    ///
+    /// - absent from the token: refused
+    ///   ([`MissingClaim`](crate::InvalidTokenKind::MissingClaim));
+    /// - equal to the value (JSON equality: type and value, so `"1"` is not
+    ///   `1`, and an integer `1` is not the float `1.0`): passes;
+    /// - an array containing an element equal to the value: passes
+    ///   (membership, for `groups`, `roles` and the like);
+    /// - anything else — a different value, `null`, an object, an array
+    ///   without the value: refused
+    ///   ([`ClaimMismatch`](crate::InvalidTokenKind::ClaimMismatch)).
+    ///
+    /// Every entry must pass. The value must be a string, number or boolean
+    /// (`null`, an array or an object is refused by
+    /// [`OAuthConfig::resolve`]); only top-level claims are matched, never a
+    /// path into a nested object. The name must not be blank, nor one of the
+    /// claims this crate already checks (`iss`, `aud`, `exp`, `nbf`, `iat`,
+    /// `cnf`). Empty (the default) checks nothing. All refusals are 401.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use serde_json::json;
+    /// # use oauth_resource_server::{KeyNaming, OAuthConfig};
+    /// let base = OAuthConfig {
+    ///     enabled: true,
+    ///     issuer: "https://auth.example.com/".into(),
+    ///     audience: "https://api.example.com/".into(),
+    ///     resource: "https://api.example.com/".into(),
+    ///     required_scope: Some("api:read".into()),
+    ///     ..OAuthConfig::default()
+    /// };
+    /// // One tenant, and membership of one group (`groups` is an array claim).
+    /// let config = OAuthConfig {
+    ///     required_claims: [
+    ///         ("tid".to_string(), json!("00000000-0000-0000-0000-000000000000")),
+    ///         ("groups".to_string(), json!("api-users")),
+    ///     ]
+    ///     .into_iter()
+    ///     .collect(),
+    ///     ..base.clone()
+    /// };
+    /// assert!(config.resolve(KeyNaming::Dotted("oauth")).is_ok());
+    ///
+    /// // A claim this crate already checks, or a non-scalar value, is refused.
+    /// let err = OAuthConfig {
+    ///     required_claims: [("aud".to_string(), json!("x")), ("org".to_string(), json!({}))]
+    ///         .into_iter()
+    ///         .collect(),
+    ///     ..base
+    /// }
+    /// .resolve(KeyNaming::Dotted("oauth"))
+    /// .unwrap_err();
+    /// assert_eq!(err.problems.len(), 2);
+    /// ```
+    #[cfg_attr(feature = "serde", serde(default))]
+    pub required_claims: BTreeMap<String, Value>,
 }
 
 impl Default for OAuthConfig {
@@ -682,6 +844,9 @@ impl Default for OAuthConfig {
             allow_unscoped_tokens: false,
             allow_insecure_http: false,
             accept_static_bearer: true,
+            allowed_client_ids: Vec::new(),
+            max_token_age_secs: None,
+            required_claims: BTreeMap::new(),
         }
     }
 }
@@ -733,7 +898,10 @@ impl OAuthConfig {
     /// scope-token, no required scope with neither `require_at_jwt` nor
     /// [`OAuthConfig::allow_unscoped_tokens`] set, an empty `scope_claims`, a
     /// blank entry in a list, an algorithm that is HMAC, `none` or unknown, an
-    /// empty algorithm list, or a `leeway_secs` over [`MAX_LEEWAY_SECS`].
+    /// empty algorithm list, a `leeway_secs` over [`MAX_LEEWAY_SECS`], a blank
+    /// `allowed_client_ids` entry, a `max_token_age_secs` of `0` or over
+    /// [`MAX_TOKEN_AGE_SECS`], or a `required_claims` entry with a blank or
+    /// reserved name or a value that is not a string, number or boolean.
     ///
     /// # Examples
     ///
@@ -1027,6 +1195,52 @@ impl OAuthConfig {
             ));
         }
 
+        if self.allowed_client_ids.iter().any(|c| c.trim().is_empty()) {
+            problems.push(ConfigProblem::new(
+                ProblemKind::EmptyListEntry,
+                [key("allowed_client_ids")],
+                format!(
+                    "{} contains an empty entry — list the OAuth client IDs whose tokens                      are accepted",
+                    key("allowed_client_ids")
+                ),
+            ));
+        }
+        if let Some(age) = self.max_token_age_secs
+            && !(1..=MAX_TOKEN_AGE_SECS).contains(&age)
+        {
+            problems.push(ConfigProblem::new(
+                ProblemKind::TokenAgeOutOfRange,
+                [key("max_token_age_secs")],
+                format!(
+                    "{} {age} is outside 1..={MAX_TOKEN_AGE_SECS} seconds (30 days) — leave it                      unset to not bound token age",
+                    key("max_token_age_secs")
+                ),
+            ));
+        }
+        for (name, value) in &self.required_claims {
+            let k = key("required_claims");
+            let why = if name.trim().is_empty() {
+                Some("has an entry with a blank claim name".to_string())
+            } else if RESERVED_REQUIRED_CLAIMS.contains(&name.as_str()) {
+                Some(format!(
+                    "names {name:?}, which this crate already checks (iss, aud, exp, nbf, iat,                      cnf) — use issuer/audience, leeway_secs or max_token_age_secs instead"
+                ))
+            } else if !matches!(value, Value::String(_) | Value::Number(_) | Value::Bool(_)) {
+                Some(format!(
+                    "entry {name:?} requires {value}, but a required value must be a string,                      number or boolean (a token's array claim passes when it contains it)"
+                ))
+            } else {
+                None
+            };
+            if let Some(why) = why {
+                problems.push(ConfigProblem::new(
+                    ProblemKind::InvalidRequiredClaim,
+                    [k.clone()],
+                    format!("{k} {why}"),
+                ));
+            }
+        }
+
         if !problems.is_empty() {
             return Err(ConfigError::from_problems(naming, problems));
         }
@@ -1069,6 +1283,9 @@ impl OAuthConfig {
             allow_unscoped_tokens: self.allow_unscoped_tokens,
             allow_insecure_http: self.allow_insecure_http,
             accept_static_bearer: self.accept_static_bearer,
+            allowed_client_ids: self.allowed_client_ids,
+            max_token_age_secs: self.max_token_age_secs,
+            required_claims: self.required_claims,
             resource_name: None,
             key_naming: naming.to_buf(),
         }))
@@ -1186,6 +1403,12 @@ pub struct ResolvedOAuthConfig {
     pub allow_insecure_http: bool,
     /// See [`OAuthConfig::accept_static_bearer`].
     pub accept_static_bearer: bool,
+    /// See [`OAuthConfig::allowed_client_ids`]; empty means no client check.
+    pub allowed_client_ids: Vec<String>,
+    /// See [`OAuthConfig::max_token_age_secs`]; `None` means no age check.
+    pub max_token_age_secs: Option<u64>,
+    /// See [`OAuthConfig::required_claims`]; empty means no claim check.
+    pub required_claims: BTreeMap<String, Value>,
     /// Human-readable name published as `resource_name` in the RFC 9728
     /// metadata document; omitted from it when `None`. Not a config key:
     /// [`OAuthConfig::resolve`] leaves it `None`, and an application that wants
@@ -2044,6 +2267,58 @@ resource: \"https://kb.example.test/mcp\"
                 |c| c.leeway_secs = MAX_LEEWAY_SECS + 1,
                 &["leeway_secs"],
             ),
+            (
+                ProblemKind::EmptyListEntry,
+                |c| c.allowed_client_ids = vec!["client-a".into(), " ".into()],
+                &["allowed_client_ids"],
+            ),
+            (
+                ProblemKind::TokenAgeOutOfRange,
+                |c| c.max_token_age_secs = Some(0),
+                &["max_token_age_secs"],
+            ),
+            (
+                ProblemKind::TokenAgeOutOfRange,
+                |c| c.max_token_age_secs = Some(MAX_TOKEN_AGE_SECS + 1),
+                &["max_token_age_secs"],
+            ),
+            (
+                ProblemKind::InvalidRequiredClaim,
+                |c| {
+                    c.required_claims.insert(" ".into(), "x".into());
+                },
+                &["required_claims"],
+            ),
+            (
+                ProblemKind::InvalidRequiredClaim,
+                |c| {
+                    c.required_claims.insert("aud".into(), "x".into());
+                },
+                &["required_claims"],
+            ),
+            (
+                ProblemKind::InvalidRequiredClaim,
+                |c| {
+                    c.required_claims.insert("tid".into(), Value::Null);
+                },
+                &["required_claims"],
+            ),
+            (
+                ProblemKind::InvalidRequiredClaim,
+                |c| {
+                    c.required_claims
+                        .insert("groups".into(), serde_json::json!(["a"]));
+                },
+                &["required_claims"],
+            ),
+            (
+                ProblemKind::InvalidRequiredClaim,
+                |c| {
+                    c.required_claims
+                        .insert("org".into(), serde_json::json!({"id": 1}));
+                },
+                &["required_claims"],
+            ),
         ]
     }
 
@@ -2078,6 +2353,8 @@ resource: \"https://kb.example.test/mcp\"
             ProblemKind::BadAlgorithm,
             ProblemKind::NoAlgorithms,
             ProblemKind::LeewayTooLarge,
+            ProblemKind::TokenAgeOutOfRange,
+            ProblemKind::InvalidRequiredClaim,
         ] {
             assert!(seen.contains(&kind), "{kind:?} is never produced");
         }
@@ -2223,6 +2500,8 @@ resource: \"https://kb.example.test/mcp\"
             (ProblemKind::BadAlgorithm, "bad_algorithm"),
             (ProblemKind::NoAlgorithms, "no_algorithms"),
             (ProblemKind::LeewayTooLarge, "leeway_too_large"),
+            (ProblemKind::TokenAgeOutOfRange, "token_age_out_of_range"),
+            (ProblemKind::InvalidRequiredClaim, "invalid_required_claim"),
             (ProblemKind::EnvLoad, "env_load"),
             (ProblemKind::EnvParse, "env_parse"),
             (ProblemKind::Other, "other"),
@@ -2233,5 +2512,79 @@ resource: \"https://kb.example.test/mcp\"
         }
         let labels: std::collections::HashSet<_> = all.iter().map(|(_, l)| *l).collect();
         assert_eq!(labels.len(), all.len());
+    }
+
+    #[cfg(feature = "serde")]
+    #[test]
+    fn the_claim_policy_settings_deserialize_and_default_to_off() {
+        let yaml = "\
+enabled: true
+allowed_client_ids: [\"client-a\", \"client-b\"]
+max_token_age_secs: 3600
+required_claims:
+  tid: \"tenant-1\"
+  level: 2
+  mfa: true
+";
+        let parsed: OAuthConfig = serde_yaml_ng::from_str(yaml).unwrap();
+        assert_eq!(parsed.allowed_client_ids, ["client-a", "client-b"]);
+        assert_eq!(parsed.max_token_age_secs, Some(3600));
+        assert_eq!(parsed.required_claims["tid"], serde_json::json!("tenant-1"));
+        assert_eq!(parsed.required_claims["level"], serde_json::json!(2));
+        assert_eq!(parsed.required_claims["mfa"], serde_json::json!(true));
+        let back: OAuthConfig =
+            serde_yaml_ng::from_str(&serde_yaml_ng::to_string(&parsed).unwrap()).unwrap();
+        assert_eq!(back, parsed);
+
+        // Omitted: exactly the defaults, which check nothing.
+        let empty: OAuthConfig = serde_yaml_ng::from_str("{}").unwrap();
+        assert_eq!(empty, OAuthConfig::default());
+        assert!(empty.allowed_client_ids.is_empty());
+        assert_eq!(empty.max_token_age_secs, None);
+        assert!(empty.required_claims.is_empty());
+        // `deny_unknown_fields` still refuses a misspelled one.
+        assert!(serde_yaml_ng::from_str::<OAuthConfig>("allowed_clients: [\"a\"]\n").is_err());
+        assert!(serde_yaml_ng::from_str::<OAuthConfig>("max_token_age: 5\n").is_err());
+    }
+
+    #[test]
+    fn the_claim_policy_settings_resolve_unchanged_and_default_off() {
+        let resolved = enabled(|_| {}).resolve(WIKI).unwrap().unwrap();
+        assert!(resolved.allowed_client_ids.is_empty());
+        assert_eq!(resolved.max_token_age_secs, None);
+        assert!(resolved.required_claims.is_empty());
+
+        let resolved = enabled(|c| {
+            c.allowed_client_ids = vec!["client-a".into()];
+            c.max_token_age_secs = Some(MAX_TOKEN_AGE_SECS);
+            c.required_claims
+                .insert("groups".into(), serde_json::json!("api-users"));
+            c.required_claims
+                .insert("level".into(), serde_json::json!(2));
+            c.required_claims
+                .insert("mfa".into(), serde_json::json!(false));
+        })
+        .resolve(WIKI)
+        .unwrap()
+        .unwrap();
+        assert_eq!(resolved.allowed_client_ids, ["client-a"]);
+        assert_eq!(resolved.max_token_age_secs, Some(MAX_TOKEN_AGE_SECS));
+        assert_eq!(resolved.required_claims.len(), 3);
+        let one = enabled(|c| c.max_token_age_secs = Some(1)).resolve(WIKI);
+        assert!(one.unwrap().is_some());
+
+        // Every reserved claim is refused, each named, all at once.
+        let err = enabled(|c| {
+            for name in RESERVED_REQUIRED_CLAIMS {
+                c.required_claims.insert((*name).into(), "x".into());
+            }
+        })
+        .resolve(KeyNaming::Env("APP_OAUTH_"))
+        .unwrap_err();
+        assert_eq!(err.problems.len(), RESERVED_REQUIRED_CLAIMS.len(), "{err}");
+        for p in err.problem_details() {
+            assert_eq!(p.kind(), ProblemKind::InvalidRequiredClaim);
+            assert_eq!(p.keys(), ["APP_OAUTH_REQUIRED_CLAIMS"]);
+        }
     }
 }
