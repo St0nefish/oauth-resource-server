@@ -157,6 +157,22 @@ Before 1.0, a breaking change increments the minor version.
   Before, those strings could split a header in a hand-built integration.
   Both layers still refuse to build with such a validator
   (`AuthLayerError::InvalidChallenge`), exactly as the axum layer did.
+- Structured configuration problems (oauth-resource-server#2), with no
+  breaking change. `ConfigError::problem_details()` and
+  `EnvOAuthConfig::problem_details()` return `ConfigProblem`s
+  (`#[non_exhaustive]`): `kind()` (a `#[non_exhaustive]` `ProblemKind` with a
+  stable `as_str()` label: `MissingRequired`, `InvalidUrl`, `InsecureHttp`,
+  `BlankRequiredScope`, `MultiWordScope`, `InvalidScopeToken`,
+  `EmptyListEntry`, `NoRequiredScope`, `EmptyScopeClaims`, `BadAlgorithm`,
+  `NoAlgorithms`, `LeewayTooLarge`, `EnvLoad`, `EnvParse`, `Other`), `keys()`
+  (the settings named, spelled through the `KeyNaming`), `message()` and
+  `Display`. Match on the kind instead of the message text. Also added:
+  `ConfigError::from_problems`, and `From<String> for ConfigProblem` (kind
+  `Other`) so an application's own loader can mix problems in. The public
+  `problems: Vec<String>` fields and `ConfigError::new` are unchanged and
+  message text is byte-identical; `problems` is now rendered from the same
+  list, and editing it in place does not update `problem_details()`. The
+  `EnvError` variants were already `#[non_exhaustive]`.
 
 ### Security
 

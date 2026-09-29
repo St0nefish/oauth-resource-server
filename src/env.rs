@@ -14,7 +14,9 @@
 
 use std::io;
 
-use crate::config::{ConfigError, KeyNaming, OAuthConfig, ResolvedOAuthConfig};
+use crate::config::{
+    ConfigError, ConfigProblem, KeyNaming, OAuthConfig, ProblemKind, ResolvedOAuthConfig,
+};
 
 /// A problem loading a secret from the environment.
 ///
@@ -214,10 +216,14 @@ fn parse_strict_bool(value: &str) -> Result<bool, ()> {
 /// The problem text for a `bool` variable that is neither `"true"` nor
 /// `"false"`. The value is echoed back: every `bool` setting here is a plain
 /// switch, never secret.
-fn bool_problem(naming: KeyNaming<'_>, field: &str, value: &str) -> String {
-    format!(
-        "{} {value:?} must be \"true\" or \"false\"",
-        naming.key(field)
+fn bool_problem(naming: KeyNaming<'_>, field: &str, value: &str) -> ConfigProblem {
+    ConfigProblem::new(
+        ProblemKind::EnvParse,
+        [naming.key(field)],
+        format!(
+            "{} {value:?} must be \"true\" or \"false\"",
+            naming.key(field)
+        ),
     )
 }
 
@@ -225,7 +231,7 @@ fn bool_problem(naming: KeyNaming<'_>, field: &str, value: &str) -> String {
 /// source chain, `": "`-separated. A [`ConfigError`] problem is a flat string
 /// with no source chain of its own, so [`EnvError::ReadFailed`]'s I/O cause —
 /// deliberately left out of its `Display` — is appended here instead.
-fn env_problem(err: &EnvError) -> String {
+fn env_problem(err: &EnvError) -> ConfigProblem {
     let mut text = err.to_string();
     let mut source = std::error::Error::source(err);
     while let Some(cause) = source {
@@ -233,12 +239,23 @@ fn env_problem(err: &EnvError) -> String {
         text.push_str(&cause.to_string());
         source = cause.source();
     }
-    text
+    // Name the variables the operator has to look at: both when both are set,
+    // otherwise the `_FILE` whose file could not be used.
+    let keys = match err {
+        EnvError::BothSet { var, .. } => vec![var.clone(), format!("{var}_FILE")],
+        EnvError::ReadFailed { var, .. } | EnvError::EmptyFile { var, .. } => {
+            vec![format!("{var}_FILE")]
+        }
+    };
+    ConfigProblem::new(ProblemKind::EnvLoad, keys, text)
 }
 
 /// Record a failed load as a problem and read it as unset, so one bad
 /// variable never stops the rest from being checked.
-fn take(result: Result<Option<String>, EnvError>, problems: &mut Vec<String>) -> Option<String> {
+fn take(
+    result: Result<Option<String>, EnvError>,
+    problems: &mut Vec<ConfigProblem>,
+) -> Option<String> {
     result.unwrap_or_else(|e| {
         problems.push(env_problem(&e));
         None
@@ -471,7 +488,7 @@ where
 /// [`OAuthConfig::resolve`] turns `None` into the required scopes as they
 /// stand at that point, application defaults included. Set it to `Some(..)` —
 /// `Some(vec![])` for an explicitly empty list — to override that.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone)]
 #[non_exhaustive]
 pub struct EnvOAuthConfig {
     /// The loaded config, `enabled: true`, every unset field at its
@@ -481,11 +498,44 @@ pub struct EnvOAuthConfig {
     /// Problems the loader found, each naming its variable. Reported by
     /// [`resolve`](Self::resolve) ahead of any it finds itself; `resolve`
     /// fails whenever this is non-empty.
+    ///
+    /// Kept for compatibility; the structured form is
+    /// [`problem_details`](Self::problem_details), filled from the same list at
+    /// load time. Editing this field in place (an application appending its
+    /// own problem, say) does not update `problem_details()`, but
+    /// [`resolve`](Self::resolve) reports whatever this field holds.
     pub problems: Vec<String>,
+    details: Vec<ConfigProblem>,
     prefix: String,
 }
 
+/// Equality covers every field except the structured `details`, which are
+/// derived from `problems` (this type derived `PartialEq` before they existed).
+impl PartialEq for EnvOAuthConfig {
+    fn eq(&self, other: &Self) -> bool {
+        self.config == other.config
+            && self.problems == other.problems
+            && self.prefix == other.prefix
+    }
+}
+
+impl Eq for EnvOAuthConfig {}
+
 impl EnvOAuthConfig {
+    /// The loader's problems as structured [`ConfigProblem`]s, in the order
+    /// [`problems`](Self::problems) lists them: [`ProblemKind::EnvLoad`] for a
+    /// variable or `_FILE` that could not be read, [`ProblemKind::EnvParse`]
+    /// for a value that could not be parsed. Match on the kind, not the text.
+    ///
+    /// Fixed at load time: editing the public `problems` field in place does
+    /// not change it, so this can be stale until [`resolve`](Self::resolve),
+    /// which reconciles the two. `keys()` of an `EnvLoad` problem is the
+    /// variable and its `_FILE` twin when both were set, else the `_FILE`
+    /// variable whose file could not be used.
+    pub fn problem_details(&self) -> &[ConfigProblem] {
+        &self.details
+    }
+
     /// The variable prefix this config was loaded with, which
     /// [`resolve`](Self::resolve) also uses to name settings in problems.
     pub fn prefix(&self) -> &str {
@@ -503,23 +553,48 @@ impl EnvOAuthConfig {
     /// # Errors
     ///
     /// A [`ConfigError`] when [`problems`](Self::problems) is non-empty or
-    /// [`OAuthConfig::resolve`] finds any, listing the loader's first.
+    /// [`OAuthConfig::resolve`] finds any, listing the loader's first. The
+    /// public [`problems`](Self::problems) decides what is reported: an entry
+    /// the application edited or added surfaces in the resulting
+    /// [`ConfigError`] as [`ProblemKind::Other`], while an untouched one keeps
+    /// its kind and keys. [`problem_details`](Self::problem_details) may be
+    /// stale before this call; the reconciliation happens inside it.
     pub fn resolve(self) -> Result<Option<ResolvedOAuthConfig>, ConfigError> {
         let Self {
             config,
-            mut problems,
+            problems,
+            details,
             prefix,
         } = self;
         let naming = KeyNaming::Env(&prefix);
+        // `problems` is public and may have been edited since loading, so it
+        // stays the authority for what is reported; each entry keeps its
+        // structured form when one still matches, and is `Other` otherwise.
+        let mut all = reconcile(problems, details);
         match config.resolve(naming) {
-            Ok(resolved) if problems.is_empty() => Ok(resolved),
-            Ok(_) => Err(ConfigError::new(naming, problems)),
+            Ok(resolved) if all.is_empty() => Ok(resolved),
+            Ok(_) => Err(ConfigError::from_problems(naming, all)),
             Err(resolve_err) => {
-                problems.extend(resolve_err.problems);
-                Err(ConfigError::new(naming, problems))
+                all.extend(resolve_err.problem_details().iter().cloned());
+                Err(ConfigError::from_problems(naming, all))
             }
         }
     }
+}
+
+/// One [`ConfigProblem`] per string in `problems`, in order: the first unused
+/// entry of `details` with the same message, else a plain `Other` problem.
+fn reconcile(problems: Vec<String>, details: Vec<ConfigProblem>) -> Vec<ConfigProblem> {
+    let mut pool: Vec<Option<ConfigProblem>> = details.into_iter().map(Some).collect();
+    problems
+        .into_iter()
+        .map(|text| {
+            pool.iter_mut()
+                .find(|slot| slot.as_ref().is_some_and(|d| d.message() == text))
+                .and_then(Option::take)
+                .unwrap_or_else(|| ConfigProblem::from(text))
+        })
+        .collect()
 }
 
 /// Load an [`OAuthConfig`] from `<PREFIX><FIELD_UPPER>` variables without
@@ -559,7 +634,7 @@ where
 {
     let naming = KeyNaming::Env(prefix);
     let field = |f: &str| secret_from_lookup(&naming.key(f), &lookup, &read_file);
-    let mut problems: Vec<String> = Vec::new();
+    let mut problems: Vec<ConfigProblem> = Vec::new();
 
     // `true` when ENABLED was set in any form other than a clean "false" —
     // including an unparsable value or a load failure, which are reported
@@ -634,9 +709,13 @@ where
     if let Some(v) = take(field("leeway_secs"), &mut problems) {
         match v.parse::<u64>() {
             Ok(n) => cfg.leeway_secs = n,
-            Err(_) => problems.push(format!(
-                "{} {v:?} is not a valid non-negative integer",
-                naming.key("leeway_secs")
+            Err(_) => problems.push(ConfigProblem::new(
+                ProblemKind::EnvParse,
+                [naming.key("leeway_secs")],
+                format!(
+                    "{} {v:?} is not a valid non-negative integer",
+                    naming.key("leeway_secs")
+                ),
             )),
         }
     }
@@ -656,7 +735,8 @@ where
 
     Some(EnvOAuthConfig {
         config: cfg,
-        problems,
+        problems: problems.iter().map(|p| p.message().to_string()).collect(),
+        details: problems,
         prefix: prefix.to_string(),
     })
 }
@@ -1151,6 +1231,138 @@ mod tests {
             err.problems
         );
         assert!(err.to_string().contains("APP_OAUTH_ISSUER"));
+    }
+
+    #[test]
+    fn loader_problems_carry_env_load_and_env_parse_kinds() {
+        let vars = HashMap::from([
+            ("APP_OAUTH_ISSUER", "https://idp.example.test/"),
+            ("APP_OAUTH_ISSUER_FILE", "/run/secrets/issuer"),
+            ("APP_OAUTH_AUDIENCE_FILE", "/run/secrets/missing"),
+            ("APP_OAUTH_RESOURCE", "https://kb.example.test/"),
+            ("APP_OAUTH_REQUIRE_AT_JWT", "yes"),
+            ("APP_OAUTH_LEEWAY_SECS", "soon"),
+            ("APP_OAUTH_ALLOW_UNSCOPED_TOKENS_FILE", "/run/secrets/empty"),
+        ]);
+        let files = HashMap::from([("/run/secrets/empty", "  ")]);
+        let loaded = unresolved_oauth_config_from_lookup(
+            "APP_OAUTH_",
+            lookup_from(&vars),
+            files_from(&files),
+        )
+        .unwrap();
+        let got: Vec<_> = loaded
+            .problem_details()
+            .iter()
+            .map(|p| (p.kind(), p.keys().to_vec()))
+            .collect();
+        let env = |v: &str| vec![v.to_string()];
+        assert_eq!(
+            got,
+            [
+                (
+                    ProblemKind::EnvLoad,
+                    vec![
+                        "APP_OAUTH_ISSUER".to_string(),
+                        "APP_OAUTH_ISSUER_FILE".to_string()
+                    ],
+                ),
+                (ProblemKind::EnvLoad, env("APP_OAUTH_AUDIENCE_FILE")),
+                (ProblemKind::EnvParse, env("APP_OAUTH_LEEWAY_SECS")),
+                (ProblemKind::EnvParse, env("APP_OAUTH_REQUIRE_AT_JWT")),
+                (
+                    ProblemKind::EnvLoad,
+                    env("APP_OAUTH_ALLOW_UNSCOPED_TOKENS_FILE")
+                ),
+            ]
+        );
+        // The strings are rendered from the same list, in the same order.
+        let texts: Vec<&str> = loaded
+            .problem_details()
+            .iter()
+            .map(ConfigProblem::message)
+            .collect();
+        assert_eq!(texts, loaded.problems);
+
+        // `resolve` carries them, then its own, into the `ConfigError`.
+        let err = loaded.resolve().unwrap_err();
+        assert_eq!(err.problems.len(), err.problem_details().len());
+        assert_eq!(err.problem_details()[0].kind(), ProblemKind::EnvLoad);
+        assert_eq!(err.problem_details()[2].kind(), ProblemKind::EnvParse);
+        let texts: Vec<&str> = err
+            .problem_details()
+            .iter()
+            .map(ConfigProblem::message)
+            .collect();
+        assert_eq!(texts, err.problems);
+    }
+
+    #[test]
+    fn env_oauth_config_equality_ignores_the_structured_details() {
+        let vars = HashMap::from([
+            ("APP_OAUTH_ISSUER", "https://idp.example.test/"),
+            ("APP_OAUTH_ALLOW_INSECURE_HTTP", "maybe"),
+        ]);
+        let files = HashMap::new();
+        let load = || {
+            unresolved_oauth_config_from_lookup(
+                "APP_OAUTH_",
+                lookup_from(&vars),
+                files_from(&files),
+            )
+            .unwrap()
+        };
+        let a = load();
+        let mut b = load();
+        assert_eq!(a, b);
+        // Same public fields, different details: still equal, as in 0.1.2.
+        b.details = vec![ConfigProblem::from(a.problems[0].clone())];
+        assert_eq!(a, b);
+        // A differing public field is not.
+        b.problems.push("extra".into());
+        assert_ne!(a, b);
+    }
+
+    #[test]
+    fn an_enabled_that_is_not_a_bool_is_an_env_parse_problem() {
+        let vars = HashMap::from([("APP_OAUTH_ENABLED", "maybe")]);
+        let files = HashMap::new();
+        let err = oauth_config_from_lookup("APP_OAUTH_", lookup_from(&vars), files_from(&files))
+            .unwrap_err();
+        let p = &err.problem_details()[0];
+        assert_eq!(p.kind(), ProblemKind::EnvParse);
+        assert_eq!(p.keys(), ["APP_OAUTH_ENABLED"]);
+        // resolve's own problems keep their kinds and env-spelled keys.
+        assert!(
+            err.problem_details()
+                .iter()
+                .any(|p| p.kind() == ProblemKind::MissingRequired
+                    && p.keys().contains(&"APP_OAUTH_ISSUER".to_string()))
+        );
+    }
+
+    #[test]
+    fn edited_problems_still_reach_resolve_as_other_and_matches_keep_their_kind() {
+        let vars = HashMap::from([
+            ("APP_OAUTH_ISSUER", "https://idp.example.test/"),
+            ("APP_OAUTH_AUDIENCE", "client-id"),
+            ("APP_OAUTH_RESOURCE", "https://kb.example.test/"),
+            ("APP_OAUTH_ALLOW_UNSCOPED_TOKENS", "maybe"),
+        ]);
+        let files = HashMap::new();
+        let mut loaded = unresolved_oauth_config_from_lookup(
+            "APP_OAUTH_",
+            lookup_from(&vars),
+            files_from(&files),
+        )
+        .unwrap();
+        loaded.problems.insert(0, "app-side problem".into());
+        // `problem_details` is fixed at load time.
+        assert_eq!(loaded.problem_details().len(), 1);
+        let err = loaded.resolve().unwrap_err();
+        assert_eq!(err.problems[0], "app-side problem");
+        assert_eq!(err.problem_details()[0].kind(), ProblemKind::Other);
+        assert_eq!(err.problem_details()[1].kind(), ProblemKind::EnvParse);
     }
 
     #[test]

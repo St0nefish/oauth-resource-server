@@ -124,8 +124,9 @@ pub use authenticate::{Credential, authenticate};
 pub use builder::OAuthValidatorBuilder;
 pub use challenge::PROTECTED_RESOURCE_METADATA_PREFIX;
 pub use config::{
-    ConfigError, DEFAULT_LEEWAY_SECS, DEFAULT_PRINCIPAL_CLAIMS, DEFAULT_SCOPE_CLAIMS, KeyNaming,
-    KeyNamingBuf, MAX_LEEWAY_SECS, OAuthConfig, ResolvedOAuthConfig,
+    ConfigError, ConfigProblem, DEFAULT_LEEWAY_SECS, DEFAULT_PRINCIPAL_CLAIMS,
+    DEFAULT_SCOPE_CLAIMS, KeyNaming, KeyNamingBuf, MAX_LEEWAY_SECS, OAuthConfig, ProblemKind,
+    ResolvedOAuthConfig,
 };
 pub use jwks::{
     DEFAULT_FETCH_TIMEOUT, KeySetStatus, MAX_FETCH_TIMEOUT, MIN_FETCH_TIMEOUT, RefreshError,
