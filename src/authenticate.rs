@@ -17,6 +17,9 @@ use crate::validator::{CachedAttempt, OAuthValidator};
 /// to tell from the outcome which mechanism accepted (or refused) which of its
 /// credentials. The axum middleware inserts it into request extensions so a
 /// handler can, for example, attribute a write to an OAuth principal.
+// `OAuth` holds the token inline: boxing it would change a public variant's type
+// (a breaking change), for a value that exists once per request.
+#[allow(clippy::large_enum_variant)]
 #[derive(Debug, Clone, PartialEq, Eq)]
 #[non_exhaustive]
 pub enum Credential {
