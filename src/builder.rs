@@ -18,7 +18,7 @@ use crate::jwks::{
     CachedKey, DEFAULT_FETCH_TIMEOUT, FetchSettings, JWKS_MIN_REFETCH_INTERVAL, MAX_FETCH_TIMEOUT,
     MIN_FETCH_TIMEOUT, error_chain, keys_from_jwk_set_json, redact_url,
 };
-use crate::validator::{OAuthValidator, ValidatorError, is_loopback_url};
+use crate::validator::{OAuthValidator, ValidatorError, parsed_plain_http_non_loopback};
 
 /// Builds an [`OAuthValidator`] with options for its metadata and JWKS
 /// fetches; get one from [`OAuthValidator::builder`].
@@ -516,7 +516,7 @@ fn check_proxy(
     // `http:alice:…@host` and `HTTP:\\alice:…@host` all parse to
     // `http://alice:…@host`, which a raw `http://` prefix test would miss.
     let credential = !url.username().is_empty() || url.password().is_some();
-    if url.scheme() == "http" && !is_loopback_url(url.as_str()) && credential {
+    if parsed_plain_http_non_loopback(&url) && credential {
         if !allow_insecure_http {
             return Err(refuse(&format!(
                 "it carries a credential but is plain http on a non-loopback host, so the \
@@ -922,6 +922,10 @@ hu4/P7MxyziTbEQzIKcRZrul7dt0eiqlr6cR25zxQIqJB5f+05DAbMFl
                 "http://127.0.0.1:9000/jwks",
                 "http://127.10.20.30/jwks",
                 "http://[::1]:9000/jwks",
+                // Non-canonical spellings are judged as parsed, as `resolve` judges them.
+                "http:/localhost:9000/jwks",
+                "HTTP:\\\\127.0.0.1\\jwks",
+                " http://[::1]/jwks",
             ] {
                 assert!(
                     std::ptr::eq(clients.for_url(url), &clients.loopback),
@@ -935,10 +939,29 @@ hu4/P7MxyziTbEQzIKcRZrul7dt0eiqlr6cR25zxQIqJB5f+05DAbMFl
                 "http://[::2]/jwks",
                 "http://128.0.0.1/jwks",
                 "not a url",
+                "http:/idp.example.test/jwks",
+                "http:localhost.example.test/jwks",
+                "HTTP:\\\\idp.example.test\\jwks",
             ] {
                 assert!(
                     std::ptr::eq(clients.for_url(url), &clients.normal),
                     "{url} with proxy {proxy:?}"
+                );
+            }
+            // Client choice and `resolve`'s plain-http judgment agree for
+            // every http spelling: loopback client exactly when no opt-in is
+            // needed.
+            for url in [
+                "http:/localhost/jwks",
+                "http:127.0.0.1/jwks",
+                "http:/idp.example.test/jwks",
+                " http://idp.example.test/jwks",
+                "HTTP:\\\\[::1]\\jwks",
+            ] {
+                assert_eq!(
+                    std::ptr::eq(clients.for_url(url), &clients.loopback),
+                    !crate::validator::plain_http_non_loopback(url),
+                    "{url}"
                 );
             }
         }

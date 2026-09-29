@@ -5,6 +5,7 @@
 use serde_json::Value;
 
 use crate::config::ResolvedOAuthConfig;
+use crate::validator::is_canonical_url;
 
 /// Path segment RFC 9728 §3 splices between a resource's authority and its path
 /// to form the metadata URL. The bare prefix is also the route that answers for
@@ -24,12 +25,27 @@ pub const PROTECTED_RESOURCE_METADATA_PREFIX: &str = "/.well-known/oauth-protect
 /// URL itself will look.
 pub(crate) fn resource_metadata_url(resource: &str) -> String {
     let trimmed = resource.trim();
-    let Some((scheme, rest)) = trimmed.split_once("://") else {
-        // Not a URL we can take apart. `OAuthConfig::resolve` refuses anything
-        // that is not an absolute http(s) URL, so this is unreachable from config;
-        // append rather than panic, so a bad value surfaces as a discovery 404
-        // with the offending string visible in the metadata document, not as a
-        // crash.
+    // Only a URL that parses and is canonically spelled is taken apart.
+    // `https:///host/path` has an empty raw authority, so splitting it would
+    // put `.well-known` where the host goes and send clients to a host nobody
+    // configured; the parser repairs `https:/host` and `https://host\x`
+    // without a `://` split finding the host either. `OAuthValidator::new`
+    // warns about all of them.
+    if reqwest::Url::parse(trimmed).is_err() {
+        // Reachable only from a hand-edited `ResolvedOAuthConfig` (`resolve`
+        // refuses it). Anything appended to, say, `https://` would parse with
+        // `.well-known` as its host, so there is no absolute URL to give: the
+        // bare path, which names no host at all, is the fail-closed answer.
+        return PROTECTED_RESOURCE_METADATA_PREFIX.to_string();
+    }
+    let split = trimmed
+        .split_once("://")
+        .filter(|_| is_canonical_url(trimmed));
+    let Some((scheme, rest)) = split else {
+        // A non-canonical spelling `resolve` accepts. Append rather than
+        // split, so the result stays on the host the parser reads and the
+        // mismatch surfaces as a discovery 404 with the offending string
+        // visible in the metadata document, not as a crash.
         return format!(
             "{}{PROTECTED_RESOURCE_METADATA_PREFIX}",
             trimmed.trim_end_matches('/')
@@ -45,8 +61,8 @@ pub(crate) fn resource_metadata_url(resource: &str) -> String {
 }
 
 /// The path part of a metadata URL from [`resource_metadata_url`] — the route a
-/// server must answer on. Falls back to the bare prefix for the (unreachable from
-/// config) malformed-resource case, which has no authority to strip.
+/// server must answer on. Falls back to the bare prefix for a metadata URL with no `://` (a resource
+/// spelled `https:/host`, say), which has no authority to strip.
 pub(crate) fn metadata_path(metadata_url: &str) -> String {
     metadata_url
         .split_once("://")
@@ -191,11 +207,14 @@ mod tests {
     fn metadata_url_of_a_malformed_resource_does_not_panic() {
         // `OAuthConfig::resolve` refuses a non-URL `resource`, so this is
         // unreachable from config — but the function itself must still degrade,
-        // not panic.
-        assert_eq!(
-            resource_metadata_url("kb.example.com/mcp"),
-            "kb.example.com/mcp/.well-known/oauth-protected-resource"
-        );
+        // not panic, and never into an absolute URL on a host nobody named.
+        for malformed in ["kb.example.com/mcp", "https://", "https:///", "http:"] {
+            assert_eq!(
+                resource_metadata_url(malformed),
+                PROTECTED_RESOURCE_METADATA_PREFIX,
+                "{malformed:?}"
+            );
+        }
     }
 
     #[test]
@@ -251,6 +270,62 @@ mod tests {
             insufficient_scope("", "https://x/.well-known/oauth-protected-resource"),
             "Bearer error=\"insufficient_scope\", \
              resource_metadata=\"https://x/.well-known/oauth-protected-resource\""
+        );
+    }
+
+    /// The host a URL string actually reaches once the parser has read it.
+    fn host(url: &str) -> Option<String> {
+        reqwest::Url::parse(url)
+            .ok()
+            .and_then(|u| u.host_str().map(str::to_owned))
+    }
+
+    #[test]
+    fn urls_built_from_a_non_canonical_spelling_stay_on_its_host() {
+        // `resolve` accepts these (with a startup warning). Whatever the
+        // metadata and discovery URLs built from them look like, none may
+        // reach a host other than the one the parser reads in the input — in
+        // particular `https:///host/path` must not become a URL on host
+        // `.well-known`. A 404 (a route that does not match) is the fail-closed
+        // outcome.
+        for resource in [
+            "https:/api.example.test/v1",
+            "https:api.example.test/v1",
+            "https://api.example.test\\v1",
+            "https:///api.example.test/v1",
+            "HTTPS:\\\\api.example.test\\v1",
+        ] {
+            let url = resource_metadata_url(resource);
+            assert_eq!(
+                host(&url).as_deref(),
+                Some("api.example.test"),
+                "{resource:?} -> {url:?}"
+            );
+            assert_eq!(
+                url,
+                format!("{resource}{PROTECTED_RESOURCE_METADATA_PREFIX}"),
+                "{resource:?}"
+            );
+        }
+        for issuer in [
+            "https:/idp.example.test/app/",
+            "https:idp.example.test/app/",
+            "https://idp.example.test\\app\\",
+            "https:///idp.example.test/app/",
+            "HTTPS:\\\\idp.example.test\\app\\",
+        ] {
+            let urls = crate::jwks::discovery_urls(issuer);
+            assert_eq!(urls.len(), 1, "{issuer:?}: {urls:?}");
+            assert_eq!(
+                host(&urls[0]).as_deref(),
+                Some("idp.example.test"),
+                "{issuer:?}: {urls:?}"
+            );
+        }
+        // Canonical spellings are untouched: still both discovery forms.
+        assert_eq!(
+            crate::jwks::discovery_urls("https://idp.example.test/app/").len(),
+            2
         );
     }
 }

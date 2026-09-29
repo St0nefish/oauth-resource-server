@@ -93,7 +93,13 @@ the ones a report is most likely to concern:
 - a configuration that would accept ID tokens as access tokens, or fetch keys
   from (or receive tokens at) a plain-`http` non-loopback URL — configured,
   discovered or reached by a redirect — is refused (at startup, or when the
-  fetch is made) unless explicitly opted into;
+  fetch is made) unless explicitly opted into. Whether a URL is plain `http`,
+  and whether its host is loopback, is decided on the URL as parsed — the
+  same reading the fetch uses — never on its raw text, so no spelling of a
+  cleartext URL (`http:/host`, `http:host`, `HTTP:\\host`) avoids the opt-in.
+  A spelling the parser has to repair is otherwise accepted and logged as a
+  startup `warn`, and the discovery and `resource_metadata` URLs built from
+  it never leave the host the parser reads in it;
 - `AuthLayer` (and the `tower` feature's `HttpAuthLayer`, which runs the
   same check) cannot be constructed in a state that silently passes every
   request through unauthenticated — that requires an explicit,

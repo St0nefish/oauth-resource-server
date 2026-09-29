@@ -484,7 +484,9 @@ pub struct OAuthConfig {
     /// AS's own discovery document including any trailing slash — Authentik's
     /// issuer ends in one, and a token minted with `.../app/` will not match
     /// `.../app`. Required; an absolute URL with no query or fragment, and no
-    /// space, control or non-ASCII character.
+    /// space, control or non-ASCII character. Write it `https://host/...`: a
+    /// spelling the URL parser repairs (`https:/host`) never matches a token's
+    /// `iss` byte-for-byte, and `OAuthValidator::new` warns about one.
     ///
     /// `https`, as RFC 8414 §2 requires of an issuer: the signing keys are
     /// found through it, and keys fetched over cleartext can be substituted by
@@ -892,7 +894,8 @@ impl OAuthConfig {
     /// a URL (`issuer`, `resource` or `jwks_uri`) that is not absolute
     /// `http`/`https`, has surrounding whitespace or contains a space, control
     /// or non-ASCII character (or, for `issuer` and `resource`, that has a
-    /// query or a fragment), a plain-`http` URL on a non-loopback host without
+    /// query or a fragment), a plain-`http` URL on a non-loopback host —
+    /// decided on the URL as parsed, however it is spelled — without
     /// [`OAuthConfig::allow_insecure_http`], a blank or multi-word required
     /// scope, a required or supported scope that is not an RFC 6749 §3.3
     /// scope-token, no required scope with neither `require_at_jwt` nor
@@ -1303,6 +1306,11 @@ impl OAuthConfig {
 /// newline and percent-encode the rest, but the RAW string is what is stored,
 /// compared and echoed into every `WWW-Authenticate` challenge — where such a
 /// character makes the header invalid, and the 401 would go out without one.
+///
+/// A spelling the parser repairs (`https:/host`, `http:\\host`) is accepted
+/// here; `OAuthValidator::build` warns about it (`non_canonical_url`), and the
+/// plain-http check in `resolve` decides on the parsed URL, so no spelling
+/// avoids it.
 fn check_url(key: &str, value: &str, identifier: bool) -> Result<(), String> {
     let parsed = reqwest::Url::parse(value.trim())
         .map_err(|e| format!("{key} {value:?} is not an absolute URL ({e})"))?;
@@ -2099,6 +2107,168 @@ resource: \"https://kb.example.test/mcp\"
         .resolve(WIKI)
         .unwrap()
         .unwrap();
+    }
+
+    /// Spellings of a plain-http, non-loopback URL that the URL parser
+    /// normalizes to `http://idp.example.test/...` — so reqwest would fetch
+    /// it over cleartext — but that do not literally begin with `http://`.
+    const NON_CANONICAL_HTTP: [&str; 4] = [
+        "http:/idp.example.test/jwks",
+        "http:idp.example.test/jwks",
+        "HTTP:\\\\idp.example.test\\jwks",
+        " http://idp.example.test/jwks",
+    ];
+
+    /// `enabled()` with `name` (`issuer`, `jwks_uri` or `resource`) set to `url`.
+    fn with_url(name: &str, url: &str, allow_insecure_http: bool) -> OAuthConfig {
+        enabled(|c| {
+            c.allow_insecure_http = allow_insecure_http;
+            match name {
+                "issuer" => c.issuer = url.into(),
+                "jwks_uri" => c.jwks_uri = Some(url.into()),
+                "resource" => c.resource = url.into(),
+                other => panic!("no URL setting {other}"),
+            }
+        })
+    }
+
+    #[test]
+    fn non_canonical_plain_http_spellings_are_refused_for_every_url_setting() {
+        for spelling in NON_CANONICAL_HTTP {
+            for name in ["issuer", "jwks_uri", "resource"] {
+                let err = with_url(name, spelling, false)
+                    .resolve(WIKI)
+                    .expect_err(&format!("{name} = {spelling:?} must be refused"));
+                assert_eq!(err.problems.len(), 1, "{name} = {spelling:?}: {err}");
+                assert!(
+                    err.problems[0].starts_with(&format!("mcp.oauth.{name} ")),
+                    "{name} = {spelling:?}: {err}"
+                );
+                // Surrounding whitespace was always refused on its own; every
+                // other spelling is refused as the cleartext URL it is.
+                let expected = if spelling.starts_with(' ') {
+                    ProblemKind::InvalidUrl
+                } else {
+                    ProblemKind::InsecureHttp
+                };
+                assert_eq!(
+                    err.problem_details()[0].kind(),
+                    expected,
+                    "{name} = {spelling:?}: {err}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn non_canonical_spellings_that_are_not_a_cleartext_hole_resolve_with_a_warning() {
+        // With the opt-in, the plain-http spellings; without it, loopback and
+        // https ones. Each resolves as 0.1.2 resolved it, and the validator's
+        // startup warnings name the setting and give the canonical form.
+        let cases: [(&str, bool, &str); 8] = [
+            (
+                "http:/idp.example.test/jwks",
+                true,
+                "http://idp.example.test/jwks",
+            ),
+            (
+                "http:idp.example.test/jwks",
+                true,
+                "http://idp.example.test/jwks",
+            ),
+            (
+                "HTTP:\\\\idp.example.test\\jwks",
+                true,
+                "http://idp.example.test/jwks",
+            ),
+            (
+                "http:/localhost:9000/jwks",
+                false,
+                "http://localhost:9000/jwks",
+            ),
+            (
+                "https:/idp.example.test/jwks",
+                false,
+                "https://idp.example.test/jwks",
+            ),
+            (
+                "https:idp.example.test/jwks",
+                false,
+                "https://idp.example.test/jwks",
+            ),
+            (
+                "https://idp.example.test\\jwks",
+                false,
+                "https://idp.example.test/jwks",
+            ),
+            (
+                "https:///idp.example.test/jwks",
+                false,
+                "https://idp.example.test/jwks",
+            ),
+        ];
+        for (spelling, opt_in, canonical) in cases {
+            for name in ["issuer", "jwks_uri", "resource"] {
+                let resolved = with_url(name, spelling, opt_in)
+                    .resolve(WIKI)
+                    .unwrap_or_else(|e| panic!("{name} = {spelling:?}: {e}"))
+                    .unwrap();
+                let warnings = crate::validator::non_canonical_warnings(&resolved);
+                assert_eq!(warnings.len(), 1, "{name} = {spelling:?}: {warnings:?}");
+                assert!(
+                    warnings[0].starts_with(&format!(
+                        "mcp.oauth.{name} {spelling:?} is not canonically spelled — it is \
+                         read as {canonical:?}; "
+                    )),
+                    "{name} = {spelling:?}: {warnings:?}"
+                );
+            }
+        }
+        // A canonically spelled config warns about nothing.
+        let resolved = enabled(|c| c.jwks_uri = Some("https://idp.example.test/jwks".into()))
+            .resolve(WIKI)
+            .unwrap()
+            .unwrap();
+        assert!(crate::validator::non_canonical_warnings(&resolved).is_empty());
+    }
+
+    #[test]
+    fn canonical_url_spellings_behave_as_before() {
+        // Canonical plain http off loopback: refused without the opt-in and
+        // admitted with it — an upper-case scheme included.
+        for url in [
+            "http://idp.example.test/jwks",
+            "HTTP://idp.example.test/jwks",
+        ] {
+            for name in ["issuer", "jwks_uri", "resource"] {
+                let err = with_url(name, url, false).resolve(WIKI).unwrap_err();
+                assert_eq!(err.problems.len(), 1, "{name} = {url:?}: {err}");
+                assert!(
+                    err.problems[0].contains("uses plain http on a non-loopback host"),
+                    "{name} = {url:?}: {err}"
+                );
+                with_url(name, url, true)
+                    .resolve(WIKI)
+                    .unwrap_or_else(|e| panic!("{name} = {url:?}: {e}"))
+                    .unwrap();
+            }
+        }
+        // Loopback and https need no opt-in; a URL with no path, a default
+        // port or an upper-case host is not "non-canonical".
+        for url in [
+            "http://localhost/jwks",
+            "http://127.0.0.1:9000/jwks",
+            "http://[::1]:9000/jwks",
+            "https://idp.example.test/jwks",
+            "https://IDP.example.test:443",
+        ] {
+            for name in ["issuer", "jwks_uri", "resource"] {
+                with_url(name, url, false)
+                    .resolve(WIKI)
+                    .unwrap_or_else(|e| panic!("{name} = {url:?}: {e}"))
+                    .unwrap();
+            }
+        }
     }
 
     // ── the unscoped posture ─────────────────────────────────────────────────
