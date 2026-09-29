@@ -688,14 +688,17 @@ pub enum InvalidTokenKind {
     /// A `required_claims` entry is present in the token with another value
     /// (and, for an array claim, not among its elements).
     ClaimMismatch,
-    /// Only a static token is configured (no OAuth validator) and no
-    /// credential is it.
+    /// Only static tokens are configured (no OAuth validator) and no
+    /// credential is one of them.
     StaticTokenMismatch,
     /// Neither a static token nor an OAuth validator is configured.
     NoMechanism,
     /// A credential was accepted, but the handler needs an OAuth access token
     /// (the axum `AuthorizedToken` extractor) and got a static token.
     OAuthTokenRequired,
+    /// A credential was accepted, but the handler needs a static token (the
+    /// axum `StaticTokenMatch` extractor) and got an OAuth access token.
+    StaticTokenRequired,
     /// Anything else: every [`InvalidToken`] built from a `String` or `&str`,
     /// and a decoder failure this crate cannot classify more precisely.
     Other,
@@ -730,6 +733,7 @@ impl InvalidTokenKind {
             Self::StaticTokenMismatch => "static_token_mismatch",
             Self::NoMechanism => "no_mechanism",
             Self::OAuthTokenRequired => "oauth_token_required",
+            Self::StaticTokenRequired => "static_token_required",
             Self::Other => "other",
         }
     }
@@ -1061,6 +1065,7 @@ mod tests {
             K::StaticTokenMismatch,
             K::NoMechanism,
             K::OAuthTokenRequired,
+            K::StaticTokenRequired,
             K::Other,
         ];
         let labels: HashSet<&str> = all.iter().map(|k| k.as_str()).collect();

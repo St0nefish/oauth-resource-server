@@ -26,7 +26,7 @@ response body are byte-for-byte what 0.1 sent.
   `KeySetUnavailable`, `MalformedToken`, `BadSignature`, `Expired`,
   `NotYetValid`, `WrongIssuer`, `WrongAudience`, `MissingClaim`,
   `MalformedClaim`, `SenderConstrained`, `StaticTokenMismatch`,
-  `NoMechanism`, `OAuthTokenRequired`, `Other` — and `as_str()` gives each a
+  `NoMechanism`, `OAuthTokenRequired`, `StaticTokenRequired`, `Other` — and `as_str()` gives each a
   stable `snake_case` label for metrics (`"expired"`, `"key_set_unavailable"`,
   ...). Every refusal the crate makes carries its specific kind;
   `KeySetUnavailable` separates an authorization-server outage from junk
@@ -83,6 +83,50 @@ response body are byte-for-byte what 0.1 sent.
 
 ### Added
 
+- Several static tokens at once, for rotating a static API key with no
+  downtime or for one key per client, with the matched key reported. All
+  additive: every existing signature (`authenticate`, `static_token_policy`,
+  `StaticTokenDecision`, both builders' `static_token`, the unit
+  `Credential::StaticToken`) is unchanged, and a layer or `authenticate` call
+  that uses one static token answers exactly as before.
+  - `StaticTokens`: an opaque set of secrets, each with an optional label
+    (`single`, `new().with(label, secret)`, `len`, `is_empty`, `labels`,
+    `MAX_LABEL_LEN`). `with` refuses (`StaticTokensError`) a blank secret, a
+    secret already in the set, a repeated label, and a label that is not 1 to
+    64 visible ASCII characters. Its `Debug` prints the count and labels only,
+    and it wipes its copies of the secrets on drop (`zeroize`, already in
+    every build through `rustls-pki-types`, is now a direct dependency). So
+    do the layer builders' single `static_token` and the `env` loaders'
+    intermediate copies (`secret_from_env`'s untrimmed value, now also
+    wiped, with its return type unchanged). Not wiped: strings the caller
+    passes in or keeps, `secret_from_env`'s returned `String`,
+    `StaticTokenDecision`'s `String` payload, and the process environment.
+  - `authenticate_with_static_tokens(candidates, Option<&StaticTokens>,
+    oauth)`, returning `(Credential, Option<StaticTokenMatch>)` with the same
+    candidate and refusal rules as `authenticate`, which now runs the same
+    code over a one-entry set. Every candidate is compared with every entry
+    in constant time, with no early exit once one matches.
+  - `StaticTokenMatch` (`label()`): inserted into request extensions by both
+    layers next to every `Credential::StaticToken` (unlabeled for a single
+    `static_token`), removed when a layer accepts an OAuth token and by an
+    `optional()` layer, and an axum extractor (plain and `Option`) with the
+    same fail-closed rules as the `AuthorizedToken` extractor.
+  - `AuthLayerBuilder::static_tokens`/`optional_static_tokens` and the same
+    on `HttpAuthLayerBuilder`. With `static_token` the two are merged (a
+    secret given both ways counts once, under the set's label); an empty set
+    is no credential. `build_with_decision` keeps the set, merged with the
+    decision's token, for `StaticOnly`/`StaticAndOAuth`, drops it on
+    `StaticIgnored`, and refuses it alongside `OAuthOnly`/`Unauthenticated`
+    with the new `AuthLayerError::DecisionWithoutStaticToken`.
+  - `env::static_tokens_from_env`/`static_tokens_from_lookup`: `<VAR>`
+    (labeled `env::CURRENT_KEY_LABEL`, `"current"`) plus `<VAR>_NEXT`
+    (`env::NEXT_KEY_LABEL`, `"next"`), each also as `_FILE`, with
+    `secret_from_env`'s rules; equal values are one entry, and `<VAR>_NEXT`
+    without `<VAR>` is the new `EnvError::NextWithoutCurrent`. Both keys
+    failing is the new `EnvError::Several`, so both are reported at once.
+  - README: "Rotating a static API key with zero downtime", and the security
+    model's constant-time and log-safety notes for several keys.
+  Closes oauth-resource-server#3.
 - A general-purpose consumer test harness in the `testing` feature.
   `testing::TestAuthority::start().await` runs a loopback fake authorization
   server with OpenID Connect and RFC 8414 discovery and a JWKS, and exposes
