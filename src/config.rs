@@ -726,10 +726,7 @@ pub struct OAuthConfig {
     /// .unwrap();
     /// assert_eq!(resolved.allowed_client_ids, ["web-app", "cli"]);
     /// ```
-    #[cfg_attr(
-        feature = "serde",
-        serde(default, skip_serializing_if = "Vec::is_empty")
-    )]
+    #[cfg_attr(feature = "serde", serde(default))]
     pub allowed_client_ids: Vec<String>,
     /// Refuse a token issued more than this many seconds ago: `now - iat`
     /// must not exceed it, with [`OAuthConfig::leeway_secs`] of slack. With it
@@ -765,10 +762,9 @@ pub struct OAuthConfig {
     /// let err = zero.resolve(KeyNaming::Dotted("oauth")).unwrap_err();
     /// assert!(err.problems[0].contains("oauth.max_token_age_secs"));
     /// ```
-    #[cfg_attr(
-        feature = "serde",
-        serde(default, skip_serializing_if = "Option::is_none")
-    )]
+    // Serialized even when `None`, so a consumer that derives its settings
+    // from the serialized defaults sees every setting.
+    #[cfg_attr(feature = "serde", serde(default))]
     pub max_token_age_secs: Option<u64>,
     /// Claims every token must carry with a given value, e.g. a tenant
     /// (`{"tid": "<tenant id>"}`) or a group (`{"groups": "api-users"}`).
@@ -835,10 +831,7 @@ pub struct OAuthConfig {
     /// .unwrap_err();
     /// assert_eq!(err.problems.len(), 2);
     /// ```
-    #[cfg_attr(
-        feature = "serde",
-        serde(default, skip_serializing_if = "BTreeMap::is_empty")
-    )]
+    #[cfg_attr(feature = "serde", serde(default))]
     pub required_claims: BTreeMap<String, Value>,
 }
 
@@ -2794,14 +2787,16 @@ required_claims:
 
     #[cfg(feature = "serde")]
     #[test]
-    fn unset_claim_policy_settings_are_not_serialized() {
+    fn unset_claim_policy_settings_are_still_serialized() {
+        // Consumers derive their list of settings from the serialized
+        // defaults, so a new setting must appear even when it is off.
         let yaml = serde_yaml_ng::to_string(&OAuthConfig::default()).unwrap();
         for key in [
             "allowed_client_ids",
             "max_token_age_secs",
             "required_claims",
         ] {
-            assert!(!yaml.contains(key), "{key} in {yaml}");
+            assert!(yaml.contains(key), "{key} missing from {yaml}");
         }
     }
 }
