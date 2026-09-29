@@ -18,6 +18,7 @@
 |---|---|
 | [`OAuthConfig`], [`OAuthConfig::resolve`] | The unvalidated settings, and their all-or-nothing validation into a [`ResolvedOAuthConfig`] or a [`ConfigError`]. [`KeyNaming`] decides how problems name settings. |
 | [`OAuthValidator`] | Validates one token ([`OAuthValidator::validate`]), renders the challenges and the metadata document, and keeps the signing keys fresh ([`OAuthValidator::spawn_background_refresh`]). |
+| [`OAuthValidator::builder`], [`OAuthValidatorBuilder`] | How the validator fetches its keys: extra TLS root certificates, a proxy, the fetch timeout, a key set to start from. |
 | [`OAuthValidator::key_set_status`], [`KeySetStatus`], [`RefreshError`] | A passive, no-I/O view of the signing keys held, for readiness probes and status pages ([`OAuthValidator::is_ready`]). |
 | [`AuthorizedToken`], [`TokenRejection`] | The two outcomes of a validation. |
 | [`authenticate`], [`Credential`] | Framework-free checking of several candidate credentials against a static token and OAuth. |
@@ -79,6 +80,7 @@ compile_error!(
 );
 
 mod algorithms;
+mod builder;
 mod challenge;
 pub mod config;
 mod jwks;
@@ -119,13 +121,17 @@ pub mod testing;
 
 pub use algorithms::{Algorithm, AlgorithmError, DEFAULT_ALGORITHMS, parse_algorithm};
 pub use authenticate::{Credential, authenticate};
+pub use builder::OAuthValidatorBuilder;
 pub use challenge::PROTECTED_RESOURCE_METADATA_PREFIX;
 pub use config::{
     ConfigError, ConfigProblem, DEFAULT_LEEWAY_SECS, DEFAULT_PRINCIPAL_CLAIMS,
     DEFAULT_SCOPE_CLAIMS, KeyNaming, KeyNamingBuf, MAX_LEEWAY_SECS, OAuthConfig, ProblemKind,
     ResolvedOAuthConfig,
 };
-pub use jwks::{KeySetStatus, RefreshError, RefreshErrorKind};
+pub use jwks::{
+    DEFAULT_FETCH_TIMEOUT, KeySetStatus, MAX_FETCH_TIMEOUT, MIN_FETCH_TIMEOUT, RefreshError,
+    RefreshErrorKind,
+};
 pub use policy::{NoAuthConfigured, StaticTokenDecision, static_token_policy};
 pub use refusal::{DEFAULT_STATIC_CHALLENGE, Refusal, refusal, refusal_with_static_challenge};
 pub use token::{AuthorizedToken, TokenRejection};

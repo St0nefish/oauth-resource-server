@@ -12,11 +12,12 @@ use serde_json::{Map, Value};
 use tracing::{debug, error, info, warn};
 
 use crate::algorithms::Algorithm;
+use crate::builder::OAuthValidatorBuilder;
 use crate::challenge;
 use crate::config::ResolvedOAuthConfig;
 use crate::jwks::{
-    JWKS_BACKGROUND_REFRESH_INTERVAL, JWKS_MIN_REFETCH_INTERVAL, JwksStore, KeySetStatus,
-    RefreshError, background_retry_delay, http_client, keyless_retry_delay, redact_url,
+    JWKS_BACKGROUND_REFRESH_INTERVAL, JwksStore, KeySetStatus, RefreshError,
+    background_retry_delay, http_clients, keyless_retry_delay, redact_url,
 };
 use crate::token::{
     AuthorizedToken, MAX_TOKEN_BYTES, TokenRejection, check_typ, extract_principal, extract_scopes,
@@ -64,6 +65,59 @@ pub enum ValidatorError {
     /// reachable through [`std::error::Error::source`].
     #[error("Failed to build the HTTP client for OAuth metadata/JWKS fetches")]
     HttpClient(#[source] Box<dyn std::error::Error + Send + Sync + 'static>),
+    /// [`OAuthValidatorBuilder::fetch_timeout`] is zero or outside
+    /// [`crate::MIN_FETCH_TIMEOUT`]`..=`[`crate::MAX_FETCH_TIMEOUT`].
+    #[error("fetch timeout {timeout:?} is outside the accepted {min:?}..={max:?}")]
+    #[non_exhaustive]
+    FetchTimeoutOutOfRange {
+        /// The requested timeout.
+        timeout: Duration,
+        /// [`crate::MIN_FETCH_TIMEOUT`].
+        min: Duration,
+        /// [`crate::MAX_FETCH_TIMEOUT`].
+        max: Duration,
+    },
+    /// A PEM passed to [`OAuthValidatorBuilder::add_root_certificate_pem`]
+    /// holds no certificate, or one the TLS backend cannot parse or use as a
+    /// trust anchor.
+    #[error("root certificate PEM #{index} is unusable: {reason}")]
+    #[non_exhaustive]
+    InvalidRootCertificate {
+        /// Which call it came from: 0 for the first
+        /// `add_root_certificate_pem`, 1 for the second, and so on.
+        index: usize,
+        /// Why, for a log line. Certificates are public, so this may quote
+        /// the TLS library's error.
+        reason: String,
+    },
+    /// The URL passed to [`OAuthValidatorBuilder::proxy`] is refused:
+    /// malformed, or plain http on a non-loopback host with a credential in
+    /// it and no `allow_insecure_http`.
+    ///
+    /// # Security
+    ///
+    /// A refused value is never echoed, not even redacted — a malformed URL
+    /// can hide a credential where no parser sees userinfo. `proxy` is only
+    /// the scheme (`http://<redacted>`) when it is a proxy scheme, and
+    /// `<redacted>` otherwise; `reason` never quotes the URL. This error is
+    /// safe to log whatever the proxy URL carries.
+    #[error("proxy {proxy} is refused: {reason}")]
+    #[non_exhaustive]
+    InvalidProxy {
+        /// `<scheme>://<redacted>`, or `<redacted>`: never the URL itself.
+        proxy: String,
+        /// Why.
+        reason: String,
+    },
+    /// The JWK Set passed to [`OAuthValidatorBuilder::initial_jwks`] is too
+    /// large, not JSON, not a JWK Set, or holds no key usable for a signature
+    /// under the configured algorithms.
+    #[error("initial JWKS is unusable: {reason}")]
+    #[non_exhaustive]
+    InvalidInitialJwks {
+        /// Why. Public keys only, so safe to log.
+        reason: String,
+    },
 }
 
 /// The outcome of a cache-only validation attempt (`OAuthValidator::validate_cached`).
@@ -232,13 +286,65 @@ impl OAuthValidator {
     /// // validator.spawn_background_refresh();
     /// ```
     pub fn new(config: &ResolvedOAuthConfig) -> Result<Self, ValidatorError> {
-        Self::build(config, JWKS_MIN_REFETCH_INTERVAL)
+        Self::builder(config).build()
     }
 
+    /// A builder for a validator whose key fetches need more than
+    /// [`OAuthValidator::new`] gives them: an extra trust anchor for an
+    /// authorization server behind a private CA, an explicit proxy, a
+    /// different fetch timeout, or a key set to start from. With no option
+    /// set, [`OAuthValidatorBuilder::build`] is exactly
+    /// [`OAuthValidator::new`].
+    ///
+    /// These are code, not [`crate::OAuthConfig`] settings: like the config,
+    /// they take effect only when a validator is built (a restart).
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use std::time::Duration;
+    ///
+    /// use oauth_resource_server::{KeyNaming, OAuthConfig, OAuthValidator};
+    ///
+    /// # let resolved = OAuthConfig {
+    /// #     enabled: true,
+    /// #     issuer: "https://auth.example.com/".into(),
+    /// #     audience: "example-api".into(),
+    /// #     resource: "https://api.example.com/".into(),
+    /// #     required_scope: Some("api:read".into()),
+    /// #     ..OAuthConfig::default()
+    /// # }
+    /// # .resolve(KeyNaming::Dotted("oauth"))
+    /// # .unwrap()
+    /// # .unwrap();
+    /// let validator = OAuthValidator::builder(&resolved)
+    ///     .fetch_timeout(Duration::from_secs(5))
+    ///     .proxy("http://proxy.example.com:3128")
+    ///     .build()
+    ///     .unwrap();
+    /// # drop(validator);
+    /// ```
+    pub fn builder(config: &ResolvedOAuthConfig) -> OAuthValidatorBuilder {
+        OAuthValidatorBuilder::new(config)
+    }
+
+    /// [`OAuthValidator::new`] with the unknown-`kid` refetch interval
+    /// overridden — for tests, which would otherwise sleep a minute.
+    #[cfg(test)]
     pub(crate) fn build(
         config: &ResolvedOAuthConfig,
         jwks_min_refetch_interval: Duration,
     ) -> Result<Self, ValidatorError> {
+        Self::builder(config)
+            .min_refetch_interval(jwks_min_refetch_interval)
+            .build()
+    }
+
+    /// The body of [`OAuthValidatorBuilder::build`]: every check
+    /// [`OAuthValidator::new`] has always made, in the same order, then the
+    /// builder's own options.
+    pub(crate) fn from_builder(builder: &OAuthValidatorBuilder) -> Result<Self, ValidatorError> {
+        let config = builder.config();
         let naming = &config.key_naming;
         // `OAuthConfig::resolve` already refuses all three of these; re-checked
         // here because `ResolvedOAuthConfig`'s fields are public and may be
@@ -413,9 +519,12 @@ impl OAuthValidator {
         }
 
         let metadata = challenge::metadata_document(config);
-        let http = http_client(
+        let settings = builder.fetch_settings()?;
+        let seed = builder.seed_keys()?;
+        let http = http_clients(
             config.allow_insecure_http,
-            naming.key("allow_insecure_http"),
+            &naming.key("allow_insecure_http"),
+            &settings,
         )
         .map_err(|e| ValidatorError::HttpClient(Box::new(e)))?;
 
@@ -430,7 +539,12 @@ impl OAuthValidator {
             metadata,
             jwt_algorithms: config.algorithms.iter().map(|a| a.to_jwt()).collect(),
             validation,
-            keys: Arc::new(JwksStore::new(config, http, jwks_min_refetch_interval)),
+            keys: Arc::new(JwksStore::new(
+                config,
+                http,
+                builder.refetch_interval(),
+                seed,
+            )),
             alive: tokio::sync::watch::channel(()).0,
         })
     }
