@@ -120,6 +120,34 @@ pub(crate) fn quoted(value: &str) -> String {
     value.replace('\\', "\\\\").replace('"', "\\\"")
 }
 
+/// The challenge sent in place of one that would not be a valid header value
+/// (see `OAuthValidator::build`): `Bearer error="<error>"`, plus the `scope`
+/// attribute only when `scopes` is non-empty and itself a valid header value.
+/// No `resource_metadata`: the URL it would carry is what was invalid, or sat
+/// next to what was.
+pub(crate) fn fallback(error: &str, scopes: &str) -> String {
+    let bare = format!("Bearer error=\"{error}\"");
+    if scopes.is_empty() {
+        return bare;
+    }
+    let with_scope = format!("{bare}, scope=\"{}\"", quoted(scopes));
+    if is_header_value(&with_scope) {
+        with_scope
+    } else {
+        bare
+    }
+}
+
+/// Whether `value` can be sent as an HTTP header value as is: visible ASCII,
+/// SP and HTAB only (RFC 9110 §5.5, without the obs-text a `&str` challenge
+/// has no business carrying). CR and LF in particular are refused, so no
+/// challenge this crate hands out can split a header.
+pub(crate) fn is_header_value(value: &str) -> bool {
+    value
+        .bytes()
+        .all(|b| b == b' ' || b == b'\t' || (0x21..=0x7e).contains(&b))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

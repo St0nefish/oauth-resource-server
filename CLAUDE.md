@@ -21,9 +21,11 @@ an `OAuthConfig` into a `ResolvedOAuthConfig` (`OAuthConfig::resolve`,
 naming settings with a `KeyNaming` so errors read the way the operator wrote
 them), build one `OAuthValidator` from it and `Arc`-share it
 (`OAuthValidator::spawn_background_refresh` warms and then hourly refreshes the
-key cache), then per request call `authenticate()` (framework-free) or run the
-`axum` feature's `AuthLayer`/`require_auth`. Nothing here hot-reloads: a changed
-config takes effect only when a new validator and a new `AuthLayer` are built,
+key cache), then per request call `authenticate()` (framework-free, with
+`refusal()` for the 401/403 and its challenge) or run the `axum` feature's
+`AuthLayer`/`require_auth` or the `tower` feature's `HttpAuthLayer`. Nothing
+here hot-reloads: a changed config takes effect only when a new validator and
+a new layer are built,
 which in an application means a restart — an application should treat every
 setting it resolves through this crate as restart-required, and this crate
 never claims otherwise in its docs.
@@ -141,14 +143,35 @@ piece of code so a change to any of them is a deliberate, reviewable act:
   hostile response or an oversized token.
 - `WWW-Authenticate` is set — or overwritten, whatever a caller's `on_reject`
   callback returned — on **every** 401/403 once OAuth is configured
-  (`axum::Enforce::reject`). A missing credential gets the same
+  (`http_layer::Gate::finish`, called by both `axum::Enforce::reject` and
+  `http_layer::HttpAuthLayer::check`). The status and which challenge are decided
+  in exactly one place, `refusal::select`, which the public `refusal()`/
+  `refusal_with_static_challenge()` (over the validator's challenge strings)
+  and `http_layer::Gate::status_and_challenge` (over the layers' pre-validated
+  `HeaderValue`s) both call — so a hand-built integration on `refusal()` and
+  either layer cannot disagree; `axum::shared_refusal_tests` pins that, and
+  that the two layers answer every request identically. A missing credential gets the same
   `invalid_token` challenge as a bad one, deliberately: `resource_metadata` is
   how claude.ai (and others) find the authorization server, and it refuses to
   start the flow at all without it. A validator challenge that is not a valid
-  header value fails `AuthLayerBuilder::build`
-  (`AuthLayerError::InvalidChallenge`) instead of shipping challenge-less
-  401s. Without OAuth, a 401 carries `axum::DEFAULT_STATIC_CHALLENGE` (RFC 9110
-  §15.5.2) unless the application opts out with `static_challenge(None)`.
+  header value fails `AuthLayerBuilder::build` and
+  `HttpAuthLayerBuilder::build` (`AuthLayerError::InvalidChallenge`, from the
+  shared `http_layer::Gate::build`) instead of shipping challenge-less 401s —
+  and `OAuthValidator::build` never hands out such a challenge either: it
+  still builds (refusing would narrow what builds), but logs once at `error`
+  (the settings named via `KeyNaming`, the URL through `redact_url`) and
+  stores `challenge::fallback`s (`Bearer error="…"`, `scope` only if valid),
+  setting `challenge_fallback`, which `Gate::build` turns into
+  `AuthLayerError::InvalidChallenge` so both layers fail exactly where the
+  axum layer always did (`tests/challenge_fallback_log.rs` pins the log);
+  so `refusal()` can never return a challenge that splits a header; a
+  caller's `static_challenge` string that is not a header value is replaced
+  by `DEFAULT_STATIC_CHALLENGE` in `refusal_with_static_challenge`.
+  Without OAuth, a 401 carries `DEFAULT_STATIC_CHALLENGE` (defined in
+  `refusal.rs`, re-exported at the root and as `axum::DEFAULT_STATIC_CHALLENGE`;
+  RFC 9110 §15.5.2) unless the application opts out with
+  `static_challenge(None)` (`refusal_with_static_challenge(.., None)` for a
+  hand-built integration).
 - `OAuthConfig::resolve` refuses what would silently weaken the deployment:
   a plain-`http` `issuer`/`jwks_uri`/`resource` on a non-loopback host without
   `allow_insecure_http` (RFC 8414 §2, RFC 9728 §1.2), no required scope with
@@ -159,13 +182,18 @@ piece of code so a change to any of them is a deliberate, reviewable act:
   default.
 - `AuthLayer` is **fail-closed by construction**: `AuthLayerBuilder::build`
   refuses to build with neither a static token nor an OAuth validator
-  (`AuthLayerError::NoCredential`); the only pass-through is the explicitly
+  (`AuthLayerError::NoCredential`) — the check is `http_layer::Gate::build`, which
+  the `tower` feature's `HttpAuthLayerBuilder::build` runs too, and
+  `HttpAuthLayer`'s only pass-through is likewise the explicitly named
+  `HttpAuthLayer::allow_unauthenticated()` (or an `Unauthenticated` decision);
+  the axum layer's only pass-through is the explicitly
   named `AuthLayer::allow_unauthenticated()`, which only
   `policy::StaticTokenDecision::Unauthenticated` (itself produced only by an
   explicit `allow_unauthenticated` at the call site) ever yields via
   `AuthLayer::from_decision`/`build_with_decision`. `AuthLayerBuilder::optional()`
   is not a second pass-through: it still needs a credential mechanism to
-  build, and `AuthLayer::check` passes a request through only when
+  build, and `http_layer::Gate::admit` (behind both `AuthLayer::check` and
+  `HttpAuthLayer::check`) passes a request through only when
   `authenticate()` returned `Missing` AND every value of every source header
   is blank (`CredentialSource::presents_nothing` — an unreadable value, a
   non-blank later value of a repeated header, and anything `names_a_token`
@@ -185,10 +213,12 @@ piece of code so a change to any of them is a deliberate, reviewable act:
   unsatisfiable-401 wirings (a required extractor behind
   `allow_unauthenticated`, `AuthorizedToken` behind a layer with no
   validator) at `error` too.
-- Secrets never reach a log or a `Debug` impl: `AuthLayer`, `AuthLayerBuilder`
-  and `policy::StaticTokenDecision` all hand-write `Debug` to redact the static
-  token; `axum::RejectContext` hand-writes `Debug` to print header names only,
-  and `AuthLayer::check` marks every configured credential header
+- Secrets never reach a log or a `Debug` impl: `AuthLayer`, `AuthLayerBuilder`,
+  `http_layer::HttpAuthLayer`, `HttpAuthLayerBuilder`, `HttpAuthService` and
+  `policy::StaticTokenDecision` all hand-write `Debug` to redact the static
+  token; `RejectContext` (defined in `http_layer.rs`, re-exported from `axum`)
+  hand-writes `Debug` to print header names only, and `http_layer::Gate::admit`
+  (both layers) marks every configured credential header
   `set_sensitive(true)` before the callback or the inner service sees it;
   `env::EnvError`'s `Display`/`Debug` never include a secret's value (only
   variable names and file paths); and `TokenRejection::Invalid`'s reason
@@ -197,8 +227,9 @@ piece of code so a change to any of them is a deliberate, reviewable act:
   `AuthorizedToken`'s hand-written `Debug` prints the names of the verified
   claims, never their values (`email`, group memberships and the like are
   personal data); the axum extractors' refusal and misconfiguration logs
-  print the request path (and extractor name) only, never a claim or a token.
-  `resolve` accepts userinfo in `issuer`/`jwks_uri` (sent as Basic auth) and
+  print the request path (and extractor name) only, never a claim or a token,
+  and so do both layers' own refusal logs (`uri.path()`, no query, so no URL
+  there needs `redact_url`). `resolve` accepts userinfo in `issuer`/`jwks_uri` (sent as Basic auth) and
   a query in `jwks_uri`, so every URL this crate displays — in a log line,
   a `RefreshError` message, `KeySetStatus::jwks_uri` — goes through
   `jwks::redact_url` (`***@`, `?***`, `#***`; a placeholder for anything
@@ -233,10 +264,14 @@ then fail closed on every single token. `serde` gates `Deserialize`/`Serialize`
 on `OAuthConfig` via `cfg_attr` (never a straight `#[derive]`, so the crate
 builds with `serde` off; the `serde` crate itself is always a dependency, since
 `AuthorizedToken::claims_as` is bounded by `DeserializeOwned`, and the feature
-only turns on its derive macros). `env` gates the `env` module. `axum` gates the `axum`
-module and its four extra deps (`axum`, `http`, `tower-layer`, `tower-service`
-— `AuthLayer` implements `tower::Layer` against the same small trait axum
-itself builds on, not the whole `tower` crate). `testing` gates
+only turns on its derive macros). `env` gates the `env` module. `tower` gates
+the `http_layer` module (`HttpAuthLayer`, and the pieces both layers share:
+`CredentialSource`, `RejectContext`, `AuthLayerError`, and the crate-private
+`Gate`) and its three extra deps (`http`, `tower-layer`, `tower-service` — the
+small traits axum itself builds on, not the whole `tower` crate). `axum`
+implies `tower` and adds the `axum` module and the `axum` dep; the `axum`
+module re-exports the shared types, so their `axum::` paths are unchanged.
+`refusal()` needs neither: it is core, with no `http` dependency. `testing` gates
 `src/testing.rs`'s throwaway keys, JWK builders, token minting and fake JWKS
 server — for **consumers'** tests, enabled only from `[dev-dependencies]`,
 never in a production build (the private keys are public knowledge; anything
@@ -244,8 +279,10 @@ that trusts them trusts everyone; its minting helpers take
 `&impl Serialize`). CI's four clippy runs (`--all-features`,
 default features, and `--no-default-features` with `native-tls` or with
 `rustls-tls-native-roots`) exist because `--all-features` alone hides a `cfg`
-that only appears with `rustls-tls` off.
-Every feature-gated public item (the `env`/`axum`/`testing` modules in
+that only appears with `rustls-tls` off. `tower` needed no fifth run: nothing
+in it varies with the TLS backend, `--all-features` lints it, and the
+`feature-powerset` job builds it with and without `axum` (96 builds).
+Every feature-gated public item (the `env`/`http_layer`/`axum`/`testing` modules in
 `src/lib.rs`, and anything added inside them later) carries
 `#[cfg_attr(docsrs, doc(cfg(feature = "...")))]` so docs.rs renders its
 feature badge; give a new feature-gated item the same attribute.
@@ -339,8 +376,9 @@ list above updates every place that describes it **in the same commit**:
   `documented-shape fixture, not live-tested` label; never upgrade a label
   without having done the verification it claims.
 - rustdoc — module-level docs on every module, doc examples on the main entry
-  points (`OAuthValidator::new`/`validate`, `authenticate`, the `AuthLayer`
-  builder, `require_auth`, `metadata_router`, `oauth_config_from_env`,
+  points (`OAuthValidator::new`/`validate`, `authenticate`, `refusal`, the
+  `AuthLayer` builder, `require_auth`, `metadata_router`, the
+  `HttpAuthLayer` builder and its `on_reject`, `oauth_config_from_env`,
   `secret_from_env`, `static_token_policy`).
 - `examples/` — runnable, and built in CI (`cargo build --examples
   --all-features`), so an example that no longer compiles against a changed
@@ -374,7 +412,7 @@ from, and never a local plan/review label ("chunk p2", "round one").
 
 | File | Purpose |
 |---|---|
-| `lib.rs` | Crate root: the module tree, feature gating, and the no-TLS-backend `compile_error!`. `#![warn(missing_docs)]` + `#![forbid(unsafe_code)]`. Re-exports the core, always-available API at the crate root (`OAuthConfig`, `ConfigError`, `KeyNaming`/`KeyNamingBuf`, `OAuthValidator`, `AuthorizedToken`, `TokenRejection`, `Credential`, `authenticate`, `static_token_policy`, `Algorithm`/`AlgorithmError`, …); no `jsonwebtoken` type is re-exported or appears in a public signature. The feature-gated `env`, `axum` and `testing` modules stay public submodules a consumer reaches through their own path instead (`oauth_resource_server::axum::AuthLayer`, `oauth_resource_server::env::secret_from_env`) — nothing inside them is re-exported at the root. `__fuzz` (`src/__fuzz.rs`, `#[doc(hidden)]`) is declared under `#[cfg(all(fuzzing, feature = "axum", feature = "testing"))]` only: the entry points the `fuzz/` crate uses to reach crate-internal parsers, never compiled in an ordinary build and never public API — a new fuzz target adds a function there and widens the target internal to `pub(crate)`, nothing more |
+| `lib.rs` | Crate root: the module tree, feature gating, and the no-TLS-backend `compile_error!`. `#![warn(missing_docs)]` + `#![forbid(unsafe_code)]`. Re-exports the core, always-available API at the crate root (`OAuthConfig`, `ConfigError`, `KeyNaming`/`KeyNamingBuf`, `OAuthValidator`, `AuthorizedToken`, `TokenRejection`, `Credential`, `authenticate`, `refusal`/`refusal_with_static_challenge`/`Refusal`/`DEFAULT_STATIC_CHALLENGE`, `static_token_policy`, `Algorithm`/`AlgorithmError`, …); no `jsonwebtoken` type is re-exported or appears in a public signature. The feature-gated `env`, `http_layer` (feature `tower`), `axum` and `testing` modules stay public submodules a consumer reaches through their own path instead (`oauth_resource_server::axum::AuthLayer`, `oauth_resource_server::http_layer::HttpAuthLayer`, `oauth_resource_server::env::secret_from_env`) — nothing inside them is re-exported at the root. `__fuzz` (`src/__fuzz.rs`, `#[doc(hidden)]`) is declared under `#[cfg(all(fuzzing, feature = "axum", feature = "testing"))]` only: the entry points the `fuzz/` crate uses to reach crate-internal parsers, never compiled in an ordinary build and never public API — a new fuzz target adds a function there and widens the target internal to `pub(crate)`, nothing more |
 | `config.rs` | `OAuthConfig` (the unvalidated, serde-deserializable input shape — every field `#[serde(default)]`, `deny_unknown_fields`, not `#[non_exhaustive]`) and `OAuthConfig::resolve` (all-or-nothing validation into `ResolvedOAuthConfig`, every problem collected at once via `check_url` and the scope/algorithm/leeway checks). `KeyNaming`/`KeyNamingBuf` (`Dotted`/`Env`) decide how a problem names a setting, carried onto `ResolvedOAuthConfig::key_naming` and `ConfigError` so log lines and errors produced after resolution name settings the same way the input did. `ConfigError::problems` is public, `naming` is private (`ConfigError::naming()` reads it). `required_scopes` (list) and `required_scope` (single) are unioned, trimmed, deduplicated, order-stable; an empty union means no scope check and needs `require_at_jwt` or `allow_unscoped_tokens`; an explicitly blank/whitespace entry in either is always an error, and every required or advertised scope must be a scope-token (`is_scope_token`). An omitted `scopes_supported` resolves to the required scopes. `check_url` refuses space/control/non-ASCII characters; a plain-`http` non-loopback URL needs `allow_insecure_http`. `ResolvedOAuthConfig` is `#[non_exhaustive]`; its `accepted_audiences()` is `audience` ∪ `audiences`. Owns the `WIKI_REWRITES` test-pinned strings — see Key conventions above |
 | `algorithms.rs` | The two independent algorithm gates, and the crate-owned `Algorithm` enum (no HMAC/`none` variant; `to_jwt`/`from_jwt` are the only bridge to `jsonwebtoken`). `DEFAULT_ALGORITHMS` (every asymmetric alg `ring`-backed `jsonwebtoken` 9 can verify) and `parse_algorithm` (refuses HMAC/`none` outright with a typed `AlgorithmError` — no config can enable them) bound the configured allowlist; `key_algorithms` (by JWK `kty`/curve) and `signing_algorithm` (a JWK's own declared `alg`, if present) bound what one key may verify. A token's `alg` must pass both, which is what stops an attacker-chosen header from steering an RSA key into an ECDSA verification or any key into HMAC |
 | `jwks.rs` | `JwksStore`: JWKS discovery (OIDC Discovery then RFC 8414, exact-issuer-match required), fetch (redirect policy `judge_redirect` refuses an https→http downgrade and, without `allow_insecure_http`, a hop to plain http on a non-loopback host; a discovered `jwks_uri` is held to the same opt-in; response capped at `MAX_FETCH_BYTES`, at most `MAX_JWKS_KEYS` keys parsed), caching, and per-key algorithm binding (`parse_jwks_entry`, the pure per-entry step of `fetch_jwks` — parse one JWK Set entry on its own, then `cached_key`, skipping non-signature — `use` other than `sig`, `key_ops` without `verify` — and unparseable keys one at a time rather than failing the whole set, and flagging an alg-less multi-algorithm key `ambiguous` for a one-time `warn`). `JWKS_MIN_REFETCH_INTERVAL` (60s) throttles an unknown-`kid` refetch; `JWKS_BACKGROUND_REFRESH_INTERVAL` (hourly) is the only thing that notices a withdrawn key, with `background_retry_delay` for a failed pass while keys are held and `keyless_retry_delay` (`KEYLESS_RETRY_FLOOR` 5 s doubling to `KEYLESS_RETRY_CAP` 5 min) while none is. The public status types live here too: `KeySetStatus` (`#[non_exhaustive]`, public fields, `is_ready`), kept in the `status` `std::sync::Mutex<Tracked>` (the public copy, whose `jwks_uri` is redacted; the unredacted `jwks_uri` the fetch uses — configured, or filled in once by discovery; and an `attempts` counter) and updated by `refresh` at the start (`attempts`, `last_attempt`) and end (`keys`/`last_success`, or `last_error`) of every attempt — `refresh_detached` records a panicked task's error only if no newer attempt has started, and none for a cancelled one (runtime shutdown); `redact_url` for every displayed URL; and `RefreshError` (private `kind` + message; `Display` is the cause chain with URLs redacted, log-only because it still names endpoints) with its `#[non_exhaustive]` `RefreshErrorKind` (`Discovery`/`Fetch`/`Parse`/`NoUsableKeys`, `as_str` labels). Every fetch runs detached (`refresh_detached`) so a dropped caller cannot cancel it. The `RwLock`/`refresh_lock` split and the fail-closed-on-any-failure behavior are covered in the Architecture section above; `decoding_key`'s "exactly one candidate key with no `kid`" fallback (`lookup`) is documented on the function itself — it never tries more than one key per verification attempt |
@@ -382,8 +420,10 @@ from, and never a local plan/review label ("chunk p2", "round one").
 | `token.rs` | `AuthorizedToken` (subject/principal/scopes plus `issuer`, `audiences`, `expires_at`, `issued_at`, `client_id`, `jti` and a private `Arc<Map>` of the verified claims read by `claims()`/`claims_as()`, all filled once by `from_verified_claims` from the map `verify`'s single `decode` produced; `new` defaults them (empty, `expires_at` 2100-01-01) and `with_*` builders set them for tests; `#[non_exhaustive]`, hand-written `Debug` that prints claim names, never values, since they can be personal data; `has_scope`) and `TokenRejection` (`Missing`/`Invalid(String)`/`InsufficientScope`, `#[non_exhaustive]` — the 401-vs-403 split RFC 6750 requires; a `std::error::Error` whose `Display` is the category only, never the `Invalid` reason). `extract_scopes`/`extract_principal` read every configured claim in every accepted shape (string, space-delimited or not; array); `check_typ` is the RFC 9068 `typ` gate `validator.rs` calls. `MAX_TOKEN_BYTES` (16 KiB) and `MAX_LOGGED_CHARS` (128, via `for_log`) bound, respectively, what a credential may be and what a token-derived string may look like in a log line |
 | `challenge.rs` | RFC 9728 metadata (`metadata_document`, which omits an empty `scopes_supported` per §3.2; `PROTECTED_RESOURCE_METADATA_PREFIX`; `resource_metadata_url`/`metadata_path` — the well-known segment goes between authority and path, not at the end, and the path is kept verbatim, trailing slash included, per §3.1) and the two RFC 6750 `WWW-Authenticate` builders (`invalid_token`, `insufficient_scope`), which omit the `scope` attribute entirely rather than sending it empty when there is nothing to name (RFC 6749 §3.3); the validator feeds the 401 the required scopes when `scopes_supported` is empty. `quoted` escapes a config-derived value for an HTTP quoted-string — defence against a typo producing a malformed header, not against an attacker |
 | `authenticate.rs` | `Credential` (`StaticToken`/`OAuth(AuthorizedToken)`, `#[non_exhaustive]`) and `authenticate()`: the framework-free credential check every candidate header value goes through — constant-time (`subtle`) static-token comparison first (needs no network), then OAuth in two passes (cache-only, then a pass that may trigger a key fetch, so one candidate's unknown `kid` never queues a request behind a refetch when another candidate's key is already cached). Precedence on refusal: any acceptance wins; otherwise `InsufficientScope` if any candidate was valid-but-unscoped; otherwise `Missing` with no non-blank candidate; otherwise `Invalid` with the first candidate's reason. Every candidate is checked independently — a bad credential in one source never masks a good one in another — no framework dependency, so a non-axum HTTP stack calls this directly |
+| `refusal.rs` | Core, no feature gate, no `http` dependency: `refusal()`/`refusal_with_static_challenge()` → `Refusal` (`status: u16`, `www_authenticate: Option<String>`, `#[non_exhaustive]`), the framework-free RFC 6750 mapping from a `TokenRejection` (403 for `InsufficientScope`, 401 for everything else, any future variant included) to a status and challenge (the validator's with OAuth; otherwise `DEFAULT_STATIC_CHALLENGE`, the caller's own, or none). The decision itself is the crate-private generic `select`, which both this public API (over `String`s) and the layers' `http_layer::Gate` (over pre-validated `HeaderValue`s, which may hold bytes a `&str` cannot, so there is no fallible conversion per request) call — the one place a status or challenge is chosen |
+| `http_layer.rs` | The `tower` feature (implied by `axum`); the module is `http_layer`, never `tower`, because a crate-root `tower` module makes `tower` ambiguous for a downstream `use oauth_resource_server::*;` next to the `tower` crate (`tests/glob_import.rs` pins that): `HttpAuthLayer<R = EmptyRefusal>`/`HttpAuthLayerBuilder<R>`/`HttpAuthService<S, R>`, a `tower::Layer` for any `Service<http::Request<ReqBody>, Response = http::Response<ResBody>>` — named `Http…` so it cannot be mistaken for `axum::AuthLayer` when both are in scope. A refusal's response comes from `R: RefusalResponse<ResBody>` (sealed by the private `sealed::Sealed`, since only `on_reject` can install one) — `EmptyRefusal` (`ResBody::default()`) or an `on_reject` closure — before `Gate::finish` fixes its status and challenge; the boxed future is `Send` without `ResBody: Send` (the check's result is bound before the inner call). Also the pieces both layers share, defined here and re-exported from `axum`: `CredentialSource` (with `presents_nothing`, `names_a_token`, `bearer_credential`, the `__fuzz` target's parser), `RejectContext`, `AuthLayerError` (re-exported with `#[doc(inline)]`, so docs.rs shows them under `axum::` too), and the crate-private `Gate` (`build` — every fail-closed check —, `check_decision`, `admit` — clear an outer credential for `optional()`, mark sources sensitive, `authenticate`, insert `Credential`/`AuthorizedToken`, decide the optional pass-through —, `status_and_challenge`, `finish`). `Gate` logs nothing: each layer logs the `Admission` itself, so the axum layer's log target stays `oauth_resource_server::axum` and this one's is `oauth_resource_server::http_layer`. No `LayerRan` marker, so the axum extractors answer 500 behind this layer (documented) |
 | `policy.rs` | `static_token_policy`: pure decision logic (no logging) for which static token, if any, an `AuthLayer` should hold alongside OAuth — `StaticTokenDecision`'s five variants (`StaticAndOAuth`/`StaticOnly`/`OAuthOnly`/`StaticIgnored`/`Unauthenticated`) cover dual mode, static-only, OAuth-only, `accept_static_bearer: false` ignoring a configured token, and the explicit unauthenticated opt-out. `NoAuthConfigured` is returned when nothing is configured and `allow_unauthenticated` was false. Its hand-written `Debug` redacts the token; an application wraps this with its own log lines and message wording (see mcp-md-wiki's `server::static_bearer_token`) |
-| `axum.rs` | The `axum` feature: `CredentialSource` (`Bearer`/`Raw` header, `#[non_exhaustive]`), `AuthLayer` (a `tower::Layer` and the state for the `require_auth` middleware fn — the two behave identically, both routing through `AuthLayer::check`), `AuthLayerBuilder` (fail-closed `build`/`build_with_decision` — including `AuthLayerError::InvalidChallenge` —, `static_challenge` for the no-OAuth 401 challenge, default `DEFAULT_STATIC_CHALLENGE`; `on_reject` shapes only the refusal body/extra headers — status and `WWW-Authenticate` are fixed after it runs, in `Enforce::reject`; `RejectContext`'s hand-written `Debug` prints header names only, and `check` marks credential headers sensitive; `optional()` passes a request presenting no credential through, logged at `debug`, and refuses everything else as without it; it clears outer layers' `Credential`/`AuthorizedToken` first, strict layers accumulate them), the `FromRequestParts`/`OptionalFromRequestParts` impls for `AuthorizedToken` and `Credential` (read the extensions `check` inserted; the private `LayerRan` marker `check` inserts on every pass lets a missing value be refused through `Enforce::refuse` with the layer's own 401 and challenge, `refuse_extraction` giving `allow_unauthenticated` layers `DEFAULT_STATIC_CHALLENGE`; no marker means a route outside every layer, answered 500 with an `error` log by `no_layer`; a typed per-handler scope extractor is deferred to oauth-resource-server#4), and `metadata_router` (serves the RFC 9728 document on the bare well-known prefix and, when the resource URL has a path, on the path-suffixed form too, matched by literal string comparison rather than registered as an axum route pattern — a resource URL may legally contain `:`/`*`/`{}` characters axum would read as routing syntax). Logs every outcome itself (module docs list the levels) so an application needs no auth-specific logging of its own |
+| `axum.rs` | The `axum` feature: re-exports `CredentialSource` (`Bearer`/`Raw` header, `#[non_exhaustive]`), `RejectContext` and `AuthLayerError` from `http_layer.rs` and `DEFAULT_STATIC_CHALLENGE` from `refusal.rs`; `AuthLayer` (a `tower::Layer` and the state for the `require_auth` middleware fn — the two behave identically, both routing through `AuthLayer::check`, which runs the shared `Gate::admit` and logs the outcome), `AuthLayerBuilder` (fail-closed `build`/`build_with_decision` through `Gate::build`/`Gate::check_decision` — including `AuthLayerError::InvalidChallenge` —, `static_challenge` for the no-OAuth 401 challenge, default `DEFAULT_STATIC_CHALLENGE`; `on_reject` shapes only the refusal body/extra headers — status and `WWW-Authenticate` are fixed after it runs, in `Enforce::reject` via `Gate::finish`; `RejectContext`'s hand-written `Debug` prints header names only, and `check` marks credential headers sensitive; `optional()` passes a request presenting no credential through, logged at `debug`, and refuses everything else as without it; it clears outer layers' `Credential`/`AuthorizedToken` first, strict layers accumulate them), the `FromRequestParts`/`OptionalFromRequestParts` impls for `AuthorizedToken` and `Credential` (read the extensions `check` inserted; the private `LayerRan` marker `check` inserts on every pass lets a missing value be refused through `Enforce::refuse` with the layer's own 401 and challenge, `refuse_extraction` giving `allow_unauthenticated` layers `DEFAULT_STATIC_CHALLENGE`; no marker means a route outside every layer, answered 500 with an `error` log by `no_layer`; a typed per-handler scope extractor is deferred to oauth-resource-server#4), and `metadata_router` (serves the RFC 9728 document on the bare well-known prefix and, when the resource URL has a path, on the path-suffixed form too, matched by literal string comparison rather than registered as an axum route pattern — a resource URL may legally contain `:`/`*`/`{}` characters axum would read as routing syntax). Logs every outcome itself (module docs list the levels) so an application needs no auth-specific logging of its own |
 | `env.rs` | The `env` feature: `secret_from_env`/`secret_from_lookup` (`VAR` or `VAR_FILE`, Docker Compose `secrets:`-mount shape; both set is an error, not a silent preference; a `_FILE` that reads empty is an error, an absent `VAR` is not) and `oauth_config_from_env`/`oauth_config_from_lookup` (one `<PREFIX><FIELD_UPPER>` variable per `OAuthConfig` field, lists whitespace-split, bools strict `"true"`/`"false"`, `<PREFIX>ENABLED` unset inferring on/off from whether any `IdentifyingVars` entry is set). `EnvOAuthConfig`/`unresolved_oauth_config_from_env` is the hook an application uses to layer its own defaults (a default required scope, say) between loading and `resolve` — the same hook a config-file application has between deserializing and calling `OAuthConfig::resolve` directly. `EnvError` never carries a secret's value, only variable names and file paths. Every `_lookup`/`_from_lookup` twin exists so tests never call the `unsafe`-as-of-2024-edition `std::env::set_var` |
 | `testing.rs` | **Test-only** fixtures (compiled for this crate's own tests, and behind the `testing` feature for consumers'). The primary entry point is `TestAuthority` (`start` runs a `spawn_http_server`-backed loopback authority with OIDC and RFC 8414 discovery plus `/jwks`, issuer = its own base URL; `issuer`/`jwks_uri`/`jwks_fetches`/`discovery_fetches` (private per-path counters on `FakeJwksServer`)/`set_response_delay`; no accessor exposes the inner `FakeJwksServer`, so its layout is not frozen and `publish()` owns the routes; `Drop` aborts the accept loop; `rotate_key` flips the active RSA key between `KEY_A_PEM` and `KEY_B_PEM` and publishes both, `withdraw_old_key` drops the retained one; every JWKS carries one labelled JWK per RSA algorithm (`<kid>` for RS256, `<kid>-rs384`/`-rs512`/`-ps256`/`-ps384`/`-ps512` — frozen `kid`s, never alg-less, so no validator logs the `ambiguous` warning; a test pins that) plus the EC and Ed25519 keys, at most 14 under `MAX_JWKS_KEYS`, so every `TokenBuilder::alg` validates; `config(adjust)` resolves an `OAuthConfig` with neutral defaults — `https://api.example.test/` resource and a distinct `https://api.example.test/audience` audience, `api:read`, `Dotted("oauth")`, loopback http needing no `allow_insecure_http` — and panics with the `ConfigError` text) and `TokenBuilder` (`token()`; the fluent knobs, `sign()` captures the active RSA key when `token()` is called, defaults validate against `config(|_| {})`); its tests use the harness itself. Below it, the older building blocks: throwaway RSA/EC/Ed25519 keypairs (`KEY_A_PEM`/`KEY_B_PEM`/`EC_PEM`/`ED_PEM`, generated for this suite, used nowhere else — see the leak policy; `KID_B`/`N_B`/`jwk_rsa_b` are `KEY_B_PEM`'s public half, no new key material), JWK builders (`jwk_rsa_a`, `jwk_ec`, `jwk_ed`, `jwks_of(&[..])`, `jwks_body`/`jwks_body_all`), token minting (`mint`/`mint_with` take `&impl Serialize` claims; `valid_token`), a `resolved_config` fixture, and `FakeJwksServer` (`Debug`, `#[non_exhaustive]`; its `hold`/`release` gate, `path_hits` and `accept_task` are `pub(crate)`)/`spawn_jwks_server`/`spawn_http_server` (an in-process fake authorization server for discovery/JWKS tests). Models a plausible Authentik deployment — not a code default, see Key conventions |
 
@@ -417,8 +457,9 @@ from, and never a local plan/review label ("chunk p2", "round one").
   The `axum`/`http` ones are (`metadata_router` returns
   `axum::Router<S>`, `require_auth`'s signature takes axum's
   `State`/`Request`/`Next`, `CredentialSource` holds an `http::HeaderName`,
-  `static_challenge` takes an `http::HeaderValue`); that ships in a new `0.x`
-  minor. `jsonwebtoken` deliberately does not (see its pin paragraph above),
+  `static_challenge` takes an `http::HeaderValue`, and the `tower` feature's
+  `HttpAuthService` is a `Service<http::Request<_>>` and `on_reject`
+  returns an `http::Response`); that ships in a new `0.x` minor. `jsonwebtoken` deliberately does not (see its pin paragraph above),
   and `reqwest` never appears in a public signature either.
 - The `testing` feature's public items are covered by the same rules (see Key
   conventions): they are API, not an exempt zone.

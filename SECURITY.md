@@ -61,12 +61,19 @@ the ones a report is most likely to concern:
   falls back to accepting a token it cannot verify against the keys it has;
 - `WWW-Authenticate` is set (and overwrites whatever a caller-supplied
   rejection handler returned) on every 401/403 once OAuth is configured, and
-  a layer whose challenge would not be a valid header refuses to build;
+  a layer whose challenge would not be a valid header refuses to build. The
+  status and challenge are decided by one function, shared by the axum layer,
+  the `tower` layer and the public `refusal()` a hand-built integration
+  calls, and every challenge it returns is a valid header value (a validator
+  whose configured challenge would not be one logs at `error` and uses a
+  fallback without `resource_metadata`, and the layers refuse to build with
+  it);
 - a configuration that would accept ID tokens as access tokens, or fetch keys
   from (or receive tokens at) a plain-`http` non-loopback URL — configured,
   discovered or reached by a redirect — is refused (at startup, or when the
   fetch is made) unless explicitly opted into;
-- `AuthLayer` cannot be constructed in a state that silently passes every
+- `AuthLayer` (and the `tower` feature's `HttpAuthLayer`, which runs the
+  same check) cannot be constructed in a state that silently passes every
   request through unauthenticated — that requires an explicit,
   clearly-named constructor. An `optional()` layer still needs a credential
   mechanism, and passes through only a request that presents no credential

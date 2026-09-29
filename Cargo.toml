@@ -45,8 +45,14 @@ native-tls = ["reqwest/native-tls"]
 serde = ["serde/derive"]
 # `env` module: load the config from environment variables (with `VAR_FILE`).
 env = []
+# `http_layer` module: an authentication layer for any `http`-typed tower service
+# (hyper, tonic, ...), generic over its request and response body types.
+tower = ["dep:http", "dep:tower-layer", "dep:tower-service"]
 # `axum` module: authentication middleware and the RFC 9728 metadata routes.
-axum = ["dep:axum", "dep:http", "dep:tower-layer", "dep:tower-service"]
+# Implies `tower`: both layers run the same credential check, and the axum
+# module re-exports `CredentialSource`, `RejectContext` and `AuthLayerError`
+# from it.
+axum = ["tower", "dep:axum"]
 # `testing` module: throwaway keys, token minting and a fake JWKS server for
 # CONSUMERS' TESTS. Never enable this in a production build.
 testing = ["tokio/net", "tokio/io-util"]
@@ -124,6 +130,12 @@ tracing-subscriber = "0.3"
 # The README's CORS doctest (`Access-Control-Expose-Headers` for
 # `WWW-Authenticate`); the library itself has no CORS opinion of its own.
 tower-http = { version = "0.7", features = ["cors"] }
+# The `hyper` example (a server with no framework, and a client to drive it).
+# All already in the dev-dependency tree through axum's `tokio`/`http1`.
+hyper = { version = "1", features = ["server", "client", "http1"] }
+hyper-util = { version = "0.1", features = ["tokio"] }
+http-body-util = "0.1"
+bytes = "1"
 
 # Each example names the features it needs, so `cargo build --examples` with
 # fewer features skips it rather than failing to compile it.
@@ -142,3 +154,7 @@ required-features = ["testing"]
 [[example]]
 name = "env_config"
 required-features = ["env", "axum"]
+
+[[example]]
+name = "hyper"
+required-features = ["testing"]

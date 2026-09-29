@@ -691,7 +691,11 @@ version = "0.1.2"
 dependencies = [
  "axum",
  "base64 0.23.1",
+ "bytes",
  "http",
+ "http-body-util",
+ "hyper",
+ "hyper-util",
  "jsonwebtoken",
  "reqwest",
  "serde",

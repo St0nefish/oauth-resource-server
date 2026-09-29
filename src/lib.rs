@@ -21,9 +21,11 @@
 | [`OAuthValidator::key_set_status`], [`KeySetStatus`], [`RefreshError`] | A passive, no-I/O view of the signing keys held, for readiness probes and status pages ([`OAuthValidator::is_ready`]). |
 | [`AuthorizedToken`], [`TokenRejection`] | The two outcomes of a validation. |
 | [`authenticate`], [`Credential`] | Framework-free checking of several candidate credentials against a static token and OAuth. |
+| [`refusal`], [`refusal_with_static_challenge`], [`Refusal`], [`DEFAULT_STATIC_CHALLENGE`] | Framework-free mapping of a [`TokenRejection`] to its status (401/403) and `WWW-Authenticate` challenge — the same decision both layers make. |
 | [`Algorithm`], [`parse_algorithm`], [`AlgorithmError`] | The JWS algorithms a config may allow (never HMAC or `none`). |
 | [`static_token_policy`], [`StaticTokenDecision`] | The startup decision about a static API key alongside OAuth. |
 | [`axum::AuthLayer`], [`axum::require_auth`], [`axum::metadata_router`] | The axum integration (feature `axum`), including extractors for [`Credential`] and [`AuthorizedToken`]. |
+| [`http_layer::HttpAuthLayer`], [`http_layer::HttpAuthLayerBuilder`] | A `tower` layer for any `http::Request<B>` service, whatever its body types (feature `tower`, implied by `axum`). |
 | [`env::oauth_config_from_env`], [`env::secret_from_env`] | Configuration from environment variables (feature `env`). |"
 )]
 // The last row links the `testing` module, which exists only with that feature;
@@ -85,10 +87,15 @@ mod validator;
 
 mod authenticate;
 mod policy;
+mod refusal;
 
 #[cfg(feature = "env")]
 #[cfg_attr(docsrs, doc(cfg(feature = "env")))]
 pub mod env;
+
+#[cfg(feature = "tower")]
+#[cfg_attr(docsrs, doc(cfg(feature = "tower")))]
+pub mod http_layer;
 
 #[cfg(feature = "axum")]
 #[cfg_attr(docsrs, doc(cfg(feature = "axum")))]
@@ -119,5 +126,6 @@ pub use config::{
 };
 pub use jwks::{KeySetStatus, RefreshError, RefreshErrorKind};
 pub use policy::{NoAuthConfigured, StaticTokenDecision, static_token_policy};
+pub use refusal::{DEFAULT_STATIC_CHALLENGE, Refusal, refusal, refusal_with_static_challenge};
 pub use token::{AuthorizedToken, TokenRejection};
 pub use validator::{OAuthValidator, ValidatorError};
