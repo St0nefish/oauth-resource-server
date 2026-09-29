@@ -372,7 +372,7 @@ pub(crate) struct CachedKey {
     /// The JWK declared no `alg` and more than one allowlisted algorithm fits
     /// its type — the RFC 8725 §3.1 deviation warned about when the key first
     /// appears.
-    ambiguous: bool,
+    pub(crate) ambiguous: bool,
 }
 
 /// The in-memory JWKS plus when we last *attempted* to refresh it.

@@ -289,13 +289,25 @@ feature badge; give a new feature-gated item the same attribute.
   message text must stay generic (no "MCP" anywhere). Rewording either phrase
   is allowed; when the pin fails, change `WIKI_REWRITES` deliberately and tell
   mcp-md-wiki, whose rewrite then changes with its lock bump.
-- Test fixtures (`src/testing.rs`) model a plausible Authentik deployment
-  (per-application issuer with a trailing slash, client-id audience,
-  `mcp:read`/`mcp:write` scopes) because that is the production shape the
-  original regression tests were written against — not because the crate is
-  MCP-specific. Docs must always present the crate as general-purpose; the
-  fixtures' scope names are an implementation detail of the test suite, never
-  a code default.
+- Test fixtures (`src/testing.rs`) come in two layers. The older free
+  functions and constants (`ISSUER`, `resolved_config`, `valid_token`, …)
+  model a plausible Authentik deployment (per-application issuer with a
+  trailing slash, client-id audience, `mcp:read`/`mcp:write` scopes) because
+  that is the production shape the original regression tests were written
+  against — not because the crate is MCP-specific — and they stay for this
+  crate's own regression tests and for downstream suites that use them. The
+  consumer-facing harness (`TestAuthority`, `TokenBuilder`) uses **neutral**
+  defaults (`https://api.example.test/` resource, a distinct `/audience` audience, `api:read`, `KeyNaming::Dotted("oauth")`)
+  and is what docs and new tests should reach for. Docs must always present
+  the crate as general-purpose; the fixtures' scope names are an
+  implementation detail of the test suite, never a code default.
+- **`testing` follows semver like the rest of the crate**: downstream test
+  suites use it, so removing, renaming or changing the behavior of a public
+  item there (a constant, a `kid`, a key the served JWKS holds, a builder
+  default) is breaking and ships in a new `0.x` minor; additions are not.
+  Only panic-message wording is exempt. Its docs and the README's "Testing
+  your integration" section say so, and CI's `cargo-semver-checks` covers it
+  (it is compiled with `--all-features`).
 - Tests use generated-for-the-suite throwaway keys only (`KEY_A_PEM`,
   `KEY_B_PEM`, `EC_PEM`, `ED_PEM` in `src/testing.rs`) and example domains
   (`*.example.test`, `*.example.com`) — never a real issuer, client ID, or
@@ -373,7 +385,7 @@ from, and never a local plan/review label ("chunk p2", "round one").
 | `policy.rs` | `static_token_policy`: pure decision logic (no logging) for which static token, if any, an `AuthLayer` should hold alongside OAuth — `StaticTokenDecision`'s five variants (`StaticAndOAuth`/`StaticOnly`/`OAuthOnly`/`StaticIgnored`/`Unauthenticated`) cover dual mode, static-only, OAuth-only, `accept_static_bearer: false` ignoring a configured token, and the explicit unauthenticated opt-out. `NoAuthConfigured` is returned when nothing is configured and `allow_unauthenticated` was false. Its hand-written `Debug` redacts the token; an application wraps this with its own log lines and message wording (see mcp-md-wiki's `server::static_bearer_token`) |
 | `axum.rs` | The `axum` feature: `CredentialSource` (`Bearer`/`Raw` header, `#[non_exhaustive]`), `AuthLayer` (a `tower::Layer` and the state for the `require_auth` middleware fn — the two behave identically, both routing through `AuthLayer::check`), `AuthLayerBuilder` (fail-closed `build`/`build_with_decision` — including `AuthLayerError::InvalidChallenge` —, `static_challenge` for the no-OAuth 401 challenge, default `DEFAULT_STATIC_CHALLENGE`; `on_reject` shapes only the refusal body/extra headers — status and `WWW-Authenticate` are fixed after it runs, in `Enforce::reject`; `RejectContext`'s hand-written `Debug` prints header names only, and `check` marks credential headers sensitive; `optional()` passes a request presenting no credential through, logged at `debug`, and refuses everything else as without it; it clears outer layers' `Credential`/`AuthorizedToken` first, strict layers accumulate them), the `FromRequestParts`/`OptionalFromRequestParts` impls for `AuthorizedToken` and `Credential` (read the extensions `check` inserted; the private `LayerRan` marker `check` inserts on every pass lets a missing value be refused through `Enforce::refuse` with the layer's own 401 and challenge, `refuse_extraction` giving `allow_unauthenticated` layers `DEFAULT_STATIC_CHALLENGE`; no marker means a route outside every layer, answered 500 with an `error` log by `no_layer`; a typed per-handler scope extractor is deferred to oauth-resource-server#4), and `metadata_router` (serves the RFC 9728 document on the bare well-known prefix and, when the resource URL has a path, on the path-suffixed form too, matched by literal string comparison rather than registered as an axum route pattern — a resource URL may legally contain `:`/`*`/`{}` characters axum would read as routing syntax). Logs every outcome itself (module docs list the levels) so an application needs no auth-specific logging of its own |
 | `env.rs` | The `env` feature: `secret_from_env`/`secret_from_lookup` (`VAR` or `VAR_FILE`, Docker Compose `secrets:`-mount shape; both set is an error, not a silent preference; a `_FILE` that reads empty is an error, an absent `VAR` is not) and `oauth_config_from_env`/`oauth_config_from_lookup` (one `<PREFIX><FIELD_UPPER>` variable per `OAuthConfig` field, lists whitespace-split, bools strict `"true"`/`"false"`, `<PREFIX>ENABLED` unset inferring on/off from whether any `IdentifyingVars` entry is set). `EnvOAuthConfig`/`unresolved_oauth_config_from_env` is the hook an application uses to layer its own defaults (a default required scope, say) between loading and `resolve` — the same hook a config-file application has between deserializing and calling `OAuthConfig::resolve` directly. `EnvError` never carries a secret's value, only variable names and file paths. Every `_lookup`/`_from_lookup` twin exists so tests never call the `unsafe`-as-of-2024-edition `std::env::set_var` |
-| `testing.rs` | **Test-only** fixtures (compiled for this crate's own tests, and behind the `testing` feature for consumers'): throwaway RSA/EC/Ed25519 keypairs (`KEY_A_PEM`/`KEY_B_PEM`/`EC_PEM`/`ED_PEM`, generated for this suite, used nowhere else — see the leak policy), JWK builders (`jwk_rsa_a`, `jwk_ec`, `jwk_ed`, `jwks_of(&[..])`, `jwks_body`/`jwks_body_all`), token minting (`mint`/`mint_with` take `&impl Serialize` claims; `valid_token`), a `resolved_config` fixture, and `FakeJwksServer` (`Debug`, `#[non_exhaustive]`; its `hold`/`release` gate is `pub(crate)`, for this crate's own tests only)/`spawn_jwks_server`/`spawn_http_server` (an in-process fake authorization server for discovery/JWKS tests). Models a plausible Authentik deployment — not a code default, see Key conventions |
+| `testing.rs` | **Test-only** fixtures (compiled for this crate's own tests, and behind the `testing` feature for consumers'). The primary entry point is `TestAuthority` (`start` runs a `spawn_http_server`-backed loopback authority with OIDC and RFC 8414 discovery plus `/jwks`, issuer = its own base URL; `issuer`/`jwks_uri`/`jwks_fetches`/`discovery_fetches` (private per-path counters on `FakeJwksServer`)/`set_response_delay`; no accessor exposes the inner `FakeJwksServer`, so its layout is not frozen and `publish()` owns the routes; `Drop` aborts the accept loop; `rotate_key` flips the active RSA key between `KEY_A_PEM` and `KEY_B_PEM` and publishes both, `withdraw_old_key` drops the retained one; every JWKS carries one labelled JWK per RSA algorithm (`<kid>` for RS256, `<kid>-rs384`/`-rs512`/`-ps256`/`-ps384`/`-ps512` — frozen `kid`s, never alg-less, so no validator logs the `ambiguous` warning; a test pins that) plus the EC and Ed25519 keys, at most 14 under `MAX_JWKS_KEYS`, so every `TokenBuilder::alg` validates; `config(adjust)` resolves an `OAuthConfig` with neutral defaults — `https://api.example.test/` resource and a distinct `https://api.example.test/audience` audience, `api:read`, `Dotted("oauth")`, loopback http needing no `allow_insecure_http` — and panics with the `ConfigError` text) and `TokenBuilder` (`token()`; the fluent knobs, `sign()` captures the active RSA key when `token()` is called, defaults validate against `config(|_| {})`); its tests use the harness itself. Below it, the older building blocks: throwaway RSA/EC/Ed25519 keypairs (`KEY_A_PEM`/`KEY_B_PEM`/`EC_PEM`/`ED_PEM`, generated for this suite, used nowhere else — see the leak policy; `KID_B`/`N_B`/`jwk_rsa_b` are `KEY_B_PEM`'s public half, no new key material), JWK builders (`jwk_rsa_a`, `jwk_ec`, `jwk_ed`, `jwks_of(&[..])`, `jwks_body`/`jwks_body_all`), token minting (`mint`/`mint_with` take `&impl Serialize` claims; `valid_token`), a `resolved_config` fixture, and `FakeJwksServer` (`Debug`, `#[non_exhaustive]`; its `hold`/`release` gate, `path_hits` and `accept_task` are `pub(crate)`)/`spawn_jwks_server`/`spawn_http_server` (an in-process fake authorization server for discovery/JWKS tests). Models a plausible Authentik deployment — not a code default, see Key conventions |
 
 ## Semver and MSRV policy
 
@@ -408,6 +420,8 @@ from, and never a local plan/review label ("chunk p2", "round one").
   `static_challenge` takes an `http::HeaderValue`); that ships in a new `0.x`
   minor. `jsonwebtoken` deliberately does not (see its pin paragraph above),
   and `reqwest` never appears in a public signature either.
+- The `testing` feature's public items are covered by the same rules (see Key
+  conventions): they are API, not an exempt zone.
 - Non-breaking (ships in a `0.x` minor): adding a field to a
   `#[non_exhaustive]` struct or a variant to a `#[non_exhaustive]` enum;
   adding a new public item; adding a new feature; loosening a validation rule

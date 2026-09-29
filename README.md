@@ -82,7 +82,7 @@ oauth-resource-server = { version = "0.1", features = ["axum", "serde"] }
 | `serde` | no | `Deserialize`/`Serialize` for `OAuthConfig`, to load it from YAML, TOML, JSON or any other serde format. |
 | `env` | no | The `env` module: load the config and secrets from environment variables, with `VAR_FILE` support. |
 | `axum` | no | The `axum` module: the `AuthLayer` middleware, `metadata_router`, and axum extractors for `Credential` and `AuthorizedToken`. |
-| `testing` | no | Throwaway signing keys, token minting and a fake JWKS server, for **your tests only**. Never enable it in a production build. |
+| `testing` | no | A fake authorization server (`TestAuthority`), a fluent token builder, and the throwaway signing keys behind them, for **your tests only**. Never enable it in a production build. It follows semver like the rest of the crate. |
 
 The core (config, validator, `authenticate`, `static_token_policy`) is always
 available and depends on no web framework.
@@ -1398,6 +1398,91 @@ no reason. The validator and key-set messages come from the targets
 | The metadata document is 404 | OAuth is off (`metadata_router(None)` answers 404), or the path does not match the path of `resource`. `OAuthValidator::metadata_path()` returns the path served. |
 | A static token that used to work is refused | With OAuth on, `accept_static_bearer: false` makes `static_token_policy` return `StaticIgnored`. |
 | `AuthLayerError::NoCredential` or `NoAuthConfigured` | Neither a static token nor OAuth is configured. Configure one, or opt out explicitly with `allow_unauthenticated`. |
+
+## Testing your integration
+
+Enable the `testing` feature **from `[dev-dependencies]` only** (its signing
+keys are public, so anything that trusts them trusts everyone):
+
+```toml
+[dev-dependencies]
+oauth-resource-server = { version = "0.1", features = ["testing"] }
+```
+
+`testing::TestAuthority` is a fake authorization server on a loopback port. It
+serves discovery (OpenID Connect and RFC 8414) and a JWKS, and hands you a
+config and tokens that agree with it, with neutral defaults: resource
+`https://api.example.test/`, a distinct audience `https://api.example.test/audience`,
+required scope `api:read`, settings named `oauth.*`. Each thing a test wants
+wrong is one builder call.
+
+```text
+use std::sync::Arc;
+
+use axum::{Router, body::Body, http::{Request, StatusCode}, routing::get};
+use oauth_resource_server::axum::AuthLayer;
+use oauth_resource_server::testing::TestAuthority;
+use oauth_resource_server::{AuthorizedToken, OAuthValidator};
+use tower::ServiceExt; // for `oneshot`
+
+#[tokio::main(flavor = "current_thread")]
+async fn main() {
+    let authority = TestAuthority::start().await;
+    // Adjust anything before the config is resolved; it panics with the
+    // `ConfigError` text if the result is invalid.
+    let config = authority.config(|c| c.require_at_jwt = true);
+    let validator = Arc::new(OAuthValidator::new(&config).unwrap());
+
+    let app = Router::new()
+        .route(
+            "/whoami",
+            get(|token: AuthorizedToken| async move { token.subject.unwrap_or_default() }),
+        )
+        .route_layer(AuthLayer::builder().oauth(validator).build().unwrap());
+    let request = |bearer: String| {
+        Request::builder()
+            .uri("/whoami")
+            .header("authorization", format!("Bearer {bearer}"))
+            .body(Body::empty())
+            .unwrap()
+    };
+
+    let ok = app.clone().oneshot(request(authority.token().subject("ada").sign())).await.unwrap();
+    assert_eq!(ok.status(), StatusCode::OK);
+
+    let expired = app.clone().oneshot(request(authority.token().expired().sign())).await.unwrap();
+    assert_eq!(expired.status(), StatusCode::UNAUTHORIZED);
+
+    let no_scope = app.oneshot(request(authority.token().scopes(["other:scope"]).sign())).await.unwrap();
+    assert_eq!(no_scope.status(), StatusCode::FORBIDDEN);
+}
+```
+
+(This block is fenced `text` because the README is compiled without the
+`testing` feature; its body is identical to the doctest in the
+[`testing`](https://docs.rs/oauth-resource-server/latest/oauth_resource_server/testing/)
+module docs, which is compiled and run. Use `#[tokio::test]` instead of
+`#[tokio::main]` in a real test.) The example needs `tower` with the `util`
+feature (for `ServiceExt::oneshot`) as a dev-dependency.
+
+The token builder covers what an access-token test needs to get wrong:
+`.subject()`, `.scopes()`, `.audience()`/`.audiences()`, `.issuer()`,
+`.expires_in(secs)`, `.expired()`, `.not_before_in(secs)`, `.issued_ago(secs)`,
+`.typ()`, `.without_typ()`, `.alg()` (RS*, PS*, ES256, EdDSA, each signed with
+the matching published throwaway key), `.kid()`, `.claim()` (also the way to
+set an absolute or malformed `exp`/`nbf`/`iat`), `.without_claim()` and
+`.sign()`. Key rotation is `authority.rotate_key()` (publishes the new key next
+to the old) followed, if you want the old key gone, by
+`authority.withdraw_old_key()` (its tokens then fail once the validator
+refreshes). `authority.jwks_fetches()` and `authority.discovery_fetches()`
+count what the authority served, and `authority.set_response_delay(..)`
+simulates a slow one. For a handler test that needs no validation at all,
+build the verified value directly with `AuthorizedToken::new(..)` and
+`with_claims(..)`.
+
+`testing` follows semver like the rest of the crate: a breaking change to it
+ships in a new `0.x` minor, so your test suite is not broken by a patch or
+additive release.
 
 ## Examples
 

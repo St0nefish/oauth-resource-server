@@ -10,6 +10,31 @@ Before 1.0, a breaking change increments the minor version.
 
 ### Added
 
+- A general-purpose consumer test harness in the `testing` feature.
+  `testing::TestAuthority::start().await` runs a loopback fake authorization
+  server with OpenID Connect and RFC 8414 discovery and a JWKS, and exposes
+  `issuer()`, `jwks_uri()`, `jwks_fetches()`, `discovery_fetches()`,
+  `set_response_delay(Duration)`, `rotate_key()` (publishes the other
+  throwaway RSA key beside the old one), `withdraw_old_key()`,
+  `config(|c: &mut OAuthConfig| ..)` (a `ResolvedOAuthConfig` for that
+  authority with neutral defaults: resource `https://api.example.test/`,
+  audience `https://api.example.test/audience`, required scope `api:read`,
+  `KeyNaming::Dotted("oauth")`; it panics with the `ConfigError` text if the
+  adjusted config does not resolve) and `token()`. Dropping the authority stops
+  its server. `testing::TokenBuilder` (`subject`, `scopes`, `audience`,
+  `audiences`, `issuer`, `expires_in`, `expired`, `not_before_in`,
+  `issued_ago`, `typ`, `without_typ`, `alg`, `kid`, `claim`, `without_claim`,
+  `sign`) builds a token the `config` validator accepts by default and signs
+  RS*/PS*/ES256/EdDSA with the matching published throwaway key. The served
+  JWKS holds one labelled JWK per algorithm (`test-key-a` for RS256,
+  `test-key-a-rs384`, `-rs512`, `-ps256`, `-ps384`, `-ps512`, the same for
+  `test-key-b`, plus the P-256 and Ed25519 keys), so no key is alg-less and
+  no validator logs the ambiguous-key warning. Also `testing::KID_B`, `N_B`
+  and `jwk_rsa_b()` (the public half of the existing `KEY_B_PEM`). Every
+  existing `testing` item is unchanged. Documented: `testing` follows semver
+  like the rest of the crate, and a handler test that skips validation can
+  build an `AuthorizedToken` with `AuthorizedToken::new(..).with_claims(..)`.
+  Closes oauth-resource-server#12.
 - `AuthorizedToken` now carries the verified claims and token metadata, so a
   handler no longer decodes the JWT a second time: `issuer`, `audiences` (a
   string `aud` normalized to a list), `expires_at`, `issued_at`, `client_id`
@@ -23,7 +48,7 @@ Before 1.0, a breaking change increments the minor version.
   `with_issued_at`, `with_client_id` and `with_jti` set them for handler tests.
   A fractional `exp`/`iat` is rounded as `jsonwebtoken` rounds it, and one beyond
   9999-12-31T23:59:59Z saturates to that instant.
-  Closes #6.
+  Closes oauth-resource-server#6.
 - axum extractors (feature `axum`): `AuthorizedToken` and `Credential`
   implement `FromRequestParts`, and `Option<AuthorizedToken>` /
   `Option<Credential>` work through `OptionalFromRequestParts`. A handler can
