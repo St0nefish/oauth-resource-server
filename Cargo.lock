@@ -704,6 +704,7 @@ dependencies = [
  "subtle",
  "thiserror",
  "tokio",
+ "tokio-rustls",
  "tower",
  "tower-http 0.7.1",
  "tower-layer",

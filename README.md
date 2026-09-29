@@ -79,7 +79,7 @@ oauth-resource-server = { version = "0.1", features = ["axum", "serde"] }
 |---|---|---|
 | `rustls-tls` | yes | The rustls TLS backend for fetching the JWKS and discovery documents, trusting **only the Mozilla root certificates compiled into the binary**. |
 | `rustls-tls-native-roots` | no | rustls, trusting the operating system's certificate store instead (for an authorization server behind a private CA). |
-| `native-tls` | no | The platform TLS backend (OpenSSL on Linux), trusting the operating system's certificate store. |
+| `native-tls` | no | The platform TLS backend (OpenSSL on Linux), trusting the operating system's certificate store. Enabled together with a rustls feature, it is the one used (reqwest's choice), so the OS store applies rather than the Mozilla roots. |
 | `serde` | no | `Deserialize`/`Serialize` for `OAuthConfig`, to load it from YAML, TOML, JSON or any other serde format. |
 | `env` | no | The `env` module: load the config and secrets from environment variables, with `VAR_FILE` support. |
 | `tower` | no | The `http_layer` module: `HttpAuthLayer`, an authentication layer for any `tower` service over `http::Request<B>` (hyper, tonic, ...), whatever its body types. See [Using with other frameworks](#using-with-other-frameworks). |
@@ -101,9 +101,54 @@ default, trusts only the Mozilla root set built into the binary
 `SSL_CERT_FILE`. That suits an authorization server with a public
 certificate, and a minimal container with no CA bundle. A self-hosted server
 whose certificate comes from a private CA fails every fetch with a TLS error
-under it. Use `rustls-tls-native-roots` (rustls plus the OS store) or
-`native-tls` (the platform library plus the OS store) for that, and install
-the CA into the OS store as usual.
+under it. Either add the CA in code with
+`OAuthValidator::builder(..).add_root_certificate_pem(..)`, which works with
+every backend, or use `rustls-tls-native-roots` (rustls plus the OS store) or
+`native-tls` (the platform library plus the OS store) and install the CA into
+the OS store as usual. With `native-tls` and a rustls feature both enabled,
+reqwest uses native-tls, so the OS store is what applies (and what
+`add_root_certificate_pem` adds to), not the Mozilla roots.
+
+`add_root_certificate_pem` **adds** trust anchors; it never replaces the
+backend's own roots. A PEM file may hold one certificate or a bundle, and a
+file with no certificate in it, one the TLS backend cannot use, or any
+private-key block fails `build()` rather than being ignored. Pass only real
+CA certificates: under rustls a trust anchor keeps only its subject, public
+key and name constraints, ignoring `basicConstraints` and `keyUsage`, so a
+leaf (`CA:FALSE`) certificate passed here becomes an anchor that can issue
+for any host.
+
+```rust,no_run
+use std::sync::Arc;
+
+use oauth_resource_server::{KeyNaming, OAuthConfig, OAuthValidator};
+
+fn main() -> Result<(), Box<dyn std::error::Error>> {
+    let resolved = OAuthConfig {
+        enabled: true,
+        issuer: "https://idp.internal.example.com/".into(),
+        audience: "example-api".into(),
+        resource: "https://api.example.com/".into(),
+        required_scope: Some("api:read".into()),
+        ..OAuthConfig::default()
+    }
+    .resolve(KeyNaming::Dotted("oauth"))?
+    .expect("OAuth is enabled");
+
+    let validator = Arc::new(
+        OAuthValidator::builder(&resolved)
+            .add_root_certificate_pem(&std::fs::read("/etc/ssl/private-ca.pem")?)
+            .build()?,
+    );
+    assert!(!validator.is_ready()); // no I/O yet: keys load on first use
+    Ok(())
+}
+```
+
+A root added this way can vouch for any host name on this validator's
+fetches, so add the CA that issues the authorization server's certificate and
+nothing broader. The other fetch options (proxy, timeout, a key set to start
+from) are in [Fetch options](#fetch-options-code-not-config).
 
 If your application already uses `reqwest` with `native-tls`, switch this
 crate over as well, so the binary carries one TLS stack instead of two:
@@ -848,6 +893,12 @@ fn probes(oauth: Arc<OAuthValidator>) -> Router {
   5 s, doubling to at most 5 minutes, until keys load; that schedule, not
   request traffic, is what makes the process ready once the identity provider
   is reachable.
+- **A seeded validator is ready before it has talked to anyone.** With
+  `initial_jwks`, `is_ready()` is true from the moment the validator is
+  built, before any contact with the authorization server
+  (`key_set_status().last_success` stays `None` until a fetch succeeds). The
+  seeded keys are withdrawn only by a successful fetch that yields at least
+  one usable key; a failed or empty fetch keeps them.
 - **Gating on `/readyz` needs `spawn_background_refresh()`** (or at the very
   least a `refresh_now()` at startup). Without it keys are loaded only when a
   request brings a token, and a process that is not ready receives no
@@ -936,6 +987,52 @@ metadata document. Set it on the resolved value if you want one. (It also
 carries `key_naming`, the owned copy of the `KeyNaming` it was resolved with,
 which the validator's log lines use; and its `required_scopes` holds the union
 of `required_scope` and `required_scopes`.)
+
+### Fetch options (code, not config)
+
+How the validator reaches the authorization server is set on
+`OAuthValidator::builder(&resolved)`, not in `OAuthConfig` (whose fields are a
+config format; these are wired in code). `OAuthValidator::new(&resolved)` is
+the builder with nothing set. Every option is checked by `build()`, and a
+refused one is a `ValidatorError`, never silently dropped.
+
+| Builder method | Default | Meaning |
+|---|---|---|
+| `add_root_certificate_pem(&[u8])` | none | Adds the certificate(s) in a PEM file (one, or a bundle) as TLS trust anchors, on top of the TLS feature's own roots. Works with every TLS feature. Pass CA certificates only. Error: `ValidatorError::InvalidRootCertificate` (no certificate in it, one the backend cannot use, or a private-key block). |
+| `proxy(url)` | reqwest's own proxy handling (environment variables, and system settings where reqwest's `system-proxy` feature is on), for non-loopback fetches | An explicit `http://` or `https://` proxy for every non-loopback metadata and JWKS fetch, `user:password@` sent as proxy Basic auth. Setting it turns the environment and system proxies off, `NO_PROXY` included. No path, query, fragment, SOCKS scheme, space, control or non-ASCII character, and no credential in a plain-`http` proxy URL on a non-loopback host unless `allow_insecure_http` is set. Error: `ValidatorError::InvalidProxy` (never showing the URL). |
+
+| `fetch_timeout(Duration)` | `DEFAULT_FETCH_TIMEOUT`, 10 s | Timeout for one metadata or JWKS request, connect through last body byte. `MIN_FETCH_TIMEOUT` (1 s) to `MAX_FETCH_TIMEOUT` (60 s); zero or anything outside is `ValidatorError::FetchTimeoutOutOfRange`. |
+| `initial_jwks(&str)` | none | A JWK Set (`{"keys": [...]}`) the key cache starts with, parsed and narrowed exactly like a fetched one (256 KiB and 64-key caps, no `oct`/`use: enc`/non-`verify` key, each key limited to the configured algorithms). Refreshed normally: the first successful refresh replaces it, a failed one keeps it. Error: `ValidatorError::InvalidInitialJwks`. |
+
+Every fetch whose URL is on a loopback host (`localhost`, `*.localhost`,
+`127.0.0.0/8`, `::1`) uses a separate client with no proxy of any kind, so a
+loopback fetch never goes through a proxy, explicit or from the environment.
+Every other fetch uses reqwest's own proxy handling untouched: the
+`HTTP_PROXY`/`HTTPS_PROXY`/`ALL_PROXY`/`NO_PROXY` environment variables (and,
+on macOS and Windows, the system proxy settings when reqwest's `system-proxy`
+feature is on in your build) exactly as a plain reqwest client applies them —
+unless `proxy(url)` is set, which turns all of those off.
+
+With `initial_jwks`, `is_ready()` is true from the start and
+`key_set_status()` reports the seeded keys in `keys`, while `last_attempt` and
+`last_success` stay `None` until a real fetch (`keys > 0` with no
+`last_success` means "seeded, not yet confirmed by the authorization
+server"). Seeded keys count as held, so a failed background pass retries on
+the held-keys schedule (a minute, backing off to an hour), not the keyless
+5-second one. To seed from a file, pass `std::fs::read_to_string(path)?`.
+
+```rust
+use std::time::Duration;
+
+use oauth_resource_server::{OAuthValidator, ResolvedOAuthConfig, ValidatorError};
+
+fn build_validator(resolved: &ResolvedOAuthConfig) -> Result<OAuthValidator, ValidatorError> {
+    OAuthValidator::builder(resolved)
+        .proxy("http://proxy.example.com:3128")
+        .fetch_timeout(Duration::from_secs(5))
+        .build()
+}
+```
 
 ### Embedding `OAuthConfig` in your own config
 
@@ -1139,9 +1236,36 @@ verified claims and token metadata) or a
   metadata names, but that document is used only when its `issuer` equals the
   configured one byte-for-byte, and it may not downgrade an `https` issuer to
   `http`. Responses are capped at 256 KiB and 64 keys, fetches time out after
-  10 seconds, at most three redirects are followed, a redirect from `https`
-  to `http` is refused, and one to plain `http` on a non-loopback host is
-  refused without `allow_insecure_http`.
+  10 seconds (1 to 60 s with `fetch_timeout`), at most three redirects are
+  followed, a redirect from `https` to `http` is refused, and one to plain
+  `http` on a non-loopback host is refused without `allow_insecure_http`.
+  None of the [fetch options](#fetch-options-code-not-config) loosens any of
+  this, and a key set passed to `initial_jwks` gets the same size cap, key cap
+  and per-key checks as a fetched one.
+- **Proxies and extra roots do not weaken key integrity.** An `https` fetch
+  through a proxy (explicit, or from `HTTPS_PROXY`) is a `CONNECT` tunnel:
+  TLS runs end to end to the authorization server and its certificate is
+  checked against its host name, so the proxy can neither read nor replace
+  the keys. That is why a plain-`http` proxy on a non-loopback host needs no
+  opt-in; a plain-`http` fetch through it already needed
+  `allow_insecure_http` for its own URL, and a fetch of a loopback URL never
+  goes through any proxy, explicit or from the environment. One residual:
+  the proxy-free client is chosen from the URL a fetch starts at, so a
+  redirect from a non-loopback URL to a loopback one is followed by the
+  normal client and, with an environment or system proxy (never an explicit
+  one, which skips loopback hosts), can go through it, as it always has.
+  Such a hop is either `https` to `https`, where TLS stays end to end and the
+  certificate is still checked, or plain `http`, which the redirect policy
+  follows only when no `https` URL came before it and which already needed
+  `allow_insecure_http` for any non-loopback hop. A credential in a
+  plain-`http` proxy URL on a non-loopback host would cross the network in
+  cleartext, so `build()` refuses it without `allow_insecure_http` (and logs a
+  `warn` with it). The proxy URL never appears unredacted in a log line or
+  `Debug`, and a refused one never appears in the error at all.
+  A root certificate added with `add_root_certificate_pem` is trusted for any
+  host name on these fetches, so whoever holds that CA's private key can
+  serve signing keys: add only the CA that issues the authorization server's
+  certificate.
 - **Secrets stay out of logs.** Tokens and the static tokens are never logged,
   and the `Debug` output of the layer, its builder and the policy decision
   redacts the static token; a `StaticTokens` set prints its count and labels
@@ -1600,8 +1724,11 @@ token from those servers has been sent to this crate's validator itself.
 ## Configuration changes need a restart
 
 Nothing hot-reloads. A changed `OAuthConfig`, static token or credential
-source takes effect only when a new `OAuthValidator` and `AuthLayer` are built,
-which in practice means restarting the process. If your application reloads
+source — or a changed [fetch option](#fetch-options-code-not-config) (root
+certificate, proxy, timeout, initial key set), which is code rather than
+config but is read at the same moment — takes effect only when a new
+`OAuthValidator` and `AuthLayer` are built, which in practice means
+restarting the process. If your application reloads
 other settings live, treat all of these as restart-required and say so.
 Signing keys are the exception: they are refreshed in the background, so a key
 rotation at the authorization server needs no restart.
@@ -1638,7 +1765,7 @@ no reason. The validator and key-set messages come from the targets
 | `token algorithm HS256 is not in ...algorithms` | The server signs with a shared secret, which a resource server cannot verify. Give it an asymmetric signing key (Authentik: set a signing key on the provider). For an asymmetric algorithm, add it to `algorithms`. |
 | `token typ "JWT" is not accepted as an access token (...require_at_jwt is on)` | Your server does not emit `at+jwt`. Turn `require_at_jwt` off and rely on a required scope. |
 | `no RS256 key for kid "..." and the JWKS was refetched less than 60s ago` | The `kid` is not in the key set, and the once-a-minute refetch was already used. A key rotation resolves itself within a minute; if it persists, the token comes from a different issuer or key set. |
-| `JWKS refresh failed: ...` | The key set could not be fetched or had no usable keys. The rest of the message says why: a DNS or TLS error, a non-success status, `metadata issuer ... does not match`, or `the JWK Set contained no usable signature keys for ...algorithms`. A certificate error against a server with a private CA means the default `rustls-tls` feature, which trusts only its built-in Mozilla roots; see [Choosing a TLS backend](#choosing-a-tls-backend). |
+| `JWKS refresh failed: ...` | The key set could not be fetched or had no usable keys. The rest of the message says why: a DNS or TLS error, a non-success status, `metadata issuer ... does not match`, or `the JWK Set contained no usable signature keys for ...algorithms`. A certificate error against a server with a private CA means the default `rustls-tls` feature, which trusts only its built-in Mozilla roots: add the CA with `add_root_certificate_pem`, or see [Choosing a TLS backend](#choosing-a-tls-backend). |
 | 403, with `OAuth token is valid but lacks the required scope` at `info` | The line lists `required`, `present` and `scope_claims`. `present=[]` usually means the scopes are in a claim missing from `scope_claims`, or the server did not grant the scope (Authentik needs a scope mapping, Kanidm a scope map). |
 | Startup `warn`: `required scope(s) ... not in ...scopes_supported` | Clients request what is advertised and will get 403. Add the scope to `scopes_supported`. (An empty `scopes_supported` never logs this: the 401 challenge then names the required scopes.) |
 | Startup error: `no required scope is configured ...` | With no scope and no `require_at_jwt`, ID tokens would be accepted too. Set a required scope (or `require_at_jwt`, or `allow_unscoped_tokens` if that is really intended, which then logs a startup `warn`: `no required scope configured ... ANY token this issuer signs ...`). |

@@ -79,6 +79,31 @@ Before 1.0, a breaking change increments the minor version.
   like the rest of the crate, and a handler test that skips validation can
   build an `AuthorizedToken` with `AuthorizedToken::new(..).with_claims(..)`.
   Closes oauth-resource-server#12.
+- `OAuthValidator::builder(&resolved)` returns an `OAuthValidatorBuilder` for
+  how the validator fetches its keys; `build()` returns the validator or a
+  `ValidatorError`, and with no option set it is exactly
+  `OAuthValidator::new`, which is unchanged. Options (code, not
+  `OAuthConfig` fields, so the config format is untouched):
+  `add_root_certificate_pem(&[u8])` adds one CA certificate or a PEM bundle
+  (never a private key, which is refused) as
+  TLS trust anchors on top of the TLS feature's own roots, with every TLS
+  feature (an authorization server behind a private CA no longer needs
+  `native-tls` or `rustls-tls-native-roots`); `proxy(url)` sends every
+  non-loopback metadata/JWKS fetch through an explicit `http(s)://` proxy,
+  replacing the environment (`HTTPS_PROXY`/`HTTP_PROXY`/`ALL_PROXY`/
+  `NO_PROXY`) and system proxies reqwest honors by default, refusing a credential in a plain-http URL to a
+  non-loopback proxy without `allow_insecure_http`, and never shown
+  unredacted (a refused one not at all); `fetch_timeout(Duration)` replaces the fixed 10 s
+  request timeout, within 1 s to 60 s (`DEFAULT_FETCH_TIMEOUT`,
+  `MIN_FETCH_TIMEOUT`, `MAX_FETCH_TIMEOUT`); and `initial_jwks(&str)` seeds
+  the key cache with a JWK Set, parsed and narrowed exactly like a fetched
+  one and replaced by the first successful refresh — `key_set_status()`
+  reports the seeded keys in `keys` with `last_attempt`/`last_success` still
+  `None`. A refused option is one of four new `ValidatorError` variants
+  (`FetchTimeoutOutOfRange`, `InvalidRootCertificate`, `InvalidProxy`,
+  `InvalidInitialJwks`; the enum is `#[non_exhaustive]`). No `reqwest` type
+  is in the new API. Part of oauth-resource-server#10; the pluggable key source and a
+  runtime-agnostic background refresh it also proposes are not built.
 - `AuthorizedToken` now carries the verified claims and token metadata, so a
   handler no longer decodes the JWT a second time: `issuer`, `audiences` (a
   string `aud` normalized to a list), `expires_at`, `issued_at`, `client_id`
@@ -195,6 +220,20 @@ Before 1.0, a breaking change increments the minor version.
 
 ### Security
 
+- A loopback JWKS or discovery fetch (`http://localhost:…`, `127.0.0.0/8`,
+  `::1`, allowed over plain http without `allow_insecure_http`) no longer
+  goes through a proxy from `HTTP_PROXY`/`HTTPS_PROXY`/`ALL_PROXY` (or the
+  system settings). It used to when `NO_PROXY` did not list it, carrying the
+  key fetch across the network in cleartext, where anyone on the path could
+  substitute the keys. A fetch of a loopback URL now uses a second client
+  with no proxy at all; every other fetch uses reqwest's own proxy handling,
+  unchanged. Only loopback fetches that went through an environment or
+  system proxy change. A redirect from a non-loopback URL to a loopback one
+  stays in the normal client, as before (see the README's security model).
+- `KeySetStatus::jwks_uri` and every other displayed URL now show a fixed
+  placeholder when the URL has an `@` the parser did not read as userinfo
+  (`http://alice:1234/s3cret@host` parses as host `alice`, port `1234`,
+  path `/s3cret@host`), instead of printing it as-is.
 - Log lines and key-refresh errors (`RefreshError`'s `Display`/`Debug`) now
   redact any userinfo (`https://user:pass@…` → `https://***@…`), query
   (`?***`) and fragment (`#***`) in the issuer, JWKS and discovery URLs they
