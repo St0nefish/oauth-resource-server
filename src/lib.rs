@@ -22,12 +22,13 @@
 | [`OAuthValidator::key_set_status`], [`KeySetStatus`], [`RefreshError`] | A passive, no-I/O view of the signing keys held, for readiness probes and status pages ([`OAuthValidator::is_ready`]). |
 | [`AuthorizedToken`], [`TokenRejection`] | The two outcomes of a validation. |
 | [`authenticate`], [`Credential`] | Framework-free checking of several candidate credentials against a static token and OAuth. |
+| [`authenticate_with_static_tokens`], [`StaticTokens`], [`StaticTokenMatch`], [`StaticTokensError`] | The same check against several labeled static tokens (zero-downtime key rotation, one key per client), reporting which one matched. |
 | [`refusal`], [`refusal_with_static_challenge`], [`Refusal`], [`DEFAULT_STATIC_CHALLENGE`] | Framework-free mapping of a [`TokenRejection`] to its status (401/403) and `WWW-Authenticate` challenge — the same decision both layers make. |
 | [`Algorithm`], [`parse_algorithm`], [`AlgorithmError`] | The JWS algorithms a config may allow (never HMAC or `none`). |
 | [`static_token_policy`], [`StaticTokenDecision`] | The startup decision about a static API key alongside OAuth. |
-| [`axum::AuthLayer`], [`axum::require_auth`], [`axum::metadata_router`] | The axum integration (feature `axum`), including extractors for [`Credential`] and [`AuthorizedToken`]. |
+| [`axum::AuthLayer`], [`axum::require_auth`], [`axum::metadata_router`] | The axum integration (feature `axum`), including extractors for [`Credential`], [`AuthorizedToken`] and [`StaticTokenMatch`]. |
 | [`http_layer::HttpAuthLayer`], [`http_layer::HttpAuthLayerBuilder`] | A `tower` layer for any `http::Request<B>` service, whatever its body types (feature `tower`, implied by `axum`). |
-| [`env::oauth_config_from_env`], [`env::secret_from_env`] | Configuration from environment variables (feature `env`). |"
+| [`env::oauth_config_from_env`], [`env::secret_from_env`], [`env::static_tokens_from_env`] | Configuration from environment variables (feature `env`), including a current and a next static key for rotation. |"
 )]
 // The last row links the `testing` module, which exists only with that feature;
 // without it the row is rendered with no link, so a `serde,env,axum` doc build
@@ -120,7 +121,10 @@ pub mod __fuzz;
 pub mod testing;
 
 pub use algorithms::{Algorithm, AlgorithmError, DEFAULT_ALGORITHMS, parse_algorithm};
-pub use authenticate::{Credential, authenticate};
+pub use authenticate::{
+    Credential, StaticTokenMatch, StaticTokens, StaticTokensError, authenticate,
+    authenticate_with_static_tokens,
+};
 pub use builder::OAuthValidatorBuilder;
 pub use challenge::PROTECTED_RESOURCE_METADATA_PREFIX;
 pub use config::{

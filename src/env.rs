@@ -3,6 +3,8 @@
 //!
 //! [`secret_from_env`] reads one value, accepting either `VAR` directly or a
 //! path in `VAR_FILE` (the shape Docker Compose `secrets:` mounts use).
+//! [`static_tokens_from_env`] reads a static API key and, during a rotation,
+//! its replacement from `<VAR>_NEXT`, into a [`StaticTokens`] set.
 //! [`oauth_config_from_env`] builds a whole [`OAuthConfig`] the same way, one
 //! field per `<PREFIX><FIELD>` variable, and [`OAuthConfig::resolve`]s it.
 //!
@@ -14,6 +16,9 @@
 
 use std::io;
 
+use zeroize::Zeroizing;
+
+use crate::authenticate::StaticTokens;
 use crate::config::{
     ConfigError, ConfigProblem, KeyNaming, OAuthConfig, ProblemKind, ResolvedOAuthConfig,
 };
@@ -67,7 +72,38 @@ pub enum EnvError {
         /// The path that was empty.
         path: String,
     },
+    /// [`static_tokens_from_env`]: `<var>_NEXT` (or `<var>_NEXT_FILE`) is set
+    /// but `<var>` (and `<var>_FILE`) is not. A next key with no current one
+    /// is a half-done rotation — promote the next key into `<var>` — and is
+    /// refused rather than read as the only key.
+    #[error("{var}_NEXT is set but {var} is not: set the current key in {var} (or {var}_FILE)")]
+    #[non_exhaustive]
+    NextWithoutCurrent {
+        /// The plain (current-key) variable name.
+        var: String,
+    },
+    /// Several variables failed to load at once (from
+    /// [`static_tokens_from_env`], the current and the next key both), so
+    /// every problem is reported in one run. `Display` joins theirs with
+    /// `"; "`.
+    #[error("{}", join_errors(errors))]
+    #[non_exhaustive]
+    Several {
+        /// Every failure, in the order the variables were read.
+        errors: Vec<EnvError>,
+    },
 }
+
+fn join_errors(errors: &[EnvError]) -> String {
+    // Each with its source chain: `Several` has no single `source` to carry
+    // a `ReadFailed`'s I/O cause.
+    errors.iter().map(error_text).collect::<Vec<_>>().join("; ")
+}
+
+/// The label [`static_tokens_from_env`] gives the key read from `<VAR>`.
+pub const CURRENT_KEY_LABEL: &str = "current";
+/// The label [`static_tokens_from_env`] gives the key read from `<VAR>_NEXT`.
+pub const NEXT_KEY_LABEL: &str = "next";
 
 /// Read a secret from `var`, falling back to the file named by `<var>_FILE`.
 ///
@@ -165,8 +201,23 @@ pub fn secret_from_lookup(
     lookup: impl Fn(&str) -> Option<String>,
     read_file: impl Fn(&str) -> io::Result<String>,
 ) -> Result<Option<String>, EnvError> {
+    // Moved out of the wiping buffer, not copied: the returned `String` is
+    // the caller's, as it always has been.
+    Ok(secret_zeroizing(var, lookup, read_file)?.map(|mut v| std::mem::take(&mut *v)))
+}
+
+/// [`secret_from_lookup`], keeping the value in a `Zeroizing` buffer. Every
+/// intermediate copy it makes (the untrimmed variable or file contents, a
+/// value dropped because both forms are set) is wiped when dropped.
+fn secret_zeroizing(
+    var: &str,
+    lookup: impl Fn(&str) -> Option<String>,
+    read_file: impl Fn(&str) -> io::Result<String>,
+) -> Result<Option<Zeroizing<String>>, EnvError> {
     let file_var = format!("{var}_FILE");
-    let direct = lookup(var).filter(|s| !s.trim().is_empty());
+    let direct = lookup(var)
+        .map(Zeroizing::new)
+        .filter(|s| !s.trim().is_empty());
     let path = lookup(&file_var).filter(|s| !s.trim().is_empty());
 
     match (direct, path) {
@@ -174,14 +225,14 @@ pub fn secret_from_lookup(
             var: var.to_string(),
             path,
         }),
-        (Some(v), None) => Ok(Some(v.trim().to_string())),
+        (Some(v), None) => Ok(Some(Zeroizing::new(v.trim().to_string()))),
         (None, Some(path)) => {
-            let raw = read_file(&path).map_err(|source| EnvError::ReadFailed {
+            let raw = Zeroizing::new(read_file(&path).map_err(|source| EnvError::ReadFailed {
                 var: var.to_string(),
                 path: path.clone(),
                 source,
-            })?;
-            let value = raw.trim().to_string();
+            })?);
+            let value = Zeroizing::new(raw.trim().to_string());
             if value.is_empty() {
                 return Err(EnvError::EmptyFile {
                     var: var.to_string(),
@@ -191,6 +242,140 @@ pub fn secret_from_lookup(
             Ok(Some(value))
         }
         (None, None) => Ok(None),
+    }
+}
+
+/// Read a static API key from `var` and, while one is being rotated in, its
+/// replacement from `<var>_NEXT`, into a [`StaticTokens`] set labeled
+/// [`CURRENT_KEY_LABEL`] (`"current"`) and [`NEXT_KEY_LABEL`] (`"next"`).
+///
+/// Each of the two is read exactly as [`secret_from_env`] reads one secret —
+/// `<var>` or `<var>_FILE`, `<var>_NEXT` or `<var>_NEXT_FILE`; both forms of
+/// one set is an error, values are trimmed, a blank variable is unset, and a
+/// `_FILE` that reads empty is an error. Then:
+///
+/// | `<var>` | `<var>_NEXT` | Result |
+/// |---|---|---|
+/// | unset | unset | `Ok(None)` |
+/// | set | unset | one entry, `"current"` |
+/// | set | set, different | two entries, `"current"` and `"next"` |
+/// | set | set, the same value | one entry, `"current"` (the promotion step of a rotation) |
+/// | unset | set | [`EnvError::NextWithoutCurrent`] |
+///
+/// Zero-downtime rotation, one restart per step: (1) set `<var>_NEXT` to the
+/// new key — both keys are accepted; (2) move every client to the new key;
+/// (3) set `<var>` to the new key and unset `<var>_NEXT` (a restart in
+/// between, with both equal, is fine). The README's "Rotating a static API
+/// key" section walks through it, including how to honour
+/// `accept_static_bearer` with [`crate::static_token_policy`].
+///
+/// Only these two variables: no whitespace-separated list. A list could not
+/// carry labels, so a handler or an audit log could not tell which key was
+/// used, and it would read a secret containing whitespace differently from
+/// [`secret_from_env`]. An application with one key per client builds its
+/// own labeled set with [`StaticTokens::with`].
+///
+/// This is [`static_tokens_from_lookup`] wired to the real process
+/// environment and filesystem.
+///
+/// # Errors
+///
+/// Any [`secret_from_env`] error for either key (when both fail,
+/// [`EnvError::Several`] with both), or [`EnvError::NextWithoutCurrent`].
+///
+/// # Security
+///
+/// No error includes a secret — only variable names and file paths — and the
+/// returned set's `Debug` prints labels only.
+///
+/// # Examples
+///
+/// ```no_run
+/// use oauth_resource_server::env::static_tokens_from_env;
+///
+/// // MYAPP_API_KEY=... (or _FILE), plus MYAPP_API_KEY_NEXT=... during a rotation
+/// match static_tokens_from_env("MYAPP_API_KEY") {
+///     Ok(Some(tokens)) => println!("static API keys: {:?}", tokens.labels().collect::<Vec<_>>()),
+///     Ok(None) => println!("no static API key"),
+///     Err(e) => eprintln!("{e}"),
+/// }
+/// ```
+pub fn static_tokens_from_env(var: &str) -> Result<Option<StaticTokens>, EnvError> {
+    static_tokens_from_lookup(
+        var,
+        |v| std::env::var(v).ok(),
+        |path| std::fs::read_to_string(path),
+    )
+}
+
+/// [`static_tokens_from_env`] with the variable lookup and file reader
+/// injected, as [`secret_from_lookup`] takes them, so tests never call the
+/// `unsafe` `std::env::set_var`.
+///
+/// # Errors
+///
+/// As [`static_tokens_from_env`].
+///
+/// # Examples
+///
+/// ```
+/// use std::collections::HashMap;
+/// use std::io;
+///
+/// use oauth_resource_server::env::{EnvError, static_tokens_from_lookup};
+///
+/// let vars = HashMap::from([
+///     ("MYAPP_API_KEY", "example-key-old"),
+///     ("MYAPP_API_KEY_NEXT", "example-key-new"),
+/// ]);
+/// let lookup = |name: &str| vars.get(name).map(|v| v.to_string());
+/// let no_files = |_: &str| Err(io::Error::from(io::ErrorKind::NotFound));
+///
+/// let tokens = static_tokens_from_lookup("MYAPP_API_KEY", &lookup, no_files)
+///     .unwrap()
+///     .unwrap();
+/// assert_eq!(tokens.labels().collect::<Vec<_>>(), [Some("current"), Some("next")]);
+///
+/// // A next key alone is a half-done rotation.
+/// let only_next = HashMap::from([("K_NEXT", "example-key-new")]);
+/// assert!(matches!(
+///     static_tokens_from_lookup("K", |n| only_next.get(n).map(|v| v.to_string()), no_files),
+///     Err(EnvError::NextWithoutCurrent { .. })
+/// ));
+/// ```
+pub fn static_tokens_from_lookup(
+    var: &str,
+    lookup: impl Fn(&str) -> Option<String>,
+    read_file: impl Fn(&str) -> io::Result<String>,
+) -> Result<Option<StaticTokens>, EnvError> {
+    // Every copy here stays in a `Zeroizing` buffer, including a `next`
+    // dropped for equalling `current`, or a value dropped with an error.
+    let current = secret_zeroizing(var, &lookup, &read_file);
+    let next = secret_zeroizing(&format!("{var}_NEXT"), &lookup, &read_file);
+    let (current, next) = match (current, next) {
+        (Ok(current), Ok(next)) => (current, next),
+        (Err(a), Err(b)) => return Err(EnvError::Several { errors: vec![a, b] }),
+        (Err(e), Ok(_)) | (Ok(_), Err(e)) => return Err(e),
+    };
+    match (current, next) {
+        (None, None) => Ok(None),
+        (None, Some(_)) => Err(EnvError::NextWithoutCurrent {
+            var: var.to_string(),
+        }),
+        (Some(current), next) => {
+            let mut tokens = StaticTokens::new();
+            // Both are trimmed and non-empty (`secret_from_lookup`), and the
+            // labels are fixed and valid: nothing `StaticTokens::with` checks
+            // can fail except a repeated secret, which is folded into one
+            // entry here instead (see the table above).
+            tokens.push_checked(CURRENT_KEY_LABEL, current);
+            if let Some(next) = next
+                && !tokens.contains(&next)
+            {
+                tokens.push_checked(NEXT_KEY_LABEL, next);
+            }
+            Ok(Some(tokens))
+        }
     }
 }
 
@@ -232,6 +417,11 @@ fn bool_problem(naming: KeyNaming<'_>, field: &str, value: &str) -> ConfigProble
 /// with no source chain of its own, so [`EnvError::ReadFailed`]'s I/O cause —
 /// deliberately left out of its `Display` — is appended here instead.
 fn env_problem(err: &EnvError) -> ConfigProblem {
+    ConfigProblem::new(ProblemKind::EnvLoad, error_keys(err), error_text(err))
+}
+
+/// An error's `Display` followed by its source chain, `": "`-separated.
+fn error_text(err: &EnvError) -> String {
     let mut text = err.to_string();
     let mut source = std::error::Error::source(err);
     while let Some(cause) = source {
@@ -239,15 +429,22 @@ fn env_problem(err: &EnvError) -> ConfigProblem {
         text.push_str(&cause.to_string());
         source = cause.source();
     }
-    // Name the variables the operator has to look at: both when both are set,
-    // otherwise the `_FILE` whose file could not be used.
-    let keys = match err {
+    text
+}
+
+/// The variables the operator has to look at: both when both are set,
+/// otherwise the `_FILE` whose file could not be used. (The last two
+/// variants come only from [`static_tokens_from_env`], never from the config
+/// loader; they are named here so the match stays exhaustive.)
+fn error_keys(err: &EnvError) -> Vec<String> {
+    match err {
         EnvError::BothSet { var, .. } => vec![var.clone(), format!("{var}_FILE")],
         EnvError::ReadFailed { var, .. } | EnvError::EmptyFile { var, .. } => {
             vec![format!("{var}_FILE")]
         }
-    };
-    ConfigProblem::new(ProblemKind::EnvLoad, keys, text)
+        EnvError::NextWithoutCurrent { var } => vec![var.clone(), format!("{var}_NEXT")],
+        EnvError::Several { errors } => errors.iter().flat_map(error_keys).collect(),
+    }
 }
 
 /// Record a failed load as a problem and read it as unset, so one bad
@@ -1697,6 +1894,177 @@ mod tests {
         assert_eq!(
             oauth_config_from_env("OAUTH_RESOURCE_SERVER_ENV_RS_TEST_UNSET_9f3c_"),
             Ok(None)
+        );
+    }
+
+    // ── static_tokens_from_lookup ────────────────────────────────────────────
+
+    fn tokens(
+        vars: &[(&'static str, &'static str)],
+        files: &[(&'static str, &'static str)],
+    ) -> Result<Option<StaticTokens>, EnvError> {
+        let vars: HashMap<_, _> = vars.iter().copied().collect();
+        let files: HashMap<_, _> = files.iter().copied().collect();
+        static_tokens_from_lookup("KEY", lookup_from(&vars), files_from(&files))
+    }
+
+    fn labels(set: &StaticTokens) -> Vec<Option<&str>> {
+        set.labels().collect()
+    }
+
+    /// Which label, if any, accepts `candidate`.
+    fn accepts(set: &StaticTokens, candidate: &str) -> Option<Option<String>> {
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .build()
+            .unwrap();
+        rt.block_on(crate::authenticate_with_static_tokens(
+            [candidate],
+            Some(set),
+            None,
+        ))
+        .ok()
+        .and_then(|(_, m)| m)
+        .map(|m| m.label().map(str::to_string))
+    }
+
+    #[test]
+    fn static_tokens_absent_is_none() {
+        assert!(tokens(&[], &[]).unwrap().is_none());
+        assert!(
+            tokens(&[("KEY", "  "), ("KEY_NEXT", "")], &[])
+                .unwrap()
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn static_tokens_var_only_is_the_current_key() {
+        let set = tokens(&[("KEY", " old\n")], &[]).unwrap().unwrap();
+        assert_eq!(labels(&set), [Some("current")]);
+        assert_eq!(accepts(&set, "old"), Some(Some("current".into())));
+        assert_eq!(accepts(&set, " old\n"), None, "trimmed, as secret_from_env");
+    }
+
+    #[test]
+    fn static_tokens_var_and_next_are_both_accepted() {
+        let set = tokens(&[("KEY", "old"), ("KEY_NEXT", "new")], &[])
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            labels(&set),
+            [Some(CURRENT_KEY_LABEL), Some(NEXT_KEY_LABEL)]
+        );
+        assert_eq!(accepts(&set, "old"), Some(Some("current".into())));
+        assert_eq!(accepts(&set, "new"), Some(Some("next".into())));
+        assert_eq!(accepts(&set, "other"), None);
+        // The promotion step: both hold the new key, which is one entry.
+        let set = tokens(&[("KEY", "new"), ("KEY_NEXT", "new")], &[])
+            .unwrap()
+            .unwrap();
+        assert_eq!(labels(&set), [Some("current")]);
+    }
+
+    #[test]
+    fn static_tokens_file_forms() {
+        let set = tokens(
+            &[("KEY_FILE", "/run/k"), ("KEY_NEXT_FILE", "/run/k_next")],
+            &[("/run/k", "old\n"), ("/run/k_next", "new\n")],
+        )
+        .unwrap()
+        .unwrap();
+        assert_eq!(accepts(&set, "old"), Some(Some("current".into())));
+        assert_eq!(accepts(&set, "new"), Some(Some("next".into())));
+        // Mixed: current from a variable, next from a file.
+        let set = tokens(
+            &[("KEY", "old"), ("KEY_NEXT_FILE", "/run/k_next")],
+            &[("/run/k_next", "new\n")],
+        )
+        .unwrap()
+        .unwrap();
+        assert_eq!(labels(&set), [Some("current"), Some("next")]);
+    }
+
+    #[test]
+    fn static_tokens_both_forms_set_is_an_error() {
+        let err = tokens(&[("KEY", "a"), ("KEY_FILE", "/run/k")], &[("/run/k", "b")]).unwrap_err();
+        assert!(
+            matches!(&err, EnvError::BothSet { var, .. } if var == "KEY"),
+            "{err:?}"
+        );
+        let err = tokens(
+            &[("KEY", "a"), ("KEY_NEXT", "b"), ("KEY_NEXT_FILE", "/run/n")],
+            &[("/run/n", "c")],
+        )
+        .unwrap_err();
+        assert!(
+            matches!(&err, EnvError::BothSet { var, .. } if var == "KEY_NEXT"),
+            "{err:?}"
+        );
+    }
+
+    #[test]
+    fn static_tokens_empty_file_is_an_error() {
+        let err = tokens(&[("KEY_FILE", "/run/k")], &[("/run/k", " \n")]).unwrap_err();
+        assert!(
+            matches!(&err, EnvError::EmptyFile { var, .. } if var == "KEY"),
+            "{err:?}"
+        );
+        let err = tokens(
+            &[("KEY", "a"), ("KEY_NEXT_FILE", "/run/n")],
+            &[("/run/n", "")],
+        )
+        .unwrap_err();
+        assert!(
+            matches!(&err, EnvError::EmptyFile { var, .. } if var == "KEY_NEXT"),
+            "{err:?}"
+        );
+    }
+
+    #[test]
+    fn static_tokens_next_without_current_is_an_error() {
+        let err = tokens(&[("KEY_NEXT", "new")], &[]).unwrap_err();
+        assert!(
+            matches!(&err, EnvError::NextWithoutCurrent { var } if var == "KEY"),
+            "{err:?}"
+        );
+        assert!(err.to_string().contains("KEY_NEXT is set but KEY is not"));
+        assert!(!err.to_string().contains("new") && !format!("{err:?}").contains("\"new\""));
+    }
+
+    #[test]
+    fn static_tokens_report_both_failures_at_once() {
+        let err = tokens(
+            &[
+                ("KEY", "s3cret-a"),
+                ("KEY_FILE", "/run/k"),
+                ("KEY_NEXT_FILE", "/run/missing"),
+            ],
+            &[("/run/k", "s3cret-b")],
+        )
+        .unwrap_err();
+        let EnvError::Several { errors } = &err else {
+            panic!("expected Several, got {err:?}");
+        };
+        assert!(matches!(errors[0], EnvError::BothSet { .. }));
+        assert!(matches!(errors[1], EnvError::ReadFailed { .. }));
+        let text = err.to_string();
+        assert!(text.contains("KEY and KEY_FILE are both set"), "{text}");
+        assert!(
+            text.contains("KEY_NEXT_FILE=/run/missing: failed to read secret file: no such file"),
+            "{text}"
+        );
+        assert!(!text.contains("s3cret") && !format!("{err:?}").contains("s3cret"));
+    }
+
+    #[test]
+    fn static_tokens_debug_prints_labels_only() {
+        let set = tokens(&[("KEY", "s3cret-a"), ("KEY_NEXT", "s3cret-b")], &[])
+            .unwrap()
+            .unwrap();
+        let rendered = format!("{set:?}");
+        assert!(
+            !rendered.contains("s3cret") && rendered.contains("next"),
+            "{rendered}"
         );
     }
 }

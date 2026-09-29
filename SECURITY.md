@@ -99,9 +99,16 @@ the ones a report is most likely to concern:
   at all (a `DPoP`-scheme or tab-separated `Bearer` value counts as
   presented); anything presented is refused exactly as without `optional()`,
   and a credential an outer layer inserted is removed, not passed on;
-- the `Credential`/`AuthorizedToken` axum extractors never turn a missing
-  credential into access: they answer with the layer's own 401 and challenge,
-  and with 500 on a route no `AuthLayer` covers (their `Option` forms too).
+- the `Credential`/`AuthorizedToken`/`StaticTokenMatch` axum extractors never
+  turn a missing credential into access: they answer with the layer's own 401
+  and challenge, and with 500 on a route no `AuthLayer` covers (their `Option`
+  forms too);
+- static tokens are compared in constant time (`subtle`): with several
+  (`StaticTokens`), every candidate is compared with every entry, with no
+  early exit once one matches and no branch on which entry matched. A
+  secret's length is not hidden. No static token reaches a `Debug` impl or a
+  log line; a set prints its count and labels, and labels are restricted to
+  1 to 64 visible ASCII characters so they are always log-safe.
 
 See `CLAUDE.md` for the full list and the module each one lives in.
 
