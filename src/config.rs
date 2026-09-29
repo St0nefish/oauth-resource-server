@@ -231,6 +231,12 @@ pub struct OAuthConfig {
     /// found through it, and keys fetched over cleartext can be substituted by
     /// anyone on the path. Plain `http` is accepted only for a loopback host,
     /// or with [`OAuthConfig::allow_insecure_http`].
+    ///
+    /// Userinfo (`https://user:pass@…`) is accepted, and sent as HTTP Basic
+    /// auth on the discovery fetches; this crate redacts it wherever it
+    /// displays the URL (log lines, [`crate::RefreshError`]). The issuer is
+    /// also published verbatim in the RFC 9728 metadata document, though, so
+    /// a credential does not belong in it.
     #[cfg_attr(feature = "serde", serde(default))]
     pub issuer: String,
     /// Where to fetch the signing keys (JWKS). Optional: absent or blank, it is
@@ -240,6 +246,11 @@ pub struct OAuthConfig {
     /// Fetched at startup and hourly in the background, and on an unknown `kid`
     /// at most once a minute. The same URL rules as `issuer` apply, except
     /// that a query is allowed; RFC 8414 §2 requires `https` for it too.
+    ///
+    /// Userinfo (`https://user:pass@…`, sent as HTTP Basic auth) and a query
+    /// (`…/jwks?key=…`) are accepted and used unchanged for the fetch; this
+    /// crate redacts both wherever it displays the URL (log lines,
+    /// [`crate::RefreshError`], [`crate::KeySetStatus::jwks_uri`]).
     #[cfg_attr(
         feature = "serde",
         serde(default, skip_serializing_if = "Option::is_none")
@@ -284,6 +295,11 @@ pub struct OAuthConfig {
     ///
     /// Not implicitly compared against `aud` — list it in `audience`/`audiences`
     /// when the authorization server stamps it there.
+    ///
+    /// It is published verbatim in the RFC 9728 metadata document and in the
+    /// `resource_metadata` of every `WWW-Authenticate` challenge, so it must
+    /// never carry a credential (userinfo is not refused, but has no place
+    /// here).
     #[cfg_attr(feature = "serde", serde(default))]
     pub resource: String,
     /// A scope every token must carry. A valid token missing it gets 403

@@ -15,8 +15,8 @@ use crate::algorithms::Algorithm;
 use crate::challenge;
 use crate::config::ResolvedOAuthConfig;
 use crate::jwks::{
-    JWKS_BACKGROUND_REFRESH_INTERVAL, JWKS_MIN_REFETCH_INTERVAL, JwksStore, RefreshError,
-    background_retry_delay, http_client,
+    JWKS_BACKGROUND_REFRESH_INTERVAL, JWKS_MIN_REFETCH_INTERVAL, JwksStore, KeySetStatus,
+    RefreshError, background_retry_delay, http_client, keyless_retry_delay, redact_url,
 };
 use crate::token::{
     AuthorizedToken, MAX_TOKEN_BYTES, TokenRejection, check_typ, extract_principal, extract_scopes,
@@ -346,7 +346,7 @@ impl OAuthValidator {
         }
         if plain_http_non_loopback(&config.issuer) {
             warn!(
-                issuer = %config.issuer,
+                issuer = %redact_url(&config.issuer),
                 "{} uses plain http on a non-loopback host — signing keys fetched over it \
                  can be substituted by anyone on the path. Use https.",
                 naming.key("issuer")
@@ -354,7 +354,7 @@ impl OAuthValidator {
         }
         if plain_http_non_loopback(&config.resource) {
             warn!(
-                resource = %config.resource,
+                resource = %redact_url(&config.resource),
                 "{} uses plain http on a non-loopback host — bearer tokens sent to it can \
                  be read in transit. Use https.",
                 naming.key("resource")
@@ -371,7 +371,7 @@ impl OAuthValidator {
             // in-cluster `http://idp:9000/...` behind a private network is a real
             // deployment shape — so it is warned about, never silent.
             warn!(
-                jwks_uri = %jwks_uri,
+                jwks_uri = %redact_url(jwks_uri),
                 "{} uses plain http on a non-loopback host — signing keys fetched over it \
                  can be substituted by anyone on the path. Use https.",
                 naming.key("jwks_uri")
@@ -721,8 +721,10 @@ impl OAuthValidator {
     /// Returns how many usable keys it holds. On failure the previous keys are
     /// kept — a transient IdP outage must not invalidate keys that are still good.
     ///
-    /// Useful for a startup check that waits for the keys (a readiness probe,
-    /// or a test); [`OAuthValidator::spawn_background_refresh`] already calls it
+    /// Useful for a startup step that waits for the keys, or a test. It fetches
+    /// every time, so a probe should call [`OAuthValidator::is_ready`] or
+    /// [`OAuthValidator::key_set_status`] instead, which do no I/O.
+    /// [`OAuthValidator::spawn_background_refresh`] already calls it
     /// once at startup and then hourly. The fetch runs in a task of its own,
     /// so dropping this future does not cancel it.
     ///
@@ -740,6 +742,112 @@ impl OAuthValidator {
         self.keys.refresh_now().await
     }
 
+    /// A snapshot of the signing keys this validator holds: how many, the
+    /// JWKS URL in use, when a refresh was last attempted and last succeeded,
+    /// and why the last one failed, if it did.
+    ///
+    /// Passive: it does no I/O, never takes the refresh lock and never waits
+    /// on a refresh in flight — it copies a few fields under a lock that is
+    /// only ever held for such a copy. Unlike [`OAuthValidator::refresh_now`]
+    /// it is cheap enough for a readiness probe, a status page or a metrics
+    /// scrape to call on every request, and needs no Tokio runtime. It only
+    /// reports: nothing loads keys unless
+    /// [`OAuthValidator::spawn_background_refresh`] runs (or a request or
+    /// [`OAuthValidator::refresh_now`] triggers a fetch), so a probe gating on
+    /// it needs that task. The `jwks_uri` and any error message in it are
+    /// redacted (see [`RefreshError`]).
+    ///
+    /// # Examples
+    ///
+    /// A status report for an operator-facing page:
+    ///
+    /// ```
+    /// use std::time::SystemTime;
+    ///
+    /// use oauth_resource_server::OAuthValidator;
+    ///
+    /// fn key_report(validator: &OAuthValidator) -> String {
+    ///     let status = validator.key_set_status();
+    ///     let age = status
+    ///         .last_success
+    ///         .and_then(|t| SystemTime::now().duration_since(t).ok())
+    ///         .map_or("never".to_string(), |d| format!("{}s ago", d.as_secs()));
+    ///     let error = match &status.last_error {
+    ///         // `kind()` is safe to show anyone; the full `Display` (URLs and
+    ///         // upstream error text) is for logs and operators.
+    ///         Some(e) => e.kind().as_str(),
+    ///         None => "none",
+    ///     };
+    ///     format!(
+    ///         "{} key(s) from {}, loaded {age}, last error: {error}",
+    ///         status.keys,
+    ///         status.jwks_uri.as_deref().unwrap_or("(not yet discovered)"),
+    ///     )
+    /// }
+    /// # let resolved = oauth_resource_server::OAuthConfig {
+    /// #     enabled: true,
+    /// #     issuer: "https://auth.example.com/".into(),
+    /// #     jwks_uri: Some("https://auth.example.com/jwks".into()),
+    /// #     audience: "example-api".into(),
+    /// #     resource: "https://api.example.com/".into(),
+    /// #     required_scope: Some("api:read".into()),
+    /// #     ..Default::default()
+    /// # }
+    /// # .resolve(oauth_resource_server::KeyNaming::Dotted("oauth"))
+    /// # .unwrap()
+    /// # .unwrap();
+    /// # let validator = OAuthValidator::new(&resolved).unwrap();
+    /// // Before any key load:
+    /// assert_eq!(
+    ///     key_report(&validator),
+    ///     "0 key(s) from https://auth.example.com/jwks, loaded never, last error: none"
+    /// );
+    /// ```
+    pub fn key_set_status(&self) -> KeySetStatus {
+        self.keys.status()
+    }
+
+    /// At least one usable signing key is held, so a token signed by it can be
+    /// validated. Passive, like [`OAuthValidator::key_set_status`]: no I/O, no
+    /// waiting on a refresh.
+    ///
+    /// It never goes back to `false` once `true`: a failed refresh keeps the
+    /// keys already held (see [`OAuthValidator::refresh_now`]). That makes it
+    /// the right readiness signal, and the wrong liveness one — see the
+    /// README's "Readiness and liveness probes".
+    ///
+    /// Gate readiness on it only with [`OAuthValidator::spawn_background_refresh`]
+    /// running (or at least a startup [`OAuthValidator::refresh_now`]).
+    /// Otherwise keys load only when a request brings a token — and a
+    /// not-ready process gets no requests, so it would never become ready.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use oauth_resource_server::OAuthValidator;
+    ///
+    /// /// The status code for a readiness endpoint.
+    /// fn readiness(validator: &OAuthValidator) -> u16 {
+    ///     if validator.is_ready() { 200 } else { 503 }
+    /// }
+    /// # let resolved = oauth_resource_server::OAuthConfig {
+    /// #     enabled: true,
+    /// #     issuer: "https://auth.example.com/".into(),
+    /// #     audience: "example-api".into(),
+    /// #     resource: "https://api.example.com/".into(),
+    /// #     required_scope: Some("api:read".into()),
+    /// #     ..Default::default()
+    /// # }
+    /// # .resolve(oauth_resource_server::KeyNaming::Dotted("oauth"))
+    /// # .unwrap()
+    /// # .unwrap();
+    /// # let validator = OAuthValidator::new(&resolved).unwrap();
+    /// assert_eq!(readiness(&validator), 503); // no key loaded yet
+    /// ```
+    pub fn is_ready(&self) -> bool {
+        self.keys.has_keys()
+    }
+
     /// Warm the key cache at startup and keep it fresh; returns the task's handle.
     ///
     /// The first pass turns a misconfigured issuer, an unreachable JWKS or a
@@ -749,6 +857,14 @@ impl OAuthValidator {
     /// take this service down too). Later passes, hourly, are what drop a key the
     /// AS has withdrawn — once one succeeds: a failed pass keeps every key held,
     /// and is retried after a minute, backing off to an hour.
+    ///
+    /// While no key is held at all (the first load failed and nothing has
+    /// succeeded since), a failed pass is retried sooner: after 5 s, doubling
+    /// to at most 5 minutes. A keyless validator refuses every token, and a
+    /// readiness probe on [`OAuthValidator::is_ready`] keeps the traffic that
+    /// would otherwise trigger a refetch away from it, so this schedule is
+    /// what brings it back once the authorization server recovers. These
+    /// retries are timer-driven only; nothing in a request can schedule one.
     ///
     /// The first load logs `OAuth: authorization server signing keys loaded` at
     /// `info`, or `OAuth: could not load the authorization server's signing
@@ -774,7 +890,7 @@ impl OAuthValidator {
                     Ok(count) => {
                         if first {
                             info!(
-                                issuer = %this.config.issuer,
+                                issuer = %redact_url(&this.config.issuer),
                                 keys = count,
                                 "OAuth: authorization server signing keys loaded"
                             );
@@ -786,9 +902,13 @@ impl OAuthValidator {
                     }
                     Err(e) => {
                         failures = failures.saturating_add(1);
-                        let wait = background_retry_delay(failures);
+                        let wait = if this.keys.has_keys() {
+                            background_retry_delay(failures)
+                        } else {
+                            keyless_retry_delay(failures)
+                        };
                         warn!(
-                            issuer = %this.config.issuer,
+                            issuer = %redact_url(&this.config.issuer),
                             error = %e,
                             retry_in_secs = wait.as_secs(),
                             "OAuth: could not load the authorization server's signing keys — \
@@ -920,7 +1040,7 @@ pub(crate) fn is_loopback_url(url: &str) -> bool {
 mod tests {
     use super::*;
     use crate::config::KeyNamingBuf;
-    use crate::jwks::MAX_FETCH_BYTES;
+    use crate::jwks::{MAX_FETCH_BYTES, RefreshErrorKind};
     use crate::testing::*;
     use std::collections::HashMap;
     use std::sync::atomic::Ordering;
@@ -2152,6 +2272,306 @@ mod tests {
             v.validate(&valid_token()).await.is_ok(),
             "an IdP outage must not revoke keys that are still good"
         );
+    }
+
+    // ── key-set status and readiness ─────────────────────────────────────────
+
+    #[tokio::test]
+    async fn the_status_before_any_load_is_empty_and_does_no_io() {
+        let jwks = spawn_jwks_server("200 OK", jwks_body()).await;
+        let v = validator(&jwks.url);
+        for _ in 0..10 {
+            let status = v.key_set_status();
+            assert_eq!(status.keys, 0);
+            assert_eq!(status.jwks_uri.as_deref(), Some(jwks.url.as_str()));
+            assert_eq!(status.last_attempt, None);
+            assert_eq!(status.last_success, None);
+            assert_eq!(status.last_error, None);
+            assert!(!status.is_ready());
+            assert!(!v.is_ready());
+        }
+        assert_eq!(
+            jwks.hits.load(Ordering::SeqCst),
+            0,
+            "reading the status must never fetch"
+        );
+    }
+
+    #[tokio::test]
+    async fn the_status_tracks_a_success_and_a_failure_keeps_the_keys() {
+        let jwks = spawn_http_server(HashMap::new(), None).await;
+        let set = |status: &'static str, body: String| {
+            jwks.routes
+                .lock()
+                .unwrap()
+                .insert("/jwks".to_string(), (status, body));
+        };
+        set("200 OK", jwks_of(&[jwk_rsa_a(), jwk_ec()]));
+        let v = validator_no_cooldown(&jwks.url);
+
+        let before = std::time::SystemTime::now();
+        assert_eq!(v.refresh_now().await.unwrap(), 2);
+        let ok = v.key_set_status();
+        assert_eq!(ok.keys, 2);
+        assert!(ok.is_ready() && v.is_ready());
+        assert_eq!(ok.jwks_uri.as_deref(), Some(jwks.url.as_str()));
+        let success = ok.last_success.expect("a success is recorded");
+        let attempt = ok.last_attempt.expect("the attempt is recorded");
+        assert!(before <= attempt && attempt <= success);
+        assert_eq!(ok.last_error, None);
+
+        set("503 Service Unavailable", "{}".into());
+        let err = v.refresh_now().await.unwrap_err();
+        let failed = v.key_set_status();
+        assert_eq!(failed.last_error.as_ref(), Some(&err));
+        assert_eq!(err.kind(), RefreshErrorKind::Fetch);
+        assert_eq!(failed.keys, 2, "a failed refresh keeps the keys held");
+        assert!(failed.is_ready() && v.is_ready());
+        assert_eq!(failed.last_success, Some(success), "unchanged by a failure");
+        assert!(failed.last_attempt.unwrap() >= success);
+
+        // Reading the status, however often, costs the IdP nothing.
+        let hits = jwks.hits.load(Ordering::SeqCst);
+        for _ in 0..10 {
+            let _ = v.key_set_status();
+            let _ = v.is_ready();
+        }
+        assert_eq!(jwks.hits.load(Ordering::SeqCst), hits);
+
+        // A later success clears the error.
+        set("200 OK", jwks_body());
+        assert_eq!(v.refresh_now().await.unwrap(), 1);
+        let recovered = v.key_set_status();
+        assert_eq!(recovered.last_error, None);
+        assert_eq!(recovered.keys, 1);
+        assert!(recovered.last_success.unwrap() >= success);
+    }
+
+    #[tokio::test]
+    async fn a_failed_first_load_leaves_the_validator_not_ready_with_the_error_kind() {
+        let no_usable_keys = jwks_of(&[serde_json::json!({"kty": "oct", "k": "c2VjcmV0"})]);
+        for (status_line, body, kind) in [
+            (
+                "503 Service Unavailable",
+                "{}".to_string(),
+                RefreshErrorKind::Fetch,
+            ),
+            ("200 OK", "not json".to_string(), RefreshErrorKind::Parse),
+            (
+                "200 OK",
+                "{\"no\": \"keys\"}".to_string(),
+                RefreshErrorKind::Parse,
+            ),
+            ("200 OK", no_usable_keys, RefreshErrorKind::NoUsableKeys),
+        ] {
+            let jwks = spawn_jwks_server(status_line, body).await;
+            let v = validator(&jwks.url);
+            let err = v.refresh_now().await.unwrap_err();
+            let status = v.key_set_status();
+            assert_eq!(err.kind(), kind, "{err}");
+            assert_eq!(status.last_error, Some(err));
+            assert_eq!(status.keys, 0);
+            assert!(status.last_attempt.is_some());
+            assert_eq!(status.last_success, None);
+            assert!(!v.is_ready());
+        }
+    }
+
+    #[tokio::test]
+    async fn the_status_reports_the_discovered_jwks_uri_and_discovery_failures() {
+        let (server, issuer) =
+            discovery_server("/application/o/wiki/", |i| i.to_string(), false).await;
+        let v = discovering_validator(&issuer);
+        assert_eq!(v.key_set_status().jwks_uri, None, "not yet discovered");
+        v.refresh_now().await.unwrap();
+        let status = v.key_set_status();
+        assert_eq!(
+            status.jwks_uri.as_deref(),
+            Some(format!("{}/keys", server.base).as_str())
+        );
+        assert!(status.is_ready());
+
+        let (_server, issuer) =
+            discovery_server("/app/", |_| "https://other.test/".into(), false).await;
+        let v = discovering_validator(&issuer);
+        let err = v.refresh_now().await.unwrap_err();
+        assert_eq!(err.kind(), RefreshErrorKind::Discovery);
+        let status = v.key_set_status();
+        assert_eq!(status.jwks_uri, None);
+        assert_eq!(status.last_error, Some(err));
+    }
+
+    /// A `jwks_uri` carrying a credential two ways (userinfo, which the fetch
+    /// sends as Basic auth, and a query): neither may surface in the status or
+    /// the refresh error (`Display` or `Debug`), or in the rejection reason a
+    /// request-driven refetch produces. Log lines are covered by
+    /// `tests/redacted_logs.rs`, which needs a process-global subscriber.
+    #[tokio::test]
+    async fn a_credential_in_the_jwks_uri_never_reaches_the_status_or_errors() {
+        let jwks = spawn_jwks_server("503 Service Unavailable", "{}".into()).await;
+        let uri = format!(
+            "{}?key=t0ken",
+            jwks.url.replacen("http://", "http://alice:s3cret@", 1)
+        );
+        let shown = format!("{}?***", jwks.url.replacen("http://", "http://***@", 1));
+        let v = validator_no_cooldown(&uri);
+
+        assert_eq!(v.key_set_status().jwks_uri.as_deref(), Some(shown.as_str()));
+        let err = v.refresh_now().await.unwrap_err();
+        let Err(TokenRejection::Invalid(reason)) = v.validate(&valid_token()).await else {
+            panic!("no key can be loaded");
+        };
+        assert_eq!(jwks.hits.load(Ordering::SeqCst), 2, "both fetches went out");
+
+        let status = v.key_set_status();
+        assert_eq!(status.jwks_uri.as_deref(), Some(shown.as_str()));
+        assert!(err.to_string().contains(&shown), "{err}");
+        for text in [
+            err.to_string(),
+            format!("{err:?}"),
+            status.last_error.as_ref().unwrap().to_string(),
+            format!("{status:?}"),
+            reason,
+        ] {
+            for secret in ["alice", "s3cret", "t0ken"] {
+                assert!(!text.contains(secret), "{secret} leaked into: {text}");
+            }
+        }
+    }
+
+    /// The fake server holds the JWKS response until the test releases it, so
+    /// the status is read while the refresh lock is certainly held. On this
+    /// single-threaded runtime a status read that waited on the refresh could
+    /// never return (the refresh cannot progress while the test's task
+    /// blocks), so a regression hangs — which the CI job timeout catches —
+    /// rather than racing a wall-clock deadline.
+    #[tokio::test]
+    async fn the_status_does_not_wait_on_a_slow_refresh_in_flight() {
+        let jwks = spawn_jwks_server("200 OK", jwks_body()).await;
+        let v = Arc::new(validator_no_cooldown(&jwks.url));
+        v.refresh_now().await.unwrap();
+        let loaded = v.key_set_status();
+
+        jwks.hold.store(true, Ordering::SeqCst);
+        let background = Arc::clone(&v);
+        let refresh = tokio::spawn(async move { background.refresh_now().await });
+        // Wait until the request has reached the server, which is holding it.
+        while !(v.keys.refresh_in_flight() && jwks.hits.load(Ordering::SeqCst) == 2) {
+            tokio::task::yield_now().await;
+        }
+
+        let status = v.key_set_status();
+        let ready = v.is_ready();
+        assert!(
+            v.keys.refresh_in_flight(),
+            "read while the fetch was in flight"
+        );
+        assert!(!refresh.is_finished());
+        assert_eq!(
+            jwks.hits.load(Ordering::SeqCst),
+            2,
+            "reading the status fetched nothing"
+        );
+        assert!(ready);
+        assert_eq!(status.keys, 1);
+        assert_eq!(status.last_success, loaded.last_success);
+        assert!(status.last_attempt > loaded.last_attempt);
+        assert_eq!(status.last_error, None);
+
+        jwks.release.notify_one();
+        assert!(refresh.await.unwrap().is_ok());
+        assert_eq!(jwks.hits.load(Ordering::SeqCst), 2);
+        assert!(v.key_set_status().last_success > loaded.last_success);
+    }
+
+    /// Run every ready task and let pending loopback I/O complete WITHOUT
+    /// moving the paused clock: `yield_now` parks the runtime with a zero
+    /// timeout, which never auto-advances time (a `sleep` would, jumping past
+    /// timers while a fetch is still in flight). Returns once no refresh is in
+    /// flight and the background task has re-armed its timer.
+    async fn settle(v: &OAuthValidator) {
+        for _ in 0..100 {
+            tokio::task::yield_now().await;
+        }
+        for _ in 0..100_000 {
+            if !v.keys.refresh_in_flight() {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+        for _ in 0..100 {
+            tokio::task::yield_now().await;
+        }
+    }
+
+    /// Move the paused clock forward by `secs`, settle, and return the
+    /// server's hit count.
+    async fn hits_after(v: &OAuthValidator, jwks: &FakeJwksServer, secs: f64) -> usize {
+        tokio::time::advance(Duration::from_secs_f64(secs)).await;
+        settle(v).await;
+        jwks.hits.load(Ordering::SeqCst)
+    }
+
+    /// Assert that the background task's next attempt comes exactly `gap`
+    /// seconds after the previous one (which ran at the current clock): none
+    /// half a second before, one half a second after. The clock ends at that
+    /// attempt, ready for the next call.
+    async fn next_attempt_after(v: &OAuthValidator, jwks: &FakeJwksServer, gap: f64) {
+        let before = jwks.hits.load(Ordering::SeqCst);
+        assert_eq!(
+            hits_after(v, jwks, gap - 0.5).await,
+            before,
+            "no attempt before {gap}s"
+        );
+        assert_eq!(
+            hits_after(v, jwks, 1.0).await,
+            before + 1,
+            "an attempt at {gap}s"
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_failed_first_load_is_retried_quickly_until_keys_are_held() {
+        let jwks = spawn_http_server(HashMap::new(), None).await;
+        let set = |status: &'static str, body: String| {
+            jwks.routes
+                .lock()
+                .unwrap()
+                .insert("/jwks".to_string(), (status, body));
+        };
+        set("503 Service Unavailable", "{}".into());
+        let v = Arc::new(validator(&jwks.url)); // the real 60 s cooldown
+        let task = v.spawn_background_refresh();
+        settle(&v).await;
+        assert_eq!(jwks.hits.load(Ordering::SeqCst), 1, "the first load");
+        assert!(!v.is_ready());
+
+        // Keyless: 5 s, doubling, capped at 5 minutes.
+        for gap in [5.0, 10.0, 20.0, 40.0, 80.0, 160.0, 300.0, 300.0] {
+            next_attempt_after(&v, &jwks, gap).await;
+        }
+        assert!(!v.is_ready());
+        assert_eq!(
+            v.key_set_status().last_error.map(|e| e.kind()),
+            Some(RefreshErrorKind::Fetch)
+        );
+
+        // The authorization server recovers: the next keyless retry loads the
+        // keys.
+        set("200 OK", jwks_body());
+        next_attempt_after(&v, &jwks, 300.0).await;
+        assert!(v.is_ready());
+        assert_eq!(v.key_set_status().last_error, None);
+
+        // With keys held the schedule is the pre-existing one: the hourly
+        // pass, then — once it fails — a minute, not the 5 s keyless retry.
+        set("503 Service Unavailable", "{}".into());
+        next_attempt_after(&v, &jwks, 3600.0).await;
+        next_attempt_after(&v, &jwks, 60.0).await;
+        next_attempt_after(&v, &jwks, 120.0).await;
+        assert!(v.is_ready(), "the failures kept the keys");
+
+        task.abort();
     }
 
     #[tokio::test]

@@ -18,7 +18,7 @@ categories = ["authentication", "web-programming::http-server"]
 # What actually ships in the package tarball. Excludes CI config, issue/PR
 # templates, and agent-facing docs (CLAUDE.md) that a consumer of the crate
 # has no use for.
-include = ["src/**/*", "examples/**/*", "docs/**/*", "README.md", "LICENSE", "CHANGELOG.md"]
+include = ["src/**/*", "examples/**/*", "tests/**/*", "docs/**/*", "README.md", "LICENSE", "CHANGELOG.md"]
 
 # `fuzzing` is set by cargo-fuzz (see `fuzz/` and `src/lib.rs`'s `__fuzz` module),
 # not by a feature, so rustc must be told it is an expected cfg.
@@ -109,7 +109,7 @@ tower-layer = { version = "0.3.3", optional = true }
 tower-service = { version = "0.3.3", optional = true }
 
 [dev-dependencies]
-tokio = { version = "1", features = ["macros", "rt", "rt-multi-thread", "net", "io-util", "time", "sync"] }
+tokio = { version = "1", features = ["macros", "rt", "rt-multi-thread", "net", "io-util", "time", "sync", "test-util"] }
 serde_yaml_ng = "0.10"
 # The `testing` module (its minting helpers take `impl Serialize`) is compiled
 # for this crate's own unit tests whether or not a feature enables `serde`.

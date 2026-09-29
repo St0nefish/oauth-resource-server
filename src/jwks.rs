@@ -16,8 +16,8 @@
 //! cooldown spent with no keys loaded.
 
 use std::collections::HashSet;
-use std::sync::Arc;
-use std::time::{Duration, Instant};
+use std::sync::{Arc, PoisonError};
+use std::time::{Duration, Instant, SystemTime};
 
 use jsonwebtoken::DecodingKey;
 use jsonwebtoken::jwk::{Jwk, KeyOperations, PublicKeyUse};
@@ -67,6 +67,32 @@ pub(crate) fn background_retry_delay(failures: u32) -> Duration {
         .min(JWKS_BACKGROUND_REFRESH_INTERVAL)
 }
 
+/// First retry after a failed background pass while NO key is held (the first
+/// load failed and none has succeeded since). One request every 5 s is nothing
+/// to an authorization server, and it is the floor: nothing here retries faster.
+pub(crate) const KEYLESS_RETRY_FLOOR: Duration = Duration::from_secs(5);
+
+/// Ceiling on the keyless retry delay. A keyless validator refuses every token,
+/// and a readiness probe on [`crate::OAuthValidator::is_ready`] keeps traffic —
+/// and with it every request-driven refetch — away from it, so this schedule
+/// is its only way back. Five minutes bounds how long it stays down after the
+/// authorization server recovers; at the cap it is 12 requests an hour.
+pub(crate) const KEYLESS_RETRY_CAP: Duration = Duration::from_secs(300);
+
+/// How long the background task waits after its `failures`-th consecutive
+/// failed pass while no key is held: [`KEYLESS_RETRY_FLOOR`], doubling each
+/// time, capped at [`KEYLESS_RETRY_CAP`] (5, 10, 20, 40, 80, 160, then 300 s).
+/// Once any key is held the task uses [`background_retry_delay`] instead.
+/// Timer-driven only — nothing a request carries can shorten it, so it is no
+/// amplification surface — and independent of the unknown-`kid` cooldown
+/// ([`JWKS_MIN_REFETCH_INTERVAL`]), which it neither shortens nor bypasses.
+pub(crate) fn keyless_retry_delay(failures: u32) -> Duration {
+    let doublings = failures.saturating_sub(1).min(16);
+    KEYLESS_RETRY_FLOOR
+        .saturating_mul(1 << doublings)
+        .min(KEYLESS_RETRY_CAP)
+}
+
 /// Cap on a metadata/JWKS response body. Real key sets are a few KiB; the cap is
 /// there so a misbehaving (or impersonated) endpoint cannot make this process
 /// buffer an unbounded body on the credential-checking path.
@@ -81,11 +107,161 @@ pub(crate) const MAX_JWKS_KEYS: usize = 64;
 ///
 /// `Display` is the whole cause chain, outermost first, joined with `": "` (e.g.
 /// `fetching the JWKS from https://…: request failed: …`), so a log line needs no
-/// special formatting to show the root cause.
+/// special formatting to show the root cause. [`RefreshError::kind`] is the
+/// coarse, matchable stage that failed.
+///
+/// # Security
+///
+/// A configured `issuer` or `jwks_uri` may carry a credential: userinfo
+/// (`https://user:pass@…`, which the fetch sends as HTTP Basic auth) or a
+/// query string (`…/jwks?key=…`). Every URL in the message is therefore
+/// redacted — userinfo becomes `***@`, a query `?***` and a fragment `#***`,
+/// while scheme, host, port and path stay, so the endpoint is still
+/// identifiable — and upstream errors are included without the URL they
+/// would otherwise repeat verbatim. The fetch itself uses the URL unchanged.
+/// The message still names the endpoints and repeats upstream error text,
+/// so it is for logs and operators: a public, unauthenticated endpoint (a
+/// health check reachable from outside, say) should report
+/// [`RefreshError::kind`] instead.
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
 #[error("{message}")]
 pub struct RefreshError {
+    kind: RefreshErrorKind,
     message: String,
+}
+
+impl RefreshError {
+    fn new(kind: RefreshErrorKind, message: impl Into<String>) -> Self {
+        Self {
+            kind,
+            message: message.into(),
+        }
+    }
+
+    /// The same error, with `context` prepended to the message.
+    fn context(self, context: impl std::fmt::Display) -> Self {
+        Self {
+            kind: self.kind,
+            message: format!("{context}: {}", self.message),
+        }
+    }
+
+    /// Which stage of the refresh failed.
+    pub fn kind(&self) -> RefreshErrorKind {
+        self.kind
+    }
+}
+
+/// The stage at which a key refresh failed — see [`RefreshError::kind`].
+///
+/// `#[non_exhaustive]`: match with a wildcard arm; a stage may be added in a
+/// minor release.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[non_exhaustive]
+pub enum RefreshErrorKind {
+    /// No `jwks_uri` is configured and none could be discovered: every
+    /// metadata URL failed, answered for a different issuer, or named a
+    /// refused `jwks_uri`.
+    Discovery,
+    /// The JWKS request failed: network, TLS, a refused redirect, a timeout, a
+    /// non-success status, or a body over the size cap.
+    Fetch,
+    /// The JWKS response was not JSON, or not a JWK Set.
+    Parse,
+    /// The JWK Set held no key usable for a signature under the configured
+    /// algorithms.
+    NoUsableKeys,
+}
+
+impl RefreshErrorKind {
+    /// A short, stable, lower-case label (`discovery`, `fetch`, `parse`,
+    /// `no_usable_keys`), suitable for a metrics label or a public health
+    /// response.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Discovery => "discovery",
+            Self::Fetch => "fetch",
+            Self::Parse => "parse",
+            Self::NoUsableKeys => "no_usable_keys",
+        }
+    }
+}
+
+impl std::fmt::Display for RefreshErrorKind {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
+/// A point-in-time view of the signing keys an [`crate::OAuthValidator`] holds,
+/// from [`crate::OAuthValidator::key_set_status`].
+///
+/// Reading it does no I/O and never waits on a refresh in flight, so a
+/// readiness probe, a status page or a metrics scrape can call it as often as
+/// it likes. `#[non_exhaustive]`: read its fields, never build one; a field
+/// may be added in a minor release.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+#[non_exhaustive]
+pub struct KeySetStatus {
+    /// How many usable verification keys are held.
+    pub keys: usize,
+    /// The JWKS URL in use: the configured `jwks_uri`, or the one discovered
+    /// from the issuer's metadata — `None` while it is still undiscovered.
+    /// Redacted as [`RefreshError`]'s `# Security` note describes: any
+    /// userinfo shows as `***@` and any query as `?***`.
+    pub jwks_uri: Option<String>,
+    /// When the most recent refresh started, whether or not it has finished
+    /// and however it ended; `None` before the first one.
+    pub last_attempt: Option<SystemTime>,
+    /// When a refresh last succeeded (loaded a key set with at least one
+    /// usable key); `None` if none ever has. A failed refresh leaves it — and
+    /// the keys — as they were.
+    pub last_success: Option<SystemTime>,
+    /// Why the most recent *finished* refresh failed; `None` if it succeeded
+    /// or none has finished yet. Read [`RefreshError`]'s `# Security` note
+    /// before exposing its `Display` publicly.
+    pub last_error: Option<RefreshError>,
+}
+
+impl KeySetStatus {
+    /// At least one usable key is held — see
+    /// [`crate::OAuthValidator::is_ready`].
+    pub fn is_ready(&self) -> bool {
+        self.keys > 0
+    }
+}
+
+/// `raw` with any credential it may carry masked, for a log line, an error
+/// message or [`KeySetStatus::jwks_uri`]: userinfo (user, or user and
+/// password) becomes `***@`, a query `?***` and a fragment `#***`. Scheme,
+/// host, port and path are kept, so the endpoint stays identifiable. A URL
+/// with none of the three comes back exactly as given; one that does not
+/// parse as a URL with a host comes back as a fixed placeholder, since there
+/// is then no telling where a credential in it might be. Never panics.
+pub(crate) fn redact_url(raw: &str) -> String {
+    const UNPARSEABLE: &str = "<unparseable URL, redacted>";
+    // No host means no telling userinfo from path: `alice:s3cret@idp/jwks`
+    // parses as scheme `alice` with an opaque path.
+    let Ok(mut url) = reqwest::Url::parse(raw) else {
+        return UNPARSEABLE.to_string();
+    };
+    if url.host_str().is_none() {
+        return UNPARSEABLE.to_string();
+    }
+    let userinfo = !url.username().is_empty() || url.password().is_some();
+    if !userinfo && url.query().is_none() && url.fragment().is_none() {
+        return raw.to_string();
+    }
+    if userinfo && (url.set_password(None).is_err() || url.set_username("***").is_err()) {
+        return UNPARSEABLE.to_string();
+    }
+    if url.query().is_some() {
+        url.set_query(Some("***"));
+    }
+    if url.fragment().is_some() {
+        url.set_fragment(Some("***"));
+    }
+    url.to_string()
 }
 
 /// `err` and every `source()` below it, joined with `": "`.
@@ -139,7 +315,7 @@ fn judge_redirect(
         return Hop::Refuse(format!(
             "redirect to plain http on a non-loopback host ({}) refused — set {opt_in_key} \
              to permit it",
-            for_log(next.as_str())
+            for_log(&redact_url(next.as_str()))
         ));
     }
     if previous.len() > 3 {
@@ -170,7 +346,7 @@ pub(crate) fn http_client(
                 Hop::Follow => attempt.follow(),
                 Hop::FollowInsecure => {
                     warn!(
-                        url = %for_log(attempt.url().as_str()),
+                        url = %for_log(&redact_url(attempt.url().as_str())),
                         "OAuth: following a redirect to plain http on a non-loopback host \
                          ({opt_in_key} is set) — signing keys fetched over it can be \
                          substituted by anyone on the path"
@@ -199,20 +375,38 @@ pub(crate) struct CachedKey {
     ambiguous: bool,
 }
 
-/// The in-memory JWKS, the URI it came from, plus when we last *attempted* to
-/// refresh it.
+/// The in-memory JWKS plus when we last *attempted* to refresh it.
 ///
 /// Attempt, not success, on purpose: a failing IdP must be backed off exactly like
 /// a successful-but-stale one, or an outage turns every junk token into a retry
 /// against a service that is already struggling.
 #[derive(Default)]
 struct JwksCache {
-    /// The configured `jwks_uri` when there is one; otherwise `None` until
-    /// discovery fills it in, after which it is fixed for the life of the
-    /// process (a new value means a config change, which means a new validator).
-    jwks_uri: Option<String>,
     keys: Vec<CachedKey>,
     last_attempt: Option<Instant>,
+}
+
+/// The fields behind [`JwksStore::status`].
+#[derive(Default)]
+struct Tracked {
+    /// What a status read copies. Its `jwks_uri` is [`redact_url`] of the
+    /// one below, so a credential in the URL never reaches a status page.
+    public: KeySetStatus,
+    /// The `jwks_uri` the fetch uses, unredacted: the configured one when
+    /// there is one; otherwise `None` until discovery fills it in, after
+    /// which it is fixed for the life of the process (a new value means a
+    /// config change, which means a new validator).
+    jwks_uri: Option<String>,
+    /// How many refreshes have started, stamped with `last_attempt`. Lets a
+    /// refresh task that died tell whether a newer attempt has run since.
+    attempts: u64,
+}
+
+impl Tracked {
+    fn set_jwks_uri(&mut self, uri: Option<String>) {
+        self.public.jwks_uri = uri.as_deref().map(redact_url);
+        self.jwks_uri = uri;
+    }
 }
 
 /// The key source behind [`crate::OAuthValidator`]: owns the JWKS cache and every
@@ -230,6 +424,17 @@ pub(crate) struct JwksStore {
     /// writer parked on a slow IdP would stall every request, including ones whose
     /// key is already cached.
     jwks: RwLock<JwksCache>,
+    /// What [`JwksStore::status`] reports, plus the `jwks_uri` actually
+    /// fetched — see [`Tracked`].
+    ///
+    /// A synchronous `std` mutex, separate from `jwks`, so reading the status
+    /// is a plain function a probe can call from anywhere. It is locked only
+    /// to copy or overwrite these few fields — never across an `.await`, and
+    /// never while taking `jwks` or `refresh_lock` — so it can never wait on a
+    /// network call or on a refresh in flight. Reading `jwks` instead would
+    /// make the status async and queue it behind tokio's writer-preferring
+    /// lock, and `try_read` would fail spuriously whenever a swap was queued.
+    status: std::sync::Mutex<Tracked>,
     /// Serializes refreshes instead: a burst of unknown-`kid` requests, or
     /// the background refresher racing one, collapse into one fetch while
     /// cached-key lookups carry on untouched. Owned guards, so the detached
@@ -247,16 +452,16 @@ impl JwksStore {
         http: reqwest::Client,
         min_refetch_interval: Duration,
     ) -> Self {
+        let mut tracked = Tracked::default();
+        tracked.set_jwks_uri(config.jwks_uri.clone().filter(|uri| !uri.trim().is_empty()));
         Self {
             issuer: config.issuer.clone(),
             allow_insecure_http: config.allow_insecure_http,
             algorithms: config.algorithms.clone(),
             naming: config.key_naming.clone(),
             http,
-            jwks: RwLock::new(JwksCache {
-                jwks_uri: config.jwks_uri.clone().filter(|uri| !uri.trim().is_empty()),
-                ..JwksCache::default()
-            }),
+            jwks: RwLock::new(JwksCache::default()),
+            status: std::sync::Mutex::new(tracked),
             refresh_lock: Arc::new(Mutex::new(())),
             min_refetch_interval,
         }
@@ -267,9 +472,32 @@ impl JwksStore {
     /// keys are kept.
     pub(crate) async fn refresh_now(self: &Arc<Self>) -> Result<usize, RefreshError> {
         let guard = Arc::clone(&self.refresh_lock).lock_owned().await;
-        self.refresh_detached(guard)
-            .await
-            .map_err(|message| RefreshError { message })
+        self.refresh_detached(guard).await
+    }
+
+    /// The status fields, locked for the instant a caller copies or updates
+    /// them. Never hold the guard across an `.await`. A poisoned lock (a panic
+    /// mid-update of plain data) is still readable, so it is not propagated.
+    fn status_fields(&self) -> std::sync::MutexGuard<'_, Tracked> {
+        self.status.lock().unwrap_or_else(PoisonError::into_inner)
+    }
+
+    /// A copy of the key-set status. No I/O; never waits on `jwks` or
+    /// `refresh_lock`.
+    pub(crate) fn status(&self) -> KeySetStatus {
+        self.status_fields().public.clone()
+    }
+
+    /// Whether at least one usable key is held. As [`JwksStore::status`].
+    pub(crate) fn has_keys(&self) -> bool {
+        self.status_fields().public.keys > 0
+    }
+
+    /// Whether a refresh holds `refresh_lock` right now — for tests that
+    /// drive a paused clock and must know when a fetch has finished.
+    #[cfg(test)]
+    pub(crate) fn refresh_in_flight(&self) -> bool {
+        self.refresh_lock.try_lock().is_err()
     }
 
     /// Run one refresh in a task of its own, which holds `guard` (the refresh
@@ -284,14 +512,34 @@ impl JwksStore {
     async fn refresh_detached(
         self: &Arc<Self>,
         guard: OwnedMutexGuard<()>,
-    ) -> Result<usize, String> {
+    ) -> Result<usize, RefreshError> {
+        // Read while `guard` is held, so no other refresh can start first:
+        // this task's own attempt, if it got as far as stamping one, is the
+        // next number.
+        let ours = self.status_fields().attempts + 1;
         let store = Arc::clone(self);
         let task = tokio::spawn(async move {
             let _refreshing = guard;
             store.refresh().await
         });
-        task.await
-            .unwrap_or_else(|e| Err(format!("the key refresh task did not finish: {e}")))
+        task.await.unwrap_or_else(|e| {
+            let err = RefreshError::new(
+                RefreshErrorKind::Fetch,
+                format!("the key refresh task did not finish: {e}"),
+            );
+            // A cancelled task means the runtime is shutting down: nothing
+            // failed, and nobody is left to read the status. A panicked one
+            // released the refresh lock while unwinding, so a newer attempt
+            // may already have run — and succeeded; record the panic only if
+            // none has started since.
+            if e.is_panic() {
+                let mut status = self.status_fields();
+                if status.attempts <= ours {
+                    status.public.last_error = Some(err.clone());
+                }
+            }
+            Err(err)
+        })
     }
 
     /// The verification key for `kid` and `alg` among the keys already held, or
@@ -349,7 +597,7 @@ impl JwksStore {
 
         if let Err(e) = self.refresh_detached(refreshing).await {
             warn!(
-                issuer = %self.issuer,
+                issuer = %redact_url(&self.issuer),
                 error = %e,
                 "JWKS refresh failed — tokens signed by a key we do not already hold will \
                  be rejected until the next attempt"
@@ -368,43 +616,63 @@ impl JwksStore {
     /// One refresh attempt. The caller holds `refresh_lock`; the key lock is taken
     /// only for the instant it takes to read or swap in-memory state, never across
     /// the network. Records the attempt time first, so a failure is backed off like
-    /// a success, and leaves the old keys in place on any failure.
-    async fn refresh(&self) -> Result<usize, String> {
+    /// a success, and leaves the old keys in place on any failure. The outcome is
+    /// recorded in the status fields once it is known.
+    async fn refresh(&self) -> Result<usize, RefreshError> {
+        self.jwks.write().await.last_attempt = Some(Instant::now());
         let known_uri = {
-            let mut cache = self.jwks.write().await;
-            cache.last_attempt = Some(Instant::now());
-            cache.jwks_uri.clone()
+            let mut status = self.status_fields();
+            status.attempts += 1;
+            status.public.last_attempt = Some(SystemTime::now());
+            status.jwks_uri.clone()
         };
+        let result = self.load(known_uri).await;
+        let status = &mut self.status_fields().public;
+        match &result {
+            Ok(count) => {
+                status.keys = *count;
+                status.last_success = Some(SystemTime::now());
+                status.last_error = None;
+            }
+            Err(e) => status.last_error = Some(e.clone()),
+        }
+        result
+    }
+
+    /// Discover the JWKS URI if `known_uri` is `None`, then fetch the key set
+    /// and swap it in: the body of [`JwksStore::refresh`].
+    async fn load(&self, known_uri: Option<String>) -> Result<usize, RefreshError> {
         let jwks_uri = match known_uri {
             Some(uri) => uri,
             None => {
                 let uri = self.discover_jwks_uri().await?;
                 info!(
-                    issuer = %self.issuer,
-                    jwks_uri = %uri,
+                    issuer = %redact_url(&self.issuer),
+                    jwks_uri = %redact_url(&uri),
                     "OAuth: discovered the JWKS URI from the issuer's metadata"
                 );
                 if plain_http_non_loopback(&uri) {
                     // Reachable only with the opt-in: `jwks_uri_from_metadata`
                     // refuses this without it.
                     warn!(
-                        jwks_uri = %uri,
+                        jwks_uri = %redact_url(&uri),
                         "the discovered JWKS URI uses plain http on a non-loopback host \
                          ({} is set) — signing keys fetched over it can be substituted by \
                          anyone on the path. Use https.",
                         self.naming.key("allow_insecure_http")
                     );
                 }
-                self.jwks.write().await.jwks_uri = Some(uri.clone());
+                self.status_fields().set_jwks_uri(Some(uri.clone()));
                 uri
             }
         };
+        let shown = redact_url(&jwks_uri);
         let keys = self
             .fetch_jwks(&jwks_uri)
             .await
-            .map_err(|e| format!("fetching the JWKS from {jwks_uri}: {e}"))?;
+            .map_err(|e| e.context(format_args!("fetching the JWKS from {shown}")))?;
         let count = keys.len();
-        debug!(count, jwks_uri = %jwks_uri, "Fetched JWKS");
+        debug!(count, jwks_uri = %shown, "Fetched JWKS");
         let previous = std::mem::replace(&mut self.jwks.write().await.keys, keys);
         self.warn_about_new_ambiguous_keys(&previous).await;
         Ok(count)
@@ -450,7 +718,7 @@ impl JwksStore {
     /// §3.3, OIDC Discovery §4.3: a mismatching document MUST NOT be used), which is
     /// what stops a proxy or a misconfigured path from handing us some other
     /// server's keys.
-    async fn discover_jwks_uri(&self) -> Result<String, String> {
+    async fn discover_jwks_uri(&self) -> Result<String, RefreshError> {
         let issuer_key = self.naming.key("issuer");
         let mut errors = Vec::new();
         for url in discovery_urls(&self.issuer) {
@@ -463,26 +731,31 @@ impl JwksStore {
                     &self.naming.key("allow_insecure_http"),
                 ) {
                     Ok(uri) => return Ok(uri),
-                    Err(e) => errors.push(format!("{url}: {e}")),
+                    Err(e) => errors.push(format!("{}: {e}", redact_url(&url))),
                 },
-                Err(e) => errors.push(format!("{url}: {e}")),
+                Err(e) => errors.push(format!("{}: {e}", redact_url(&url))),
             }
         }
-        Err(format!(
-            "could not discover a jwks_uri for {issuer_key} {:?} — set {} explicitly or fix \
-             the issuer. Tried: {}",
-            self.issuer,
-            self.naming.key("jwks_uri"),
-            errors.join("; ")
+        Err(RefreshError::new(
+            RefreshErrorKind::Discovery,
+            format!(
+                "could not discover a jwks_uri for {issuer_key} {:?} — set {} explicitly or \
+                 fix the issuer. Tried: {}",
+                redact_url(&self.issuer),
+                self.naming.key("jwks_uri"),
+                errors.join("; ")
+            ),
         ))
     }
 
-    async fn fetch_jwks(&self, uri: &str) -> Result<Vec<CachedKey>, String> {
+    async fn fetch_jwks(&self, uri: &str) -> Result<Vec<CachedKey>, RefreshError> {
         let doc = self.fetch_json(uri).await?;
-        let entries = doc
-            .get("keys")
-            .and_then(Value::as_array)
-            .ok_or_else(|| "response is not a JWK Set (no \"keys\" array)".to_string())?;
+        let entries = doc.get("keys").and_then(Value::as_array).ok_or_else(|| {
+            RefreshError::new(
+                RefreshErrorKind::Parse,
+                "response is not a JWK Set (no \"keys\" array)",
+            )
+        })?;
         if entries.len() > MAX_JWKS_KEYS {
             warn!(
                 published = entries.len(),
@@ -498,45 +771,56 @@ impl JwksStore {
             }
         }
         if keys.is_empty() {
-            return Err(format!(
-                "the JWK Set contained no usable signature keys for {} {:?}",
-                self.naming.key("algorithms"),
-                self.algorithms
+            return Err(RefreshError::new(
+                RefreshErrorKind::NoUsableKeys,
+                format!(
+                    "the JWK Set contained no usable signature keys for {} {:?}",
+                    self.naming.key("algorithms"),
+                    self.algorithms
+                ),
             ));
         }
         Ok(keys)
     }
 
     /// GET a JSON document with the body capped at [`MAX_FETCH_BYTES`].
-    async fn fetch_json(&self, url: &str) -> Result<Value, String> {
+    async fn fetch_json(&self, url: &str) -> Result<Value, RefreshError> {
+        let fetch = |message: String| RefreshError::new(RefreshErrorKind::Fetch, message);
         let mut resp = self
             .http
             .get(url)
             .header(reqwest::header::ACCEPT, "application/json")
             .send()
             .await
-            .map_err(|e| context("request failed", &e))?
+            .map_err(|e| fetch(context("request failed", &e.without_url())))?
             .error_for_status()
-            .map_err(|e| context("non-success status", &e))?;
+            .map_err(|e| fetch(context("non-success status", &e.without_url())))?;
         if let Some(len) = resp.content_length()
             && len > MAX_FETCH_BYTES as u64
         {
-            return Err(format!(
+            return Err(fetch(format!(
                 "response is {len} bytes, over the {MAX_FETCH_BYTES}-byte cap"
-            ));
+            )));
         }
         let mut body = Vec::new();
         while let Some(chunk) = resp
             .chunk()
             .await
-            .map_err(|e| context("reading the response body", &e))?
+            .map_err(|e| fetch(context("reading the response body", &e.without_url())))?
         {
             if body.len() + chunk.len() > MAX_FETCH_BYTES {
-                return Err(format!("response exceeds the {MAX_FETCH_BYTES}-byte cap"));
+                return Err(fetch(format!(
+                    "response exceeds the {MAX_FETCH_BYTES}-byte cap"
+                )));
             }
             body.extend_from_slice(&chunk);
         }
-        serde_json::from_slice(&body).map_err(|e| context("response was not JSON", &e))
+        serde_json::from_slice(&body).map_err(|e| {
+            RefreshError::new(
+                RefreshErrorKind::Parse,
+                context("response was not JSON", &e),
+            )
+        })
     }
 }
 
@@ -669,12 +953,18 @@ fn jwks_uri_from_metadata(
     allow_insecure_http: bool,
     opt_in_key: &str,
 ) -> Result<String, String> {
+    // Every URL in a message is redacted: the configured issuer may carry a
+    // credential, and a document echoing it back may too.
+    let shown_issuer = redact_url(issuer);
     let found = doc.get("issuer").and_then(Value::as_str);
     if found != Some(issuer) {
         return Err(format!(
-            "metadata issuer {} does not match {issuer_key} {issuer:?} byte-for-byte \
+            "metadata issuer {} does not match {issuer_key} {shown_issuer:?} byte-for-byte \
              (RFC 8414 §3.3 / OIDC Discovery §4.3: such a document must not be used)",
-            found.map_or_else(|| "(absent)".to_string(), |f| format!("{:?}", for_log(f)))
+            found.map_or_else(
+                || "(absent)".to_string(),
+                |f| format!("{:?}", for_log(&redact_url(f)))
+            )
         ));
     }
     let uri = doc
@@ -692,13 +982,13 @@ fn jwks_uri_from_metadata(
                 return Err(format!(
                     "jwks_uri {:?} uses plain http on a non-loopback host — refused \
                      (RFC 8414 §2) unless {opt_in_key} is set",
-                    for_log(uri)
+                    for_log(&redact_url(uri))
                 ));
             }
         }
         other => {
             return Err(format!(
-                "jwks_uri scheme {other:?} is not allowed for issuer {issuer:?}"
+                "jwks_uri scheme {other:?} is not allowed for issuer {shown_issuer:?}"
             ));
         }
     }
@@ -992,6 +1282,98 @@ mod tests {
         assert_eq!(background_retry_delay(6), Duration::from_secs(1920));
         assert_eq!(background_retry_delay(7), Duration::from_secs(3600));
         assert_eq!(background_retry_delay(u32::MAX), Duration::from_secs(3600));
+    }
+
+    #[test]
+    fn redact_url_masks_userinfo_query_and_fragment_only() {
+        for (raw, shown) in [
+            // user and password
+            (
+                "https://alice:s3cret@idp.example.com:8443/jwks",
+                "https://***@idp.example.com:8443/jwks",
+            ),
+            // user only, and password only
+            (
+                "https://alice@idp.example.com/jwks",
+                "https://***@idp.example.com/jwks",
+            ),
+            (
+                "https://:s3cret@idp.example.com/jwks",
+                "https://***@idp.example.com/jwks",
+            ),
+            // query
+            (
+                "https://idp.example.com/jwks?key=t0ken",
+                "https://idp.example.com/jwks?***",
+            ),
+            // all of them
+            (
+                "https://alice:s3cret@idp.example.com/o/app/jwks?key=t0ken#frag",
+                "https://***@idp.example.com/o/app/jwks?***#***",
+            ),
+            // IPv6 host with a port
+            (
+                "http://alice:s3cret@[::1]:9000/jwks?key=t0ken",
+                "http://***@[::1]:9000/jwks?***",
+            ),
+        ] {
+            let redacted = redact_url(raw);
+            assert_eq!(redacted, shown, "{raw}");
+            for secret in ["alice", "s3cret", "t0ken", "frag"] {
+                assert!(!redacted.contains(secret), "{raw} -> {redacted}");
+            }
+        }
+        // Nothing to mask: returned exactly as given, not normalized.
+        for raw in [
+            "https://idp.example.com/app/",
+            "https://IDP.example.com",
+            "http://[::1]:9000/jwks",
+        ] {
+            assert_eq!(redact_url(raw), raw);
+        }
+        // Unparseable: a fixed placeholder, never the input, never a panic.
+        for raw in [
+            "",
+            "not a url",
+            "alice:s3cret@idp.example.com/jwks",
+            "http://[::1",
+            "https://alice:s3cret@",
+        ] {
+            let redacted = redact_url(raw);
+            assert!(!redacted.contains("s3cret"), "{raw} -> {redacted}");
+            assert_eq!(redacted, "<unparseable URL, redacted>", "{raw}");
+        }
+    }
+
+    #[test]
+    fn keyless_retries_back_off_from_five_seconds_to_five_minutes() {
+        let secs: Vec<u64> = (1..=9).map(|n| keyless_retry_delay(n).as_secs()).collect();
+        assert_eq!(secs, [5, 10, 20, 40, 80, 160, 300, 300, 300]);
+        assert_eq!(keyless_retry_delay(0), KEYLESS_RETRY_FLOOR);
+        assert_eq!(keyless_retry_delay(u32::MAX), KEYLESS_RETRY_CAP);
+        for n in 0..64 {
+            assert!(
+                keyless_retry_delay(n) >= Duration::from_secs(5),
+                "never under the floor"
+            );
+        }
+    }
+
+    #[test]
+    fn refresh_error_kinds_have_stable_labels() {
+        let labels: Vec<&str> = [
+            RefreshErrorKind::Discovery,
+            RefreshErrorKind::Fetch,
+            RefreshErrorKind::Parse,
+            RefreshErrorKind::NoUsableKeys,
+        ]
+        .iter()
+        .map(|k| k.as_str())
+        .collect();
+        assert_eq!(labels, ["discovery", "fetch", "parse", "no_usable_keys"]);
+        let err = RefreshError::new(RefreshErrorKind::Parse, "inner").context("outer");
+        assert_eq!(err.to_string(), "outer: inner");
+        assert_eq!(err.kind(), RefreshErrorKind::Parse);
     }
 
     #[test]
