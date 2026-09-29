@@ -49,7 +49,20 @@ the ones a report is most likely to concern:
   (`crit`) is refused there too;
 - each JWKS key is narrowed to only the algorithms its own key type can
   produce (an HMAC, raw octet, `use: enc` key, or key whose `key_ops` lacks
-  `verify` is never usable to verify a signature);
+  `verify` is never usable to verify a signature) — including a key set
+  seeded with `OAuthValidatorBuilder::initial_jwks`, which goes through the
+  same size cap, key cap and per-key checks as a fetched one;
+- no `OAuthValidatorBuilder` option relaxes a fetch rule: an added root
+  certificate only adds trust anchors (a private key alongside it is
+  refused), an explicit proxy tunnels `https` fetches end to end, a
+  credential in a plain-`http` non-loopback proxy URL is refused without
+  `allow_insecure_http`, and the proxy URL is never logged, displayed or
+  `Debug`-printed unredacted (a refused one is not shown at all);
+- no proxy — explicit, from `HTTP_PROXY`/`HTTPS_PROXY`/`ALL_PROXY`, or from
+  the system settings — ever carries a fetch of a loopback URL (it uses a
+  proxy-free client), so the plain-http loopback exemption never crosses the
+  network; non-loopback fetches keep reqwest's own proxy handling, and an
+  explicit proxy replaces the environment and system ones;
 - signature verification and `iss`/`aud`/`exp`/`nbf` claim checks happen
   inside a single `jsonwebtoken::decode` call, so a claim check can never be
   reordered to run after a signature has already been treated as valid;

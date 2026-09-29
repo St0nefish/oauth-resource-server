@@ -28,7 +28,9 @@ use tracing::{debug, info, warn};
 use crate::algorithms::{Algorithm, key_algorithms, signing_algorithm};
 use crate::config::{KeyNamingBuf, ResolvedOAuthConfig};
 use crate::token::{TokenRejection, describe_kid, for_log};
-use crate::validator::{is_canonical_url, parsed_plain_http_non_loopback, plain_http_non_loopback};
+use crate::validator::{
+    is_canonical_url, parsed_plain_http_non_loopback, plain_http_non_loopback, url_is_loopback,
+};
 
 /// How long an unknown `kid` is allowed to trigger a JWKS refetch again.
 ///
@@ -40,10 +42,23 @@ use crate::validator::{is_canonical_url, parsed_plain_http_non_loopback, plain_h
 /// never notices us.
 pub(crate) const JWKS_MIN_REFETCH_INTERVAL: Duration = Duration::from_secs(60);
 
-/// Ceiling on a single metadata or JWKS fetch. Bounds how long a refresh holds
-/// `refresh_lock`, and therefore how long a stalled IdP can stall validation of
-/// a token whose key is not already cached.
-const JWKS_FETCH_TIMEOUT: Duration = Duration::from_secs(10);
+/// Ceiling on a single metadata or JWKS fetch, unless
+/// [`crate::OAuthValidatorBuilder::fetch_timeout`] sets another. Bounds how
+/// long a refresh holds `refresh_lock`, and therefore how long a stalled IdP
+/// can stall validation of a token whose key is not already cached.
+pub const DEFAULT_FETCH_TIMEOUT: Duration = Duration::from_secs(10);
+
+/// The shortest timeout [`crate::OAuthValidatorBuilder::fetch_timeout`]
+/// accepts. Zero would fail every fetch; under a second a TLS handshake to a
+/// distant authorization server fails intermittently.
+pub const MIN_FETCH_TIMEOUT: Duration = Duration::from_secs(1);
+
+/// The longest timeout [`crate::OAuthValidatorBuilder::fetch_timeout`]
+/// accepts. The timeout bounds how long a refresh holds the refresh lock, and
+/// every request whose key is not cached waits behind it — a discovery pass
+/// can chain three fetches — so a minute (the unknown-`kid` refetch interval)
+/// is the ceiling.
+pub const MAX_FETCH_TIMEOUT: Duration = Duration::from_secs(60);
 
 /// How often the background task re-reads the JWKS even when every `kid` is known.
 ///
@@ -248,6 +263,14 @@ pub(crate) fn redact_url(raw: &str) -> String {
     if url.host_str().is_none() {
         return UNPARSEABLE.to_string();
     }
+    // An `@` the parser did not read as the userinfo separator means the
+    // input is not the URL it looks like — `http://alice:1234/s3cret@host`
+    // is host `alice`, port `1234`, path `/s3cret@host` — and a credential
+    // may sit in what parsed as host, port or path. (One in the query or
+    // fragment is masked below anyway.)
+    if url.path().contains('@') {
+        return UNPARSEABLE.to_string();
+    }
     let userinfo = !url.username().is_empty() || url.password().is_some();
     if !userinfo && url.query().is_none() && url.fragment().is_none() {
         return raw.to_string();
@@ -265,7 +288,7 @@ pub(crate) fn redact_url(raw: &str) -> String {
 }
 
 /// `err` and every `source()` below it, joined with `": "`.
-fn error_chain(err: &dyn std::error::Error) -> String {
+pub(crate) fn error_chain(err: &dyn std::error::Error) -> String {
     let mut out = err.to_string();
     let mut source = err.source();
     while let Some(cause) = source {
@@ -327,36 +350,143 @@ fn judge_redirect(
     }
 }
 
-/// The HTTP client every metadata and JWKS fetch goes through. Redirects are
-/// judged by [`judge_redirect`]; `opt_in_key` names the `allow_insecure_http`
-/// setting in a refusal or warning.
-pub(crate) fn http_client(
+/// Hosts an explicit proxy is never used for: every loopback name and
+/// address ([`crate::validator::url_is_loopback`]'s set — `localhost`,
+/// `*.localhost`, `127.0.0.0/8`, `::1`). The URLs this crate fetches from a
+/// loopback host go through [`HttpClients::loopback`] anyway; this also
+/// covers a redirect hop to one inside [`HttpClients::normal`].
+pub(crate) const PROXY_BYPASS: &str = "localhost, 127.0.0.0/8, ::1";
+
+/// How the HTTP clients are built beyond the redirect policy: set by
+/// [`crate::OAuthValidatorBuilder`], defaulted by [`crate::OAuthValidator::new`].
+/// Holds `reqwest` types, so it never leaves the crate.
+pub(crate) struct FetchSettings {
+    /// Per-request timeout (connect through last body byte).
+    pub(crate) timeout: Duration,
+    /// Trust anchors ADDED to the TLS backend's own root set.
+    pub(crate) roots: Vec<reqwest::Certificate>,
+    /// An explicit proxy URL, already validated. `None` leaves reqwest's
+    /// own proxy behavior in place for non-loopback fetches.
+    pub(crate) proxy: Option<reqwest::Url>,
+}
+
+impl Default for FetchSettings {
+    fn default() -> Self {
+        Self {
+            timeout: DEFAULT_FETCH_TIMEOUT,
+            roots: Vec::new(),
+            proxy: None,
+        }
+    }
+}
+
+/// The two HTTP clients every metadata and JWKS fetch goes through, built
+/// from the same [`FetchSettings`] and redirect policy; [`HttpClients::for_url`]
+/// picks one per fetch from the URL being fetched.
+///
+/// A loopback URL names THIS host. Sent through a proxy it would name the
+/// proxy's host instead, and the plain-http loopback exemption (no
+/// `allow_insecure_http` needed) would carry the key fetch across the
+/// network in cleartext, where anyone on the path could substitute the keys.
+/// reqwest's own proxy handling (the `*_PROXY` environment variables, and on
+/// macOS and Windows the system settings when reqwest's `system-proxy`
+/// feature is on in the build) cannot be given extra exceptions, so rather
+/// than reimplementing it, loopback fetches use a second client with no
+/// proxy at all, and every other fetch keeps reqwest's behavior untouched.
+pub(crate) struct HttpClients {
+    /// Every non-loopback fetch. With no explicit proxy, a plain reqwest
+    /// client: environment and system proxies apply exactly as reqwest
+    /// applies them. With one, only that proxy (reqwest turns the
+    /// environment and system proxies off once a proxy is set), skipping
+    /// [`PROXY_BYPASS`].
+    pub(crate) normal: reqwest::Client,
+    /// Every fetch whose URL is loopback: `no_proxy()`, no proxy of any kind.
+    pub(crate) loopback: reqwest::Client,
+}
+
+impl HttpClients {
+    /// The client for a fetch of `url`: [`HttpClients::loopback`] when `url`
+    /// satisfies [`crate::validator::url_is_loopback`], otherwise
+    /// [`HttpClients::normal`].
+    ///
+    /// Chosen once per fetch, from its first URL; redirects are followed
+    /// inside the chosen client. A redirect from a non-loopback URL to a
+    /// loopback one therefore stays in `normal`, and with an environment or
+    /// system proxy (never an explicit one, which skips [`PROXY_BYPASS`])
+    /// that hop can go through the proxy, as it always has. Such a hop is
+    /// either https to https — TLS end to end through a `CONNECT` tunnel,
+    /// the certificate still checked — or plain http, which
+    /// [`judge_redirect`] follows only after an https-free chain and, off
+    /// loopback, only with `allow_insecure_http`.
+    pub(crate) fn for_url(&self, url: &str) -> &reqwest::Client {
+        if url_is_loopback(url) {
+            &self.loopback
+        } else {
+            &self.normal
+        }
+    }
+}
+
+/// Build [`HttpClients`]. Redirects are judged by [`judge_redirect`];
+/// `opt_in_key` names the `allow_insecure_http` setting in a refusal or
+/// warning.
+///
+/// Extra roots are added with `add_root_certificate`, which every TLS backend
+/// this crate offers treats as an addition: rustls puts them into the root
+/// store alongside the webpki and/or native roots its feature loads, and
+/// native-tls adds them to the platform store it keeps.
+pub(crate) fn http_clients(
     allow_insecure_http: bool,
-    opt_in_key: String,
-) -> Result<reqwest::Client, reqwest::Error> {
-    reqwest::Client::builder()
-        .timeout(JWKS_FETCH_TIMEOUT)
-        .redirect(reqwest::redirect::Policy::custom(
-            move |attempt| match judge_redirect(
-                attempt.url(),
-                attempt.previous(),
-                allow_insecure_http,
-                &opt_in_key,
-            ) {
-                Hop::Follow => attempt.follow(),
-                Hop::FollowInsecure => {
-                    warn!(
-                        url = %for_log(&redact_url(attempt.url().as_str())),
-                        "OAuth: following a redirect to plain http on a non-loopback host \
-                         ({opt_in_key} is set) — signing keys fetched over it can be \
-                         substituted by anyone on the path"
-                    );
-                    attempt.follow()
-                }
-                Hop::Refuse(reason) => attempt.error(reason),
-            },
-        ))
-        .build()
+    opt_in_key: &str,
+    settings: &FetchSettings,
+) -> Result<HttpClients, reqwest::Error> {
+    let mut normal = client_builder(allow_insecure_http, opt_in_key, settings);
+    if let Some(proxy) = &settings.proxy {
+        normal = normal.no_proxy().proxy(
+            reqwest::Proxy::all(proxy.clone())?
+                .no_proxy(reqwest::NoProxy::from_string(PROXY_BYPASS)),
+        );
+    }
+    Ok(HttpClients {
+        normal: normal.build()?,
+        loopback: client_builder(allow_insecure_http, opt_in_key, settings)
+            .no_proxy()
+            .build()?,
+    })
+}
+
+/// A client builder with the timeout, extra roots and redirect policy both
+/// [`HttpClients`] share, and reqwest's default proxy behavior.
+fn client_builder(
+    allow_insecure_http: bool,
+    opt_in_key: &str,
+    settings: &FetchSettings,
+) -> reqwest::ClientBuilder {
+    let opt_in_key = opt_in_key.to_string();
+    let mut builder = reqwest::Client::builder().timeout(settings.timeout);
+    for root in &settings.roots {
+        builder = builder.add_root_certificate(root.clone());
+    }
+    builder.redirect(reqwest::redirect::Policy::custom(
+        move |attempt| match judge_redirect(
+            attempt.url(),
+            attempt.previous(),
+            allow_insecure_http,
+            &opt_in_key,
+        ) {
+            Hop::Follow => attempt.follow(),
+            Hop::FollowInsecure => {
+                warn!(
+                    url = %for_log(&redact_url(attempt.url().as_str())),
+                    "OAuth: following a redirect to plain http on a non-loopback host \
+                     ({opt_in_key} is set) — signing keys fetched over it can be \
+                     substituted by anyone on the path"
+                );
+                attempt.follow()
+            }
+            Hop::Refuse(reason) => attempt.error(reason),
+        },
+    ))
 }
 
 /// One usable verification key from the JWK Set, with the algorithms it may verify.
@@ -418,7 +548,7 @@ pub(crate) struct JwksStore {
     allow_insecure_http: bool,
     algorithms: Vec<Algorithm>,
     naming: KeyNamingBuf,
-    http: reqwest::Client,
+    http: HttpClients,
     /// Only ever held for in-memory reads and swaps — never across a network
     /// call. tokio's `RwLock` queues new readers behind a waiting writer, so a
     /// writer parked on a slow IdP would stall every request, including ones whose
@@ -447,20 +577,34 @@ pub(crate) struct JwksStore {
 }
 
 impl JwksStore {
+    /// A store holding `seed` (keys from
+    /// [`crate::OAuthValidatorBuilder::initial_jwks`], already parsed by
+    /// [`keys_from_jwk_set_json`]; empty otherwise).
+    ///
+    /// Seeded keys count toward [`KeySetStatus::keys`] (so the validator is
+    /// ready at once), but stamp neither `last_attempt` nor `last_success`:
+    /// no fetch has happened, so the first unknown `kid` may fetch at once and
+    /// `last_success` keeps meaning "the authorization server answered".
     pub(crate) fn new(
         config: &ResolvedOAuthConfig,
-        http: reqwest::Client,
+        http: HttpClients,
         min_refetch_interval: Duration,
+        seed: Vec<CachedKey>,
     ) -> Self {
         let mut tracked = Tracked::default();
         tracked.set_jwks_uri(config.jwks_uri.clone().filter(|uri| !uri.trim().is_empty()));
+        tracked.public.keys = seed.len();
+        warn_about_new_ambiguous_keys(&[], &seed, &config.key_naming);
         Self {
             issuer: config.issuer.clone(),
             allow_insecure_http: config.allow_insecure_http,
             algorithms: config.algorithms.clone(),
             naming: config.key_naming.clone(),
             http,
-            jwks: RwLock::new(JwksCache::default()),
+            jwks: RwLock::new(JwksCache {
+                keys: seed,
+                last_attempt: None,
+            }),
             status: std::sync::Mutex::new(tracked),
             refresh_lock: Arc::new(Mutex::new(())),
             min_refetch_interval,
@@ -570,8 +714,9 @@ impl JwksStore {
 
         // One refresher at a time. A thundering herd of concurrent unknown-`kid`
         // requests queues HERE, not on the key lock, so requests whose key is
-        // already cached are never held up by a slow IdP; `JWKS_FETCH_TIMEOUT`
-        // bounds how long the queued ones wait.
+        // already cached are never held up by a slow IdP; the fetch timeout
+        // (`DEFAULT_FETCH_TIMEOUT` unless the builder set one) bounds how long
+        // the queued ones wait.
         let refreshing = Arc::clone(&self.refresh_lock).lock_owned().await;
 
         // Another task may have fetched while we waited.
@@ -674,39 +819,9 @@ impl JwksStore {
         let count = keys.len();
         debug!(count, jwks_uri = %shown, "Fetched JWKS");
         let previous = std::mem::replace(&mut self.jwks.write().await.keys, keys);
-        self.warn_about_new_ambiguous_keys(&previous).await;
-        Ok(count)
-    }
-
-    /// RFC 8725 §3.1 binds each key to exactly one algorithm. A JWK that
-    /// declares no `alg` (it is OPTIONAL, RFC 7517 §4.4) is usable here for
-    /// every allowlisted algorithm its type can produce — an RSA key for
-    /// RS256/384/512 and PS256/384/512 by default. Accepted, because an
-    /// authorization server that omits `alg` gives no other way to know which
-    /// one it signs with, and no practical attack mixing those on one key is
-    /// known; but said once per key, when it first appears, with the fix.
-    async fn warn_about_new_ambiguous_keys(&self, previous: &[CachedKey]) {
-        let already: HashSet<Option<&str>> = previous
-            .iter()
-            .filter(|k| k.ambiguous)
-            .map(|k| k.kid.as_deref())
-            .collect();
         let cache = self.jwks.read().await;
-        for key in cache.keys.iter().filter(|k| k.ambiguous) {
-            if already.contains(&key.kid.as_deref()) {
-                continue;
-            }
-            let algorithms: Vec<&str> = key.algorithms.iter().map(|a| a.as_str()).collect();
-            warn!(
-                kid = %describe_kid(key.kid.as_deref()),
-                algorithms = %algorithms.join(" "),
-                "JWKS key declares no alg, so it may verify any of {} — RFC 8725 §3.1 binds a \
-                 key to one algorithm. Narrow {} to the algorithm the authorization server \
-                 signs with.",
-                algorithms.join(", "),
-                self.naming.key("algorithms")
-            );
-        }
+        warn_about_new_ambiguous_keys(&previous, &cache.keys, &self.naming);
+        Ok(count)
     }
 
     /// Find the JWKS URI in the issuer's own metadata (used only when no
@@ -750,37 +865,7 @@ impl JwksStore {
 
     async fn fetch_jwks(&self, uri: &str) -> Result<Vec<CachedKey>, RefreshError> {
         let doc = self.fetch_json(uri).await?;
-        let entries = doc.get("keys").and_then(Value::as_array).ok_or_else(|| {
-            RefreshError::new(
-                RefreshErrorKind::Parse,
-                "response is not a JWK Set (no \"keys\" array)",
-            )
-        })?;
-        if entries.len() > MAX_JWKS_KEYS {
-            warn!(
-                published = entries.len(),
-                used = MAX_JWKS_KEYS,
-                "JWK Set has more keys than this server will consider; the rest are ignored"
-            );
-        }
-
-        let mut keys = Vec::new();
-        for entry in entries.iter().take(MAX_JWKS_KEYS) {
-            if let Some(key) = parse_jwks_entry(entry, &self.algorithms) {
-                keys.push(key);
-            }
-        }
-        if keys.is_empty() {
-            return Err(RefreshError::new(
-                RefreshErrorKind::NoUsableKeys,
-                format!(
-                    "the JWK Set contained no usable signature keys for {} {:?}",
-                    self.naming.key("algorithms"),
-                    self.algorithms
-                ),
-            ));
-        }
-        Ok(keys)
+        keys_from_jwk_set(&doc, &self.algorithms, &self.naming)
     }
 
     /// GET a JSON document with the body capped at [`MAX_FETCH_BYTES`].
@@ -788,6 +873,7 @@ impl JwksStore {
         let fetch = |message: String| RefreshError::new(RefreshErrorKind::Fetch, message);
         let mut resp = self
             .http
+            .for_url(url)
             .get(url)
             .header(reqwest::header::ACCEPT, "application/json")
             .send()
@@ -822,6 +908,103 @@ impl JwksStore {
             )
         })
     }
+}
+
+/// RFC 8725 §3.1 binds each key to exactly one algorithm. A JWK that
+/// declares no `alg` (it is OPTIONAL, RFC 7517 §4.4) is usable here for
+/// every allowlisted algorithm its type can produce — an RSA key for
+/// RS256/384/512 and PS256/384/512 by default. Accepted, because an
+/// authorization server that omits `alg` gives no other way to know which
+/// one it signs with, and no practical attack mixing those on one key is
+/// known; but said once per key, when it first appears in `current` (and was
+/// not already in `previous`), with the fix.
+fn warn_about_new_ambiguous_keys(
+    previous: &[CachedKey],
+    current: &[CachedKey],
+    naming: &KeyNamingBuf,
+) {
+    let already: HashSet<Option<&str>> = previous
+        .iter()
+        .filter(|k| k.ambiguous)
+        .map(|k| k.kid.as_deref())
+        .collect();
+    for key in current.iter().filter(|k| k.ambiguous) {
+        if already.contains(&key.kid.as_deref()) {
+            continue;
+        }
+        let algorithms: Vec<&str> = key.algorithms.iter().map(|a| a.as_str()).collect();
+        warn!(
+            kid = %describe_kid(key.kid.as_deref()),
+            algorithms = %algorithms.join(" "),
+            "JWKS key declares no alg, so it may verify any of {} — RFC 8725 §3.1 binds a \
+             key to one algorithm. Narrow {} to the algorithm the authorization server \
+             signs with.",
+            algorithms.join(", "),
+            naming.key("algorithms")
+        );
+    }
+}
+
+/// The usable keys in a JWK Set document: at most [`MAX_JWKS_KEYS`] entries
+/// are considered, each through [`parse_jwks_entry`] (so [`cached_key`]'s
+/// narrowing), and a set with none left is an error. The one path every key
+/// set takes, fetched or seeded by
+/// [`crate::OAuthValidatorBuilder::initial_jwks`].
+pub(crate) fn keys_from_jwk_set(
+    doc: &Value,
+    allowed: &[Algorithm],
+    naming: &KeyNamingBuf,
+) -> Result<Vec<CachedKey>, RefreshError> {
+    let entries = doc.get("keys").and_then(Value::as_array).ok_or_else(|| {
+        RefreshError::new(RefreshErrorKind::Parse, "not a JWK Set (no \"keys\" array)")
+    })?;
+    if entries.len() > MAX_JWKS_KEYS {
+        warn!(
+            published = entries.len(),
+            used = MAX_JWKS_KEYS,
+            "JWK Set has more keys than this server will consider; the rest are ignored"
+        );
+    }
+
+    let mut keys = Vec::new();
+    for entry in entries.iter().take(MAX_JWKS_KEYS) {
+        if let Some(key) = parse_jwks_entry(entry, allowed) {
+            keys.push(key);
+        }
+    }
+    if keys.is_empty() {
+        return Err(RefreshError::new(
+            RefreshErrorKind::NoUsableKeys,
+            format!(
+                "the JWK Set contained no usable signature keys for {} {:?}",
+                naming.key("algorithms"),
+                allowed
+            ),
+        ));
+    }
+    Ok(keys)
+}
+
+/// Parse a JWK Set given as JSON text (not fetched) into its usable keys:
+/// the same [`MAX_FETCH_BYTES`] cap a fetched body is held to, then
+/// [`keys_from_jwk_set`]. For [`crate::OAuthValidatorBuilder::initial_jwks`].
+pub(crate) fn keys_from_jwk_set_json(
+    json: &str,
+    allowed: &[Algorithm],
+    naming: &KeyNamingBuf,
+) -> Result<Vec<CachedKey>, RefreshError> {
+    if json.len() > MAX_FETCH_BYTES {
+        return Err(RefreshError::new(
+            RefreshErrorKind::Parse,
+            format!(
+                "it is {} bytes, over the {MAX_FETCH_BYTES}-byte cap",
+                json.len()
+            ),
+        ));
+    }
+    let doc: Value = serde_json::from_str(json)
+        .map_err(|e| RefreshError::new(RefreshErrorKind::Parse, context("not JSON", &e)))?;
+    keys_from_jwk_set(&doc, allowed, naming)
 }
 
 /// Build a [`CachedKey`] from one raw JWK Set entry, or `None` when the entry
@@ -1389,8 +1572,17 @@ mod tests {
         ] {
             assert_eq!(redact_url(raw), raw);
         }
-        // Unparseable: a fixed placeholder, never the input, never a panic.
+        // An `@` in the query or fragment is masked with the rest of it.
+        assert_eq!(
+            redact_url("https://idp.example.test/jwks?u=alice:s3cret@x#y@z"),
+            "https://idp.example.test/jwks?***#***"
+        );
+        // Unparseable, or an `@` the parser did not take as userinfo (which
+        // can hide a credential in what parsed as host, port or path): a
+        // fixed placeholder, never the input, never a panic.
         for raw in [
+            "http://alice:1234/s3cret@proxy.example.test:3128",
+            "https://idp.example.test/alice:s3cret@x/jwks",
             "",
             "not a url",
             "alice:s3cret@idp.example.com/jwks",
@@ -1438,6 +1630,7 @@ mod tests {
     fn the_http_client_builds_with_the_enabled_tls_backend() {
         // Whichever of `rustls-tls` / `native-tls` this build enabled, the client
         // the validator fetches keys with must build.
-        http_client(false, OPT_IN.to_string()).expect("the JWKS HTTP client must build");
+        http_clients(false, OPT_IN, &FetchSettings::default())
+            .expect("the JWKS HTTP clients must build");
     }
 }
