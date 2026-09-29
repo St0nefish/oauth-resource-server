@@ -40,7 +40,11 @@
 //! 401 for a missing or invalid credential, 403 for a valid token without the
 //! required scopes, each with a `WWW-Authenticate` challenge: the validator's
 //! when OAuth is configured, otherwise [`DEFAULT_STATIC_CHALLENGE`] (see
-//! [`AuthLayerBuilder::static_challenge`]). There is no 400 `invalid_request`
+//! [`AuthLayerBuilder::static_challenge`]). The status and the challenge are
+//! the ones [`crate::refusal()`] gives — the same decision, made by the same
+//! code — so an integration outside axum built on it, and the `tower`
+//! feature's [`HttpAuthLayer`](crate::http_layer::HttpAuthLayer), refuse exactly
+//! as this layer does. There is no 400 `invalid_request`
 //! (RFC 6750 §3.1's SHOULD for a malformed request): a request is authenticated
 //! or it is not, and anything unreadable is simply no credential.
 //!
@@ -155,223 +159,30 @@ use ::axum::extract::{FromRequestParts, OptionalFromRequestParts, Request, State
 use ::axum::middleware::Next;
 use ::axum::response::{IntoResponse, Response};
 use ::axum::routing::{any, get};
-use http::header::{AUTHORIZATION, WWW_AUTHENTICATE};
+use http::header::WWW_AUTHENTICATE;
 use http::request::Parts;
-use http::{HeaderMap, HeaderName, HeaderValue, Method, StatusCode};
+use http::{HeaderValue, Method, StatusCode};
 use tracing::{debug, error, warn};
 
-use crate::authenticate::{Credential, authenticate};
+use crate::authenticate::Credential;
 use crate::challenge::PROTECTED_RESOURCE_METADATA_PREFIX;
 use crate::policy::StaticTokenDecision;
 use crate::token::{AuthorizedToken, TokenRejection, for_log};
 use crate::validator::OAuthValidator;
 
-/// Where a request may carry a credential. Each configured source contributes
-/// at most one candidate — the header's FIRST value; a request that repeats the
-/// header has the later values ignored, not refused — and every candidate is
-/// checked independently (see [`crate::authenticate()`]): a bad credential in
-/// one source never masks a good one in another.
-///
-/// A header value that is not visible ASCII contributes no candidate. Every
-/// configured source header is marked sensitive
-/// (`http::HeaderValue::set_sensitive`) on the request, before the callback and
-/// the inner service see it, so `Debug` output and tracing layers print it as
-/// `Sensitive`.
-#[derive(Debug, Clone, PartialEq, Eq)]
-#[non_exhaustive]
-pub enum CredentialSource {
-    /// `<header>: Bearer <token>` (RFC 6750 §2.1). The scheme is matched
-    /// case-insensitively (RFC 9110 §11.1): `bearer x` is the same credential as
-    /// `Bearer x`. The token is the rest of the value after the first space,
-    /// trimmed. Any other scheme contributes no candidate.
-    Bearer(HeaderName),
-    /// `<header>: <token>`: the whole value, verbatim — for an API-key header
-    /// such as `X-Api-Key`.
-    Raw(HeaderName),
-}
-
-impl CredentialSource {
-    /// `Authorization: Bearer <token>`, the default and only source unless
-    /// [`AuthLayerBuilder::sources`] says otherwise.
-    pub fn authorization_bearer() -> Self {
-        Self::Bearer(AUTHORIZATION)
-    }
-
-    /// This source's candidate in `headers`, if the header is present, valid
-    /// visible ASCII and (for [`CredentialSource::Bearer`]) uses the `Bearer`
-    /// scheme. May be blank; [`crate::authenticate()`] treats blank as absent.
-    fn candidate<'h>(&self, headers: &'h HeaderMap) -> Option<&'h str> {
-        headers.get(self.header_name()).and_then(|v| self.parse(v))
-    }
-
-    /// The candidate one value of this source's header carries: `None` when
-    /// the value is not visible ASCII, otherwise the (possibly blank) token.
-    fn parse<'h>(&self, value: &'h HeaderValue) -> Option<&'h str> {
-        let value = value.to_str().ok()?;
-        Some(match self {
-            Self::Bearer(_) => bearer_credential(value),
-            Self::Raw(_) => value,
-        })
-    }
-
-    /// Whether EVERY value of this source's header — not just the first, which
-    /// is the only one ever authenticated — is readable and blank. Used only by
-    /// an [`AuthLayerBuilder::optional`] layer, and deliberately stricter than
-    /// the candidate parsing ([`bearer_credential`], unchanged): an unreadable
-    /// (non-visible-ASCII) value, and for a [`CredentialSource::Bearer`] source
-    /// any value [`names_a_token`] says carries a token, count as presented.
-    fn presents_nothing(&self, headers: &HeaderMap) -> bool {
-        headers.get_all(self.header_name()).iter().all(|v| {
-            let Ok(value) = v.to_str() else {
-                return false;
-            };
-            match self {
-                Self::Raw(_) => value.trim().is_empty(),
-                Self::Bearer(_) => {
-                    !names_a_token(value) && bearer_credential(value).trim().is_empty()
-                }
-            }
-        })
-    }
-
-    /// The header this source reads.
-    fn header_name(&self) -> &HeaderName {
-        match self {
-            Self::Bearer(name) | Self::Raw(name) => name,
-        }
-    }
-}
-
-/// Whether a `Bearer`-source header value carries a token that an
-/// [`AuthLayerBuilder::optional`] layer must not read as "no credential", even
-/// though [`bearer_credential`] yields no candidate from it:
-///
-/// - any value whose auth-scheme is `DPoP` (case-insensitive) — a
-///   sender-constrained token this crate cannot accept (RFC 9449), which must
-///   be refused rather than served as anonymous;
-/// - a `Bearer` scheme separated from a non-blank rest by SP **or HTAB** (RFC
-///   9110 §11.4 allows only SP; the strict parsing is not widened, the value
-///   is only counted as presented).
-///
-/// Leading SP/HTAB is skipped. Every other scheme (`Basic`, …) still counts as
-/// no bearer credential.
-fn names_a_token(value: &str) -> bool {
-    let value = value.trim_start_matches([' ', '\t']);
-    let (scheme, rest) = value
-        .find([' ', '\t'])
-        .map_or((value, ""), |i| value.split_at(i));
-    scheme.eq_ignore_ascii_case("dpop")
-        || (scheme.eq_ignore_ascii_case("bearer") && !rest.trim().is_empty())
-}
-
-/// The credential from a `Bearer <token>` header value, or `""`.
-///
-/// The auth-scheme is matched case-insensitively (RFC 9110 §11.1, RFC 6750 §2.1
-/// examples notwithstanding) — `bearer x` is the same credential as `Bearer x`,
-/// and refusing it would be a spurious 401 for a client that lower-cases scheme
-/// names. The token itself is taken verbatim, minus surrounding spaces.
-pub(crate) fn bearer_credential(header: &str) -> &str {
-    match header.split_once(' ') {
-        Some((scheme, token)) if scheme.eq_ignore_ascii_case("bearer") => token.trim(),
-        _ => "",
-    }
-}
-
-/// What an [`AuthLayerBuilder::on_reject`] callback is told about a refusal.
-///
-/// `#[non_exhaustive]`: read its fields; more may be added without a breaking
-/// change.
-///
-/// Its `Debug` prints the rejection, the status, the method, URI and version,
-/// and the request's header NAMES — never a header value, so
-/// `tracing::warn!(?cx, "refused")` cannot log the presented credential (which,
-/// for an insufficient-scope refusal, is a validly signed, unexpired token).
-#[non_exhaustive]
-pub struct RejectContext<'a> {
-    /// Why the request was refused. [`TokenRejection::Invalid`]'s reason is for
-    /// logs only — never put it in the response.
-    pub rejection: &'a TokenRejection,
-    /// The status the response will carry (401, or 403 for insufficient scope),
-    /// whatever the callback sets.
-    pub status: StatusCode,
-    /// The refused request's method, URI, version, headers and extensions — for
-    /// content negotiation (`Accept`), or a per-path error shape.
-    pub request: &'a Parts,
-}
-
-impl std::fmt::Debug for RejectContext<'_> {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        let header_names: Vec<&str> = self
-            .request
-            .headers
-            .keys()
-            .map(HeaderName::as_str)
-            .collect();
-        f.debug_struct("RejectContext")
-            .field("rejection", self.rejection)
-            .field("status", &self.status)
-            .field("method", &self.request.method)
-            .field("uri", &self.request.uri)
-            .field("version", &self.request.version)
-            .field("header_names", &header_names)
-            .finish_non_exhaustive()
-    }
-}
+use crate::http_layer::{Admission, Gate};
+#[doc(inline)]
+pub use crate::http_layer::{AuthLayerError, CredentialSource, RejectContext};
+pub use crate::refusal::DEFAULT_STATIC_CHALLENGE;
+// What the test module (`use super::*`) used from here before these moved to
+// `crate::http_layer`.
+#[cfg(test)]
+use crate::http_layer::{bearer_credential, names_a_token};
+#[cfg(test)]
+use http::{HeaderMap, HeaderName};
 
 /// Builds a refusal's body and extra headers; see [`AuthLayerBuilder::on_reject`].
 pub type RejectFn = Arc<dyn Fn(RejectContext<'_>) -> Response + Send + Sync>;
-
-/// The `WWW-Authenticate` value a layer with no OAuth validator sends on every
-/// 401, unless [`AuthLayerBuilder::static_challenge`] says otherwise.
-///
-/// RFC 9110 §15.5.2 requires a 401 to carry at least one challenge, and RFC
-/// 6750 §3 a `Bearer` challenge with at least one parameter. This is the same
-/// `invalid_token` challenge an OAuth layer sends (without the
-/// `resource_metadata` there is nothing to point at), for a missing credential
-/// as well as a wrong one — see the [module docs](self).
-pub const DEFAULT_STATIC_CHALLENGE: &str = "Bearer error=\"invalid_token\"";
-
-/// Why an [`AuthLayerBuilder`] refused to build.
-#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
-#[non_exhaustive]
-pub enum AuthLayerError {
-    /// Neither a (non-empty) static token nor an OAuth validator was given. A
-    /// layer that could accept nothing would lock every route; one that
-    /// accepted everything must be asked for by name.
-    #[error(
-        "no credential is configured: give a static token and/or an OAuth validator \
-         (AuthLayer::allow_unauthenticated is the explicit opt-out)"
-    )]
-    NoCredential,
-    /// [`AuthLayerBuilder::sources`] was given an empty list, so no request could
-    /// ever present a credential.
-    #[error("no credential source is configured: a request could never present a credential")]
-    NoSources,
-    /// [`AuthLayerBuilder::build_with_decision`]: the decision was made with
-    /// OAuth on, but no OAuth validator was given.
-    #[error(
-        "the static-token decision was made with OAuth enabled, but no OAuth validator \
-         was given"
-    )]
-    DecisionNeedsOAuth,
-    /// [`AuthLayerBuilder::build_with_decision`]: the decision was made with
-    /// OAuth off, but an OAuth validator was given.
-    #[error(
-        "the static-token decision was made with OAuth disabled, but an OAuth validator \
-         was given"
-    )]
-    DecisionWithoutOAuth,
-    /// The OAuth validator's challenge is not a valid HTTP header value, so
-    /// refusals could not carry `WWW-Authenticate`. [`crate::OAuthConfig::resolve`]
-    /// refuses every config that would cause this (a control or non-ASCII
-    /// character in `resource`, a scope that is not a scope-token); only a
-    /// hand-edited [`crate::ResolvedOAuthConfig`] reaches it.
-    #[error(
-        "the OAuth WWW-Authenticate challenge is not a valid HTTP header value — check \
-         the resource URL and scopes for control or non-ASCII characters"
-    )]
-    InvalidChallenge,
-}
 
 /// Which credentials are accepted, where they are read from, and how a refusal
 /// looks. Cheap to clone (one `Arc`).
@@ -403,21 +214,13 @@ enum Mode {
     AllowUnauthenticated,
 }
 
+/// An enforcing layer: the credential check shared with the `tower`
+/// feature's `HttpAuthLayer` (`Gate`, which also holds the static token, the
+/// validator, the sources, the pre-rendered challenges and
+/// [`AuthLayerBuilder::optional`]), plus this layer's axum-typed `on_reject`.
 struct Enforce {
-    static_token: Option<String>,
-    oauth: Option<Arc<OAuthValidator>>,
-    sources: Vec<CredentialSource>,
+    gate: Gate,
     on_reject: Option<RejectFn>,
-    /// The validator's pre-rendered challenges, `(invalid_token,
-    /// insufficient_scope)`; `Some` exactly when OAuth is configured (a
-    /// challenge that is not a valid header value fails the build instead).
-    oauth_challenges: Option<(HeaderValue, HeaderValue)>,
-    /// The challenge for a 401 when OAuth is off; `None` when the application
-    /// opted out with `static_challenge(None)`.
-    static_challenge: Option<HeaderValue>,
-    /// [`AuthLayerBuilder::optional`]: pass a request that presents no
-    /// credential through instead of refusing it.
-    optional: bool,
 }
 
 /// Hand-written so the static token never reaches a log line through `{:?}`.
@@ -432,13 +235,13 @@ impl std::fmt::Debug for AuthLayer {
                 .debug_struct("AuthLayer")
                 .field(
                     "static_token",
-                    &e.static_token.as_ref().map(|_| "<redacted>"),
+                    &e.gate.static_token.as_ref().map(|_| "<redacted>"),
                 )
-                .field("oauth", &e.oauth)
-                .field("sources", &e.sources)
+                .field("oauth", &e.gate.oauth)
+                .field("sources", &e.gate.sources)
                 .field("on_reject", &e.on_reject.as_ref().map(|_| "<fn>"))
-                .field("static_challenge", &e.static_challenge)
-                .field("optional", &e.optional)
+                .field("static_challenge", &e.gate.static_challenge)
+                .field("optional", &e.gate.optional)
                 .finish(),
         }
     }
@@ -532,7 +335,7 @@ impl AuthLayer {
     /// The OAuth validator, when one is configured.
     pub fn oauth(&self) -> Option<&Arc<OAuthValidator>> {
         match &*self.inner {
-            Mode::Enforce(e) => e.oauth.as_ref(),
+            Mode::Enforce(e) => e.gate.oauth.as_ref(),
             Mode::AllowUnauthenticated => None,
         }
     }
@@ -758,11 +561,7 @@ impl AuthLayerBuilder {
         mut self,
         decision: StaticTokenDecision,
     ) -> Result<AuthLayer, AuthLayerError> {
-        match (decision.oauth_enabled(), self.oauth.is_some()) {
-            (true, false) => return Err(AuthLayerError::DecisionNeedsOAuth),
-            (false, true) => return Err(AuthLayerError::DecisionWithoutOAuth),
-            _ => {}
-        }
+        Gate::check_decision(&decision, self.oauth.is_some())?;
         if decision == StaticTokenDecision::Unauthenticated {
             return Ok(AuthLayer::allow_unauthenticated());
         }
@@ -780,41 +579,19 @@ impl AuthLayerBuilder {
     /// challenge is not a valid header value (only reachable from a
     /// hand-edited resolved config).
     pub fn build(self) -> Result<AuthLayer, AuthLayerError> {
-        let static_token = self.static_token.filter(|t| !t.is_empty());
-        if static_token.is_none() && self.oauth.is_none() {
-            return Err(AuthLayerError::NoCredential);
-        }
-        let sources = self
-            .sources
-            .unwrap_or_else(|| vec![CredentialSource::authorization_bearer()]);
-        if sources.is_empty() {
-            return Err(AuthLayerError::NoSources);
-        }
-        // Fail closed here too: an OAuth layer whose 401s could not carry
-        // `resource_metadata` would leave hosted clients unable to start the
-        // authorization flow, which is worse than refusing to start.
-        let header = |challenge: String| {
-            HeaderValue::from_str(&challenge).map_err(|_| AuthLayerError::InvalidChallenge)
-        };
-        let oauth_challenges = match &self.oauth {
-            Some(v) => Some((
-                header(v.invalid_token_challenge())?,
-                header(v.insufficient_scope_challenge())?,
-            )),
-            None => None,
-        };
-        let static_challenge = self
-            .static_challenge
-            .unwrap_or_else(|| Some(HeaderValue::from_static(DEFAULT_STATIC_CHALLENGE)));
+        // The fail-closed checks, shared with the `tower` feature's
+        // `HttpAuthLayerBuilder::build`.
+        let gate = Gate::build(
+            self.static_token,
+            self.oauth,
+            self.sources,
+            self.static_challenge,
+            self.optional,
+        )?;
         Ok(AuthLayer {
             inner: Arc::new(Mode::Enforce(Enforce {
-                static_token,
-                oauth: self.oauth,
-                sources,
+                gate,
                 on_reject: self.on_reject,
-                oauth_challenges,
-                static_challenge,
-                optional: self.optional,
             })),
         })
     }
@@ -837,36 +614,23 @@ impl Enforce {
     /// `static_challenge(None)` gets none (a deliberate deviation, for keeping
     /// an existing API's responses byte-identical) and keeps whatever its
     /// callback set.
+    ///
+    /// The status and the challenge come from the same decision as the public
+    /// [`crate::refusal()`] (`refusal::select`, through `Gate`), so an
+    /// integration built on `refusal()` sends exactly what this layer sends.
     fn reject(&self, rejection: &TokenRejection, request: &Parts) -> Response {
-        let status = match rejection {
-            TokenRejection::InsufficientScope => StatusCode::FORBIDDEN,
-            TokenRejection::Invalid(_) | TokenRejection::Missing => StatusCode::UNAUTHORIZED,
-        };
-        let challenge = match (&self.oauth_challenges, rejection) {
-            (Some((_, insufficient)), TokenRejection::InsufficientScope) => Some(insufficient),
-            (Some((invalid, _)), _) => Some(invalid),
-            (None, _) => self.static_challenge.as_ref(),
-        };
-        let mut response = match &self.on_reject {
+        let (status, _) = self.gate.status_and_challenge(rejection);
+        let response = match &self.on_reject {
             Some(f) => f(RejectContext {
                 rejection,
                 status,
                 request,
             }),
-            None => {
-                let mut response = Response::new(Body::empty());
-                *response.status_mut() = status;
-                response
-            }
+            None => Response::new(Body::empty()),
         };
-        *response.status_mut() = status;
-        if let Some(value) = challenge {
-            // `insert` replaces every value the callback set.
-            response
-                .headers_mut()
-                .insert(WWW_AUTHENTICATE, value.clone());
-        }
-        response
+        // `finish` sets the status and `insert`s the challenge, replacing every
+        // value the callback set.
+        self.gate.finish(rejection, response)
     }
 
     /// Log a refusal at the level the [module docs](self#logging) give, then
@@ -874,7 +638,7 @@ impl Enforce {
     /// layer's own and an extractor's — goes through here.
     fn refuse(&self, rejection: &TokenRejection, request: &Parts) -> Response {
         let path = request.uri.path();
-        match (&self.oauth, rejection) {
+        match (&self.gate.oauth, rejection) {
             (None, _) => warn!(path = %path, "Bearer auth rejected"),
             // Every OAuth client's first request carries no credential
             // (401 → read `resource_metadata` → authorize), so it is not
@@ -913,37 +677,14 @@ impl AuthLayer {
         };
 
         let (mut parts, body) = request.into_parts();
-        // An optional layer's pass-through must mean "this layer accepted
-        // nothing": drop whatever an outer layer inserted, so `Option<..>`
-        // never hands the handler a credential this layer did not validate.
-        // Strict layers keep accumulating, as they always have (module docs).
-        if enforce.optional {
-            parts.extensions.remove::<Credential>();
-            parts.extensions.remove::<AuthorizedToken>();
-        }
-        // The credential must not reach a `Debug` of the request — ours
-        // (`RejectContext`), a tracing layer's, or a handler's.
-        for (name, value) in parts.headers.iter_mut() {
-            if enforce.sources.iter().any(|s| s.header_name() == name) {
-                value.set_sensitive(true);
-            }
-        }
-        let result = {
-            let headers = &parts.headers;
-            let candidates = enforce.sources.iter().filter_map(|s| s.candidate(headers));
-            authenticate(
-                candidates,
-                enforce.static_token.as_deref(),
-                enforce.oauth.as_deref(),
-            )
-            .await
-        };
-
-        match result {
-            Ok(Credential::StaticToken) => {
-                parts.extensions.insert(Credential::StaticToken);
-            }
-            Ok(Credential::OAuth(token)) => {
+        // `Gate::admit` (shared with the `tower` feature's `HttpAuthLayer`):
+        // clear an outer layer's credential for an optional layer, mark the
+        // source headers sensitive, `authenticate`, insert what was accepted,
+        // and decide an optional layer's pass-through. Logging stays here, so
+        // its target stays `oauth_resource_server::axum`.
+        match enforce.gate.admit(&mut parts).await {
+            Admission::Static => {}
+            Admission::OAuth(token) => {
                 debug!(
                     path = %parts.uri.path(),
                     principal = ?token.principal.as_deref().map(for_log),
@@ -951,28 +692,14 @@ impl AuthLayer {
                     scopes = ?token.scopes,
                     "OAuth bearer auth accepted"
                 );
-                parts.extensions.insert(token.clone());
-                parts.extensions.insert(Credential::OAuth(token));
             }
-            // `optional()`: pass through only what `authenticate` found no
-            // credential in AND where no source header holds anything at all
-            // beyond blanks — an unreadable value, or a non-blank later value
-            // of a repeated header, is refused below like any other `Missing`.
-            // An invalid or insufficient credential never reaches this arm:
-            // `authenticate` reports `Missing` only with no non-blank candidate.
-            Err(TokenRejection::Missing)
-                if enforce.optional
-                    && enforce
-                        .sources
-                        .iter()
-                        .all(|s| s.presents_nothing(&parts.headers)) =>
-            {
+            Admission::PassedThrough => {
                 debug!(
                     path = %parts.uri.path(),
                     "No credential presented; optional auth passes the request through"
                 );
             }
-            Err(rejection) => return Err(enforce.refuse(&rejection, &parts)),
+            Admission::Refused(rejection) => return Err(enforce.refuse(&rejection, &parts)),
         }
         parts.extensions.insert(LayerRan(self.clone()));
         Ok(Request::from_parts(parts, body))
@@ -995,7 +722,7 @@ impl AuthLayer {
         wants_oauth_token: bool,
     ) -> Response {
         match &*self.inner {
-            Mode::Enforce(enforce) if wants_oauth_token && enforce.oauth.is_none() => {
+            Mode::Enforce(enforce) if wants_oauth_token && enforce.gate.oauth.is_none() => {
                 error!(
                     path = %parts.uri.path(),
                     "Server misconfiguration: the handler requires an OAuth access token, but \
@@ -3348,5 +3075,518 @@ mod tests {
         let resp = send_raw(&app, &[("authorization", valid.as_bytes())]).await;
         assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
         assert_eq!(resp.headers()[WWW_AUTHENTICATE], DEFAULT_STATIC_CHALLENGE);
+    }
+}
+
+/// The shared refusal mapping: [`crate::refusal()`] against this layer's own
+/// [`Enforce::reject`], and this layer against the `tower` feature's
+/// `HttpAuthLayer`, request for request.
+#[cfg(test)]
+mod shared_refusal_tests {
+    use ::tower::{ServiceExt, service_fn};
+
+    use super::*;
+    use crate::http_layer::HttpAuthLayer;
+    use crate::testing;
+    use crate::{Refusal, refusal, refusal_with_static_challenge};
+
+    const STATIC: &str = "secret";
+    const CUSTOM: &str = "ApiKey realm=\"example\"";
+
+    fn validator(jwks_uri: &str) -> Arc<OAuthValidator> {
+        Arc::new(OAuthValidator::new(&testing::resolved_config(jwks_uri)).unwrap())
+    }
+
+    /// The layer's `static_challenge` setting, and the `&str` form
+    /// `refusal_with_static_challenge` takes for it.
+    #[derive(Clone, Copy, Debug)]
+    enum Static {
+        Unset,
+        Custom,
+        Off,
+    }
+
+    fn what_the_axum_layer_sends(
+        oauth: Option<Arc<OAuthValidator>>,
+        setting: Static,
+        rejection: &TokenRejection,
+    ) -> (u16, Vec<String>) {
+        let mut builder = AuthLayer::builder()
+            .static_token(STATIC)
+            .optional_oauth(oauth)
+            // A callback that sets its own challenge, to show it is replaced
+            // exactly when `refusal()` names one.
+            .on_reject(|_| {
+                (StatusCode::IM_A_TEAPOT, [(WWW_AUTHENTICATE, "Callback x")]).into_response()
+            });
+        builder = match setting {
+            Static::Unset => builder,
+            Static::Custom => builder.static_challenge(Some(HeaderValue::from_static(CUSTOM))),
+            Static::Off => builder.static_challenge(None),
+        };
+        let layer = builder.build().unwrap();
+        let Mode::Enforce(enforce) = &*layer.inner else {
+            unreachable!("an enforcing layer was built")
+        };
+        let (parts, ()) = Request::builder()
+            .uri("/test")
+            .body(())
+            .unwrap()
+            .into_parts();
+        let response = enforce.reject(rejection, &parts);
+        let challenges = response
+            .headers()
+            .get_all(WWW_AUTHENTICATE)
+            .iter()
+            .map(|v| v.to_str().unwrap().to_string())
+            .collect();
+        (response.status().as_u16(), challenges)
+    }
+
+    #[test]
+    fn refusal_gives_exactly_what_enforce_reject_gives() {
+        let v = validator("http://127.0.0.1:1/jwks");
+        let rejections = [
+            TokenRejection::Missing,
+            TokenRejection::Invalid("any reason".into()),
+            TokenRejection::InsufficientScope,
+        ];
+        let mut rows = 0;
+        for oauth in [None, Some(Arc::clone(&v))] {
+            for setting in [Static::Unset, Static::Custom, Static::Off] {
+                for rejection in &rejections {
+                    let static_str = match setting {
+                        Static::Unset => Some(DEFAULT_STATIC_CHALLENGE),
+                        Static::Custom => Some(CUSTOM),
+                        Static::Off => None,
+                    };
+                    let ours =
+                        refusal_with_static_challenge(rejection, oauth.as_deref(), static_str);
+                    if let Static::Unset = setting {
+                        assert_eq!(ours, refusal(rejection, oauth.as_deref()));
+                    }
+                    let (status, challenges) =
+                        what_the_axum_layer_sends(oauth.clone(), setting, rejection);
+                    let context = format!("oauth={} {setting:?} {rejection:?}", oauth.is_some());
+                    assert_eq!(ours.status, status, "{context}");
+                    // `None` leaves the callback's own header in place, as the
+                    // layer documents; `Some` replaces it.
+                    let expected = match &ours {
+                        Refusal {
+                            www_authenticate: Some(c),
+                            ..
+                        } => vec![c.clone()],
+                        _ => vec!["Callback x".to_string()],
+                    };
+                    assert_eq!(challenges, expected, "{context}");
+                    rows += 1;
+                }
+            }
+        }
+        assert_eq!(rows, 18);
+    }
+
+    #[test]
+    fn the_status_and_challenge_are_what_rfc_6750_asks_for() {
+        let v = validator("http://127.0.0.1:1/jwks");
+        let r = refusal(&TokenRejection::Missing, Some(&v));
+        assert_eq!(r.status, 401);
+        assert_eq!(r.www_authenticate, Some(v.invalid_token_challenge()));
+        let r = refusal(&TokenRejection::Invalid("x".into()), Some(&v));
+        assert_eq!(r.status, 401);
+        assert_eq!(r.www_authenticate, Some(v.invalid_token_challenge()));
+        let r = refusal(&TokenRejection::InsufficientScope, Some(&v));
+        assert_eq!(r.status, 403);
+        assert_eq!(r.www_authenticate, Some(v.insufficient_scope_challenge()));
+        // With OAuth, the static setting is ignored.
+        assert_eq!(
+            refusal_with_static_challenge(&TokenRejection::Missing, Some(&v), None),
+            refusal(&TokenRejection::Missing, Some(&v))
+        );
+    }
+
+    /// Status, every `WWW-Authenticate` value, and the handler's body.
+    type Seen = (u16, Vec<String>, String);
+
+    async fn through_axum(layer: AuthLayer, headers: &[(&str, &str)]) -> Seen {
+        let app: Router = Router::new()
+            .route(
+                "/test",
+                get(|credential: Option<Credential>| async move { format!("{credential:?}") }),
+            )
+            .route_layer(layer);
+        let mut request = Request::builder().uri("/test");
+        for (name, value) in headers {
+            request = request.header(*name, *value);
+        }
+        let response = app
+            .oneshot(request.body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+        let status = response.status().as_u16();
+        let challenges = response
+            .headers()
+            .get_all(WWW_AUTHENTICATE)
+            .iter()
+            .map(|v| v.to_str().unwrap().to_string())
+            .collect();
+        let body = ::axum::body::to_bytes(response.into_body(), 64 * 1024)
+            .await
+            .unwrap();
+        (
+            status,
+            challenges,
+            String::from_utf8(body.to_vec()).unwrap(),
+        )
+    }
+
+    async fn through_tower(layer: HttpAuthLayer, headers: &[(&str, &str)]) -> Seen {
+        let service = tower_layer::Layer::layer(
+            &layer,
+            service_fn(|request: http::Request<String>| async move {
+                let credential = request.extensions().get::<Credential>().cloned();
+                Ok::<_, std::convert::Infallible>(http::Response::new(format!("{credential:?}")))
+            }),
+        );
+        let mut request = http::Request::builder().uri("/test");
+        for (name, value) in headers {
+            request = request.header(*name, *value);
+        }
+        let response = service
+            .oneshot(request.body(String::new()).unwrap())
+            .await
+            .unwrap();
+        let challenges = response
+            .headers()
+            .get_all(WWW_AUTHENTICATE)
+            .iter()
+            .map(|v| v.to_str().unwrap().to_string())
+            .collect();
+        (response.status().as_u16(), challenges, response.into_body())
+    }
+
+    #[tokio::test]
+    async fn the_axum_and_tower_layers_answer_every_request_identically() {
+        let jwks = testing::spawn_jwks_server("200 OK", testing::jwks_body()).await;
+        let v = validator(&jwks.url);
+        let mint = |scope: &str, exp_offset: i64| {
+            testing::mint(
+                testing::KEY_A_PEM,
+                testing::KID_A,
+                &serde_json::json!({
+                    "iss": testing::ISSUER, "aud": testing::AUDIENCE, "sub": "user-1",
+                    "exp": testing::now() as i64 + exp_offset, "scope": scope,
+                }),
+            )
+        };
+        let valid = format!("Bearer {}", mint("mcp:read", 3600));
+        let expired = format!("Bearer {}", mint("mcp:read", -3600));
+        let unscoped = format!("Bearer {}", mint("openid", 3600));
+        let requests: Vec<Vec<(&str, &str)>> = vec![
+            vec![],
+            vec![("authorization", valid.as_str())],
+            vec![("authorization", expired.as_str())],
+            vec![("authorization", unscoped.as_str())],
+            vec![("authorization", "Bearer not-a-jwt")],
+            vec![("authorization", "Bearer secret")],
+            vec![("authorization", "bearer secret")],
+            vec![("authorization", "Bearer ")],
+            vec![("authorization", "Basic abc")],
+            vec![("authorization", "DPoP abc")],
+            vec![("x-api-key", "secret")],
+            vec![("authorization", "Bearer wrong"), ("x-api-key", "secret")],
+        ];
+
+        // (static token, oauth, static_challenge, optional, x-api-key source)
+        type Config = (
+            Option<&'static str>,
+            bool,
+            Option<Option<&'static str>>,
+            bool,
+            bool,
+        );
+        let configs: [Config; 7] = [
+            (None, true, None, false, false),
+            (Some(STATIC), true, None, false, true),
+            (Some(STATIC), false, None, false, false),
+            (Some(STATIC), false, Some(None), false, false),
+            (Some(STATIC), false, Some(Some(CUSTOM)), false, true),
+            (Some(STATIC), true, None, true, false),
+            (Some(STATIC), false, None, true, true),
+        ];
+        for (static_token, with_oauth, static_challenge, optional, api_key) in configs {
+            let oauth = with_oauth.then(|| Arc::clone(&v));
+            let sources = if api_key {
+                vec![
+                    CredentialSource::authorization_bearer(),
+                    CredentialSource::Raw(HeaderName::from_static("x-api-key")),
+                ]
+            } else {
+                vec![CredentialSource::authorization_bearer()]
+            };
+            let challenge = static_challenge.map(|c| c.map(HeaderValue::from_static));
+            let mut axum_builder = AuthLayer::builder()
+                .optional_static_token(static_token.map(str::to_string))
+                .optional_oauth(oauth.clone())
+                .sources(sources.clone());
+            let mut tower_builder = HttpAuthLayer::builder()
+                .optional_static_token(static_token.map(str::to_string))
+                .optional_oauth(oauth.clone())
+                .sources(sources);
+            if let Some(c) = challenge {
+                axum_builder = axum_builder.static_challenge(c.clone());
+                tower_builder = tower_builder.static_challenge(c);
+            }
+            if optional {
+                axum_builder = axum_builder.optional();
+                tower_builder = tower_builder.optional();
+            }
+            let axum_layer = axum_builder.build().unwrap();
+            let tower_layer = tower_builder.build().unwrap();
+            for headers in &requests {
+                let a = through_axum(axum_layer.clone(), headers).await;
+                let t = through_tower(tower_layer.clone(), headers).await;
+                assert_eq!(
+                    a, t,
+                    "config {static_token:?} oauth={with_oauth} {static_challenge:?} \
+                     optional={optional} api_key={api_key}, request {headers:?}"
+                );
+            }
+        }
+    }
+
+    /// Status, every `WWW-Authenticate` value, `Content-Type`, and the body.
+    type SeenFull = (u16, Vec<String>, Option<String>, String);
+
+    fn seen_parts(headers: &HeaderMap, status: u16, body: String) -> SeenFull {
+        let challenges = headers
+            .get_all(WWW_AUTHENTICATE)
+            .iter()
+            .map(|v| v.to_str().unwrap().to_string())
+            .collect();
+        let content_type = headers
+            .get(http::header::CONTENT_TYPE)
+            .map(|v| v.to_str().unwrap().to_string());
+        (status, challenges, content_type, body)
+    }
+
+    /// What the handler behind both stacks reports: the credential and the
+    /// token the layers left in the extensions.
+    fn describe(extensions: &http::Extensions) -> String {
+        format!(
+            "{:?} token={}",
+            extensions.get::<Credential>(),
+            extensions.get::<AuthorizedToken>().is_some()
+        )
+    }
+
+    /// Headers as raw `HeaderValue`s, so a test can send a repeated header or
+    /// bytes that are not visible ASCII.
+    type RawHeaders = Vec<(&'static str, HeaderValue)>;
+
+    async fn axum_full(app: Router, headers: &RawHeaders) -> SeenFull {
+        let mut request = Request::builder().uri("/test");
+        for (name, value) in headers {
+            request = request.header(*name, value.clone());
+        }
+        let response = app
+            .oneshot(request.body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+        let (parts, body) = response.into_parts();
+        let body = ::axum::body::to_bytes(body, 64 * 1024).await.unwrap();
+        seen_parts(
+            &parts.headers,
+            parts.status.as_u16(),
+            String::from_utf8(body.to_vec()).unwrap(),
+        )
+    }
+
+    async fn tower_full<S>(service: S, headers: &RawHeaders) -> SeenFull
+    where
+        S: tower_service::Service<
+                http::Request<String>,
+                Response = http::Response<String>,
+                Error = std::convert::Infallible,
+            >,
+    {
+        let mut request = http::Request::builder().uri("/test");
+        for (name, value) in headers {
+            request = request.header(*name, value.clone());
+        }
+        let response = service
+            .oneshot(request.body(String::new()).unwrap())
+            .await
+            .unwrap();
+        let (parts, body) = response.into_parts();
+        seen_parts(&parts.headers, parts.status.as_u16(), body)
+    }
+
+    fn axum_app(layer: AuthLayer) -> Router {
+        Router::new()
+            .route(
+                "/test",
+                get(|request: Request| async move { describe(request.extensions()) }),
+            )
+            .route_layer(layer)
+    }
+
+    fn tower_handler(
+        request: http::Request<String>,
+    ) -> std::future::Ready<Result<http::Response<String>, std::convert::Infallible>> {
+        // The content type axum gives a `String` handler response, so only
+        // the layers' own differences could make the two stacks disagree.
+        let mut response = http::Response::new(describe(request.extensions()));
+        response.headers_mut().insert(
+            http::header::CONTENT_TYPE,
+            HeaderValue::from_static("text/plain; charset=utf-8"),
+        );
+        std::future::ready(Ok(response))
+    }
+
+    #[tokio::test]
+    async fn the_layers_agree_on_callbacks_repeated_and_unreadable_headers() {
+        let jwks = testing::spawn_jwks_server("200 OK", testing::jwks_body()).await;
+        let v = validator(&jwks.url);
+        let valid = HeaderValue::from_str(&format!("Bearer {}", testing::valid_token())).unwrap();
+        let requests: Vec<RawHeaders> = vec![
+            vec![],
+            vec![("authorization", valid.clone())],
+            vec![("authorization", HeaderValue::from_static("Bearer wrong"))],
+            // Repeated: only the first value is authenticated, and an optional
+            // layer counts a non-blank later value as presented.
+            vec![
+                ("authorization", valid.clone()),
+                ("authorization", HeaderValue::from_static("Bearer wrong")),
+            ],
+            vec![
+                ("authorization", HeaderValue::from_static("Bearer ")),
+                ("authorization", HeaderValue::from_static("Bearer secret")),
+            ],
+            vec![
+                ("x-api-key", HeaderValue::from_static("wrong")),
+                ("x-api-key", HeaderValue::from_static("secret")),
+            ],
+            // Not visible ASCII: no candidate, but presented.
+            vec![(
+                "authorization",
+                HeaderValue::from_bytes(b"Bearer s\xe9cret").unwrap(),
+            )],
+            vec![("x-api-key", HeaderValue::from_bytes(b"\xff").unwrap())],
+        ];
+        for with_oauth in [false, true] {
+            for optional in [false, true] {
+                for static_challenge in [None, Some(None)] {
+                    let sources = [
+                        CredentialSource::authorization_bearer(),
+                        CredentialSource::Raw(HeaderName::from_static("x-api-key")),
+                    ];
+                    let oauth = with_oauth.then(|| Arc::clone(&v));
+                    // Both callbacks set their own challenge, content type and
+                    // body; the layers must treat them identically.
+                    let mut a = AuthLayer::builder()
+                        .static_token(STATIC)
+                        .optional_oauth(oauth.clone())
+                        .sources(sources.clone())
+                        .on_reject(|cx| {
+                            (
+                                StatusCode::IM_A_TEAPOT,
+                                [
+                                    (WWW_AUTHENTICATE, "Callback x"),
+                                    (http::header::CONTENT_TYPE, "application/json"),
+                                ],
+                                format!("{{\"status\":{}}}", cx.status.as_u16()),
+                            )
+                                .into_response()
+                        });
+                    let mut t = HttpAuthLayer::builder()
+                        .static_token(STATIC)
+                        .optional_oauth(oauth)
+                        .sources(sources)
+                        .on_reject(|cx: RejectContext<'_>| {
+                            http::Response::builder()
+                                .status(StatusCode::IM_A_TEAPOT)
+                                .header(WWW_AUTHENTICATE, "Callback x")
+                                .header(http::header::CONTENT_TYPE, "application/json")
+                                .body(format!("{{\"status\":{}}}", cx.status.as_u16()))
+                                .unwrap()
+                        });
+                    if let Some(c) = &static_challenge {
+                        a = a.static_challenge(c.clone());
+                        t = t.static_challenge(c.clone());
+                    }
+                    if optional {
+                        a = a.optional();
+                        t = t.optional();
+                    }
+                    let (a, t) = (a.build().unwrap(), t.build().unwrap());
+                    for headers in &requests {
+                        let service = tower_layer::Layer::layer(&t, service_fn(tower_handler));
+                        assert_eq!(
+                            axum_full(axum_app(a.clone()), headers).await,
+                            tower_full(service, headers).await,
+                            "oauth={with_oauth} optional={optional} \
+                             static_challenge={static_challenge:?} {headers:?}"
+                        );
+                    }
+                }
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn the_layers_agree_that_optional_clears_an_outer_layers_credential() {
+        let jwks = testing::spawn_jwks_server("200 OK", testing::jwks_body()).await;
+        let v = validator(&jwks.url);
+        let bearer = HeaderValue::from_str(&format!("Bearer {}", testing::valid_token())).unwrap();
+        // An outer strict layer accepts an OAuth token from `X-Outer`; the
+        // inner optional layer reads only `Authorization`.
+        let outer_sources = [CredentialSource::Bearer(HeaderName::from_static("x-outer"))];
+        let requests: Vec<RawHeaders> = vec![
+            vec![("x-outer", bearer.clone())],
+            vec![
+                ("x-outer", bearer.clone()),
+                ("authorization", HeaderValue::from_static("Bearer secret")),
+            ],
+            vec![
+                ("x-outer", bearer.clone()),
+                ("authorization", HeaderValue::from_static("Bearer wrong")),
+            ],
+        ];
+        let axum_outer = AuthLayer::builder()
+            .oauth(Arc::clone(&v))
+            .sources(outer_sources.clone())
+            .build()
+            .unwrap();
+        let axum_inner = AuthLayer::builder()
+            .static_token(STATIC)
+            .optional()
+            .build()
+            .unwrap();
+        let tower_outer = HttpAuthLayer::builder()
+            .oauth(Arc::clone(&v))
+            .sources(outer_sources)
+            .build()
+            .unwrap();
+        let tower_inner = HttpAuthLayer::builder()
+            .static_token(STATIC)
+            .optional()
+            .build()
+            .unwrap();
+        let mut outcomes = Vec::new();
+        for headers in &requests {
+            let app = axum_app(axum_inner.clone()).layer(axum_outer.clone());
+            let service = ::tower::ServiceBuilder::new()
+                .layer(tower_outer.clone())
+                .layer(tower_inner.clone())
+                .service(service_fn(tower_handler));
+            let a = axum_full(app, headers).await;
+            assert_eq!(a, tower_full(service, headers).await, "{headers:?}");
+            outcomes.push(a);
+        }
+        // The pass-through left nothing of the outer layer's token.
+        assert_eq!(outcomes[0].3, "None token=false");
+        assert_eq!(outcomes[1].3, "Some(StaticToken) token=false");
+        assert_eq!(outcomes[2].0, 401);
     }
 }

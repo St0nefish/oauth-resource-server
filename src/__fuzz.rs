@@ -21,10 +21,10 @@ use crate::config::KeyNamingBuf;
 use crate::token::{MAX_TOKEN_BYTES, TokenRejection};
 use crate::validator::OAuthValidator;
 
-/// `axum::bearer_credential`: the result is always a sub-slice of the input
+/// `http_layer::bearer_credential`: the result is always a sub-slice of the input
 /// and never carries surrounding whitespace.
 pub fn bearer_credential(header: &str) {
-    let token = crate::axum::bearer_credential(header);
+    let token = crate::http_layer::bearer_credential(header);
     assert!(header.contains(token));
     assert_eq!(token, token.trim());
 }

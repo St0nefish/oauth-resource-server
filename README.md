@@ -81,11 +81,12 @@ oauth-resource-server = { version = "0.1", features = ["axum", "serde"] }
 | `native-tls` | no | The platform TLS backend (OpenSSL on Linux), trusting the operating system's certificate store. |
 | `serde` | no | `Deserialize`/`Serialize` for `OAuthConfig`, to load it from YAML, TOML, JSON or any other serde format. |
 | `env` | no | The `env` module: load the config and secrets from environment variables, with `VAR_FILE` support. |
-| `axum` | no | The `axum` module: the `AuthLayer` middleware, `metadata_router`, and axum extractors for `Credential` and `AuthorizedToken`. |
+| `tower` | no | The `http_layer` module: `HttpAuthLayer`, an authentication layer for any `tower` service over `http::Request<B>` (hyper, tonic, ...), whatever its body types. See [Using with other frameworks](#using-with-other-frameworks). |
+| `axum` | no | The `axum` module: the `AuthLayer` middleware, `metadata_router`, and axum extractors for `Credential` and `AuthorizedToken`. Implies `tower`. |
 | `testing` | no | A fake authorization server (`TestAuthority`), a fluent token builder, and the throwaway signing keys behind them, for **your tests only**. Never enable it in a production build. It follows semver like the rest of the crate. |
 
-The core (config, validator, `authenticate`, `static_token_policy`) is always
-available and depends on no web framework.
+The core (config, validator, `authenticate`, `refusal`, `static_token_policy`)
+is always available and depends on no web framework.
 
 ### Choosing a TLS backend
 
@@ -723,51 +724,6 @@ browser-managed HTTP auth would be). Use an explicit origin, as above, rather
 than a wildcard — and never combine a wildcard `allow_origin` with
 `allow_credentials(true)` at all; the Fetch spec forbids it.
 
-### Without axum
-
-The validator and the credential logic have no web-framework dependency. They
-do need a **Tokio 1.x runtime**: key fetches use `reqwest` with a Tokio timer
-and run in a spawned task, and the first fetch panics outside one. On
-`async-std`, `smol` or another executor, drive `validate` and `authenticate`
-from a Tokio runtime handle. On another HTTP stack, collect the candidate
-credentials yourself and map the result to a response:
-
-```rust,no_run
-use oauth_resource_server::{Credential, OAuthValidator, TokenRejection, authenticate};
-
-/// On refusal: the status and the `WWW-Authenticate` value to send.
-async fn check(
-    bearer: Option<&str>,
-    api_key: Option<&str>,
-    static_token: Option<&str>,
-    oauth: &OAuthValidator,
-) -> Result<Credential, (u16, String)> {
-    let candidates = bearer.into_iter().chain(api_key);
-    match authenticate(candidates, static_token, Some(oauth)).await {
-        Ok(credential) => Ok(credential),
-        Err(TokenRejection::InsufficientScope) => {
-            Err((403, oauth.insufficient_scope_challenge()))
-        }
-        // Missing, Invalid (log its reason; never send it) and any future
-        // variant are 401.
-        Err(_) => Err((401, oauth.invalid_token_challenge())),
-    }
-}
-```
-
-For a single token, call `OAuthValidator::validate` directly. Serve
-`OAuthValidator::metadata()` (a `&serde_json::Value`) as JSON, without
-authentication, on `OAuthValidator::metadata_path()` and, if you like, on the
-bare `/.well-known/oauth-protected-resource` (see [Using with
-MCP](#using-with-mcp) for what that bare copy is and is not). With only a
-static token, send `WWW-Authenticate` on every 401 yourself (RFC 9110
-§15.5.2); `Bearer error="invalid_token"` is what the axum layer sends.
-`TokenRejection` is a `std::error::Error` whose `Display` is only its category
-(`invalid token`), so `?` and `{e}` never expose the reason; the reason is in
-the variant and in `Debug`, for your log.
-[`examples/standalone_validator.rs`](https://github.com/St0nefish/oauth-resource-server/blob/master/examples/standalone_validator.rs)
-walks through accepted and refused tokens against a fake authorization server.
-
 ### Readiness and liveness probes
 
 `OAuthValidator::is_ready()` is true once at least one signing key is held;
@@ -1008,8 +964,9 @@ verified claims and token metadata) or a
   disconnects or times out mid-fetch cannot cancel it and leave the cooldown
   spent with no keys loaded.
 - **The middleware fails closed by construction.**
-  `AuthLayer::builder().build()` returns an error with neither a static token
-  nor a validator. The only pass-throughs are `AuthLayer::allow_unauthenticated()`
+  `AuthLayer::builder().build()` (and the tower layer's
+  `HttpAuthLayer::builder().build()`, which runs the same check) returns an
+  error with neither a static token nor a validator. The only pass-throughs are `AuthLayer::allow_unauthenticated()`
   and a `StaticTokenDecision::Unauthenticated` handed to `AuthLayer::from_decision`
   or `build_with_decision` (which `static_token_policy` returns only with
   `allow_unauthenticated = true`); both must be asked for by name.
@@ -1040,10 +997,16 @@ verified claims and token metadata) or a
   403 carries `WWW-Authenticate` with `resource_metadata`, including a request
   that failed with a static token, since the server cannot tell which
   credential the caller meant. A custom `on_reject` cannot remove it, and a
-  validator whose challenge would not be a valid header makes
-  `AuthLayerBuilder::build` fail rather than send challenge-less 401s. With
+  config whose challenge would not be a valid header makes
+  `AuthLayerBuilder::build` fail rather than send challenge-less 401s (the
+  validator itself then logs at `error` and falls back to a bare `Bearer`
+  challenge, so `refusal()` never returns a header a line break could
+  split). With
   only a static token, 401s carry `Bearer error="invalid_token"` unless the
-  application opts out with `static_challenge(None)`.
+  application opts out with `static_challenge(None)`. The status and the
+  challenge are decided by one function, `refusal()`, which the axum layer,
+  the tower layer and a hand-built integration all use, so the three cannot
+  disagree about a refusal.
 - **Weak configurations are refused, not just logged.** `resolve` refuses a
   plain-`http` `issuer`, `jwks_uri` or `resource` on a non-loopback host, a
   config that would accept ID tokens (no required scope and no `typ` check),
@@ -1241,6 +1204,166 @@ To switch from one audience to another without downtime, list both in
 - **401 and 403 are different answers.** A client that gets 401 for a missing
   scope re-authorizes, gets the same token, and loops. 403
   `insufficient_scope` names the scope it needs.
+
+## Using with other frameworks
+
+The validator and the credential logic have no web-framework dependency. They
+do need a **Tokio 1.x runtime**: key fetches use `reqwest` with a Tokio timer
+and run in a spawned task, and the first fetch panics outside one. On
+`async-std`, `smol` or another executor, drive `validate` and `authenticate`
+from a Tokio runtime handle.
+
+Whatever the stack, the 401/403 decision is one function, `refusal()`: the
+axum layer, the tower layer and a hand-built integration all get the status and
+`WWW-Authenticate` challenge from the same code, so they cannot disagree.
+
+### A tower stack (hyper, tonic, ...): `HttpAuthLayer`
+
+With the `tower` feature, `oauth_resource_server::http_layer::HttpAuthLayer` wraps
+any `tower` service over `http::Request<ReqBody>` / `http::Response<ResBody>`,
+for any body types. It is the axum layer's check without axum: the same
+builder (`static_token`, `oauth`, `sources`, `static_challenge`, `optional`,
+`build_with_decision`), the same fail-closed build, the same refusals, and the
+same `Credential`/`AuthorizedToken` request extensions. A refusal's body is
+`ResBody::default()` unless `on_reject` builds a response, whose status and
+challenge the layer then sets:
+
+```rust,no_run
+use std::convert::Infallible;
+use std::sync::Arc;
+
+use http::{Request, Response, header::CONTENT_TYPE};
+use oauth_resource_server::http_layer::{HttpAuthLayer, RejectContext};
+use oauth_resource_server::{Credential, OAuthValidator};
+use tower::{ServiceBuilder, service_fn};
+
+async fn handler(request: Request<String>) -> Result<Response<String>, Infallible> {
+    let who = match request.extensions().get::<Credential>() {
+        Some(Credential::OAuth(token)) => format!("{:?}", token.subject),
+        _ => "someone".to_string(),
+    };
+    Ok(Response::new(format!("hello, {who}")))
+}
+
+fn service(oauth: Arc<OAuthValidator>) {
+    let auth = HttpAuthLayer::builder()
+        .oauth(oauth)
+        .on_reject(|cx: RejectContext<'_>| {
+            Response::builder()
+                .header(CONTENT_TYPE, "application/json")
+                .body(format!(r#"{{"status":{}}}"#, cx.status.as_u16()))
+                .unwrap()
+        })
+        .build()
+        .expect("a validator is configured");
+    let _service = ServiceBuilder::new().layer(auth).service(service_fn(handler));
+}
+```
+
+On hyper, adapt the tower service with `hyper_util::service::TowerToHyperService`.
+On an axum app, use `axum::AuthLayer`: the axum extractors answer 500 behind
+`HttpAuthLayer`, which they cannot tell ran.
+
+### Any other stack: `authenticate` + `refusal`
+
+Collect the candidate credentials yourself, call `authenticate`, and answer a
+refusal with what `refusal` returns — the status, and `WWW-Authenticate` set
+(not appended) to its value:
+
+```rust,no_run
+use oauth_resource_server::{Credential, OAuthValidator, authenticate, refusal};
+
+/// On refusal: the status and the `WWW-Authenticate` value to send.
+async fn check(
+    bearer: Option<&str>,
+    api_key: Option<&str>,
+    static_token: Option<&str>,
+    oauth: &OAuthValidator,
+) -> Result<Credential, (u16, Option<String>)> {
+    let candidates = bearer.into_iter().chain(api_key);
+    authenticate(candidates, static_token, Some(oauth))
+        .await
+        .map_err(|rejection| {
+            // Log `rejection` (an `Invalid` carries its reason); never send it.
+            let r = refusal(&rejection, Some(oauth));
+            (r.status, r.www_authenticate)
+        })
+}
+```
+
+With only a static token, `refusal(&rejection, None)` gives the same
+`Bearer error="invalid_token"` challenge the layers send (RFC 9110 §15.5.2
+requires one on every 401); `refusal_with_static_challenge` picks another, or
+none (a challenge that is not a valid header value, such as one containing a
+line break, is replaced by the default). For a single token, call `OAuthValidator::validate` directly. Serve
+`OAuthValidator::metadata()` (a `&serde_json::Value`) as JSON, without
+authentication, on `OAuthValidator::metadata_path()` and, if you like, on the
+bare `/.well-known/oauth-protected-resource` (see [Using with
+MCP](#using-with-mcp) for what that bare copy is and is not). A readiness
+probe is framework-free too: answer it from `OAuthValidator::is_ready()`,
+outside authentication, as in [Readiness and liveness
+probes](#readiness-and-liveness-probes) (never from `refresh_now()`, which
+fetches every time). `TokenRejection` is a `std::error::Error` whose `Display` is only its category
+(`invalid token`), so `?` and `{e}` never expose the reason; the reason is in
+the variant and in `Debug`, for your log.
+[`examples/hyper.rs`](https://github.com/St0nefish/oauth-resource-server/blob/master/examples/hyper.rs)
+is a complete hyper 1.x server built this way, and
+[`examples/standalone_validator.rs`](https://github.com/St0nefish/oauth-resource-server/blob/master/examples/standalone_validator.rs)
+walks through accepted and refused tokens against a fake authorization server.
+
+### actix-web
+
+actix-web runs on Tokio, so the same two functions work in an actix-web
+middleware. This sketch is not compiled by this crate's CI (actix-web is not
+one of its dev-dependencies); it uses `actix_web::middleware::from_fn`
+(actix-web 4.9 or later):
+
+```text
+use std::sync::Arc;
+
+use actix_web::body::MessageBody;
+use actix_web::dev::{ServiceRequest, ServiceResponse};
+use actix_web::http::{StatusCode, header};
+use actix_web::middleware::{Next, from_fn};
+use actix_web::{App, Error, HttpMessage, HttpResponse, web};
+use oauth_resource_server::{OAuthValidator, authenticate, refusal};
+
+async fn require_auth(
+    req: ServiceRequest,
+    next: Next<impl MessageBody + 'static>,
+) -> Result<ServiceResponse<impl MessageBody>, Error> {
+    let oauth = req
+        .app_data::<web::Data<OAuthValidator>>()
+        .expect("the validator is registered as app data")
+        .clone();
+    let bearer = req
+        .headers()
+        .get(header::AUTHORIZATION)
+        .and_then(|v| v.to_str().ok())
+        .and_then(|v| v.split_once(' '))
+        .filter(|(scheme, _)| scheme.eq_ignore_ascii_case("bearer"))
+        .map(|(_, token)| token.trim().to_owned());
+    match authenticate(bearer.as_deref(), None, Some(&oauth)).await {
+        Ok(credential) => {
+            req.extensions_mut().insert(credential);
+            Ok(next.call(req).await?.map_into_left_body())
+        }
+        Err(rejection) => {
+            let r = refusal(&rejection, Some(&oauth));
+            let mut response = HttpResponse::build(StatusCode::from_u16(r.status).unwrap());
+            if let Some(challenge) = r.www_authenticate {
+                response.insert_header((header::WWW_AUTHENTICATE, challenge));
+            }
+            Ok(req.into_response(response.finish()).map_into_right_body())
+        }
+    }
+}
+
+// let oauth: Arc<OAuthValidator> = ...;
+// App::new()
+//     .app_data(web::Data::from(Arc::clone(&oauth)))
+//     .service(web::scope("/api").wrap(from_fn(require_auth)) /* .route(...) */)
+```
 
 ## Using with MCP
 
@@ -1495,6 +1618,7 @@ cargo run --example axum_basic --features axum,serde,testing
 cargo run --example multiple_sources --features axum,testing
 cargo run --example standalone_validator --features testing
 cargo run --example env_config --features env,axum
+cargo run --example hyper --features testing
 ```
 
 | Example | What it shows |
@@ -1503,6 +1627,7 @@ cargo run --example env_config --features env,axum
 | `multiple_sources` | `Authorization: Bearer` plus an `X-Api-Key` header, a static key in dual mode, and JSON rejection bodies. |
 | `standalone_validator` | The validator without axum: discovery, `validate`, `authenticate` and the challenge headers. |
 | `env_config` | Loading everything from `MYAPP_OAUTH_*` variables, an application default for the required scope, and `static_token_policy`. |
+| `hyper` | A plain hyper 1.x server with no framework: `authenticate`, `refusal` for the 401/403 and challenge, and the metadata document, driven by hyper's client. |
 
 ## MSRV and semver policy
 

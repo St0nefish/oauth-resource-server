@@ -9,7 +9,7 @@ use base64::Engine;
 use base64::engine::general_purpose::URL_SAFE_NO_PAD;
 use jsonwebtoken::{DecodingKey, Validation, decode, decode_header};
 use serde_json::{Map, Value};
-use tracing::{debug, info, warn};
+use tracing::{debug, error, info, warn};
 
 use crate::algorithms::Algorithm;
 use crate::challenge;
@@ -131,10 +131,18 @@ pub struct OAuthValidator {
     /// The route the metadata document must be served on (the path of
     /// `resource_metadata_url`).
     metadata_path: String,
-    /// `scopes_supported`, space-joined, for the 401 challenge's `scope` parameter.
-    supported_scopes: String,
     /// `required_scopes`, space-joined, for the 403 challenge and the log line.
     required_scopes: String,
+    /// The two `WWW-Authenticate` values, rendered once. Always valid header
+    /// values: when the configured ones would not be (a control or non-ASCII
+    /// character in a hand-edited `resource` or scope), `build` logs at
+    /// `error` and stores `challenge::fallback`s instead.
+    invalid_token_challenge: String,
+    insufficient_scope_challenge: String,
+    /// Whether `build` fell back. The layers refuse to build with such a
+    /// validator (`AuthLayerError::InvalidChallenge`), as they always have.
+    #[cfg_attr(not(any(feature = "tower", test)), allow(dead_code))] // read by the layers only
+    challenge_fallback: bool,
     /// The RFC 9728 document, rendered once.
     metadata: Value,
     /// Allowlisted algorithms in the JWT library's form, for the header check.
@@ -296,6 +304,32 @@ impl OAuthValidator {
         } else {
             config.scopes_supported.join(" ")
         };
+        // Every challenge this validator (and so `refusal()`) hands out must be
+        // a valid header value. `resolve` refuses every config that would break
+        // one; a hand-edited resolved config still builds (refusing it here
+        // would narrow what builds), but gets a safe fallback and a loud log
+        // line, and the layers refuse it (`challenge_fallback`).
+        let mut invalid_token_challenge =
+            challenge::invalid_token(&resource_metadata_url, &supported_scopes);
+        let mut insufficient_scope_challenge =
+            challenge::insufficient_scope(&required_scopes, &resource_metadata_url);
+        let challenge_fallback = !challenge::is_header_value(&invalid_token_challenge)
+            || !challenge::is_header_value(&insufficient_scope_challenge);
+        if challenge_fallback {
+            invalid_token_challenge = challenge::fallback("invalid_token", &supported_scopes);
+            insufficient_scope_challenge =
+                challenge::fallback("insufficient_scope", &required_scopes);
+            error!(
+                resource = %redact_url(&config.resource),
+                "the WWW-Authenticate challenge built from {}, {} and {} is not a valid HTTP \
+                 header value (a control or non-ASCII character); sending a fallback \
+                 challenge without resource_metadata, which clients need to find the \
+                 authorization server. Fix the configuration (resolve refuses it).",
+                naming.key("resource"),
+                naming.key("scopes_supported"),
+                naming.key("required_scopes"),
+            );
+        }
 
         // A required scope nobody is told to ask for is a guaranteed 403 for every
         // client that requests exactly `scopes_supported`. Not fatal — an operator
@@ -389,8 +423,10 @@ impl OAuthValidator {
             config: config.clone(),
             resource_metadata_url,
             metadata_path,
-            supported_scopes,
             required_scopes,
+            invalid_token_challenge,
+            insufficient_scope_challenge,
+            challenge_fallback,
             metadata,
             jwt_algorithms: config.algorithms.iter().map(|a| a.to_jwt()).collect(),
             validation,
@@ -453,8 +489,13 @@ impl OAuthValidator {
     /// easy to drop and hard to notice. Emit it on EVERY 401 once OAuth is
     /// configured — including a failed static-token request, since the server
     /// cannot tell which credential the caller meant to present.
+    ///
+    /// Always a valid header value: with a hand-edited config that would break
+    /// it (a control or non-ASCII character in `resource` or a scope), this is
+    /// the fallback `Bearer error="invalid_token"` (plus `scope` when that is
+    /// valid), logged at `error` when the validator is built.
     pub fn invalid_token_challenge(&self) -> String {
-        challenge::invalid_token(&self.resource_metadata_url, &self.supported_scopes)
+        self.invalid_token_challenge.clone()
     }
 
     /// The `WWW-Authenticate` value for a 403:
@@ -466,8 +507,18 @@ impl OAuthValidator {
     /// re-authorize for the right thing instead of replaying the same request.
     /// With no required scope (no token is ever refused for scope) the `scope`
     /// parameter is omitted.
+    ///
+    /// Always a valid header value, falling back as
+    /// [`OAuthValidator::invalid_token_challenge`] does.
     pub fn insufficient_scope_challenge(&self) -> String {
-        challenge::insufficient_scope(&self.required_scopes, &self.resource_metadata_url)
+        self.insufficient_scope_challenge.clone()
+    }
+
+    /// Whether the configured challenges were not valid header values and the
+    /// fallbacks are in use; the layers refuse to build with such a validator.
+    #[cfg_attr(not(any(feature = "tower", test)), allow(dead_code))] // read by the layers only
+    pub(crate) fn challenge_fell_back(&self) -> bool {
+        self.challenge_fallback
     }
 
     /// Validate a bearer credential as a JWT access token.

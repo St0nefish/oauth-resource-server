@@ -88,6 +88,50 @@ Before 1.0, a breaking change increments the minor version.
   (`Discovery`, `Fetch`, `Parse`, `NoUsableKeys`, with `as_str()` labels): the
   stage a key refresh failed at, safe to show where the full error message
   (which names URLs and repeats upstream error text) is not.
+- `refusal()` and `refusal_with_static_challenge()`, with the `Refusal`
+  result (`status: u16`, `www_authenticate: Option<String>`,
+  `#[non_exhaustive]`): the framework-free mapping from a `TokenRejection` to
+  its status (401, or 403 for insufficient scope) and `WWW-Authenticate`
+  challenge (the validator's with OAuth; otherwise `DEFAULT_STATIC_CHALLENGE`,
+  another of the caller's choosing, or none). The axum layer now makes its
+  refusal decision through the same private function, so a non-axum
+  integration built on `authenticate()` + `refusal()` sends exactly what the
+  layer sends; the axum layer's responses are unchanged.
+  `DEFAULT_STATIC_CHALLENGE` is now also exported at the crate root
+  (`axum::DEFAULT_STATIC_CHALLENGE` is the same constant). The challenge
+  returned is always a valid header value: a caller's static challenge with
+  any byte outside visible ASCII, SP and HTAB (a CR or LF, say) is replaced by
+  `DEFAULT_STATIC_CHALLENGE`.
+- A `tower` feature with `http_layer::HttpAuthLayer` (built with
+  `HttpAuthLayerBuilder`, wrapping into `HttpAuthService`): the axum layer's
+  check for any `tower` service over `http::Request<ReqBody>` /
+  `http::Response<ResBody>`, whatever the body types (hyper, tonic, ...). Same
+  builder settings, fail-closed build, sensitive credential headers,
+  `WWW-Authenticate` on every 401/403, log levels (target
+  `oauth_resource_server::http_layer`) and `Credential`/`AuthorizedToken` request
+  extensions. A refusal's body is `ResBody::default()` unless an `on_reject`
+  closure builds the response; the layer then sets its status and challenge.
+  (`RefusalResponse`, the bound both satisfy, is sealed: it can be named, not
+  implemented.) The module is `http_layer`, not `tower`, so a downstream
+  `use oauth_resource_server::*;` next to the `tower` crate stays unambiguous. Both layers share one
+  implementation of the credential check. The `axum` feature now implies
+  `tower`, and `CredentialSource`, `RejectContext` and `AuthLayerError` are
+  defined in the `http_layer` module and re-exported, unchanged, from `axum`.
+- `examples/hyper.rs`: a plain hyper 1.x server built on `authenticate()` and
+  `refusal()`. The README's new "Using with other frameworks" section covers
+  the tower layer, any other stack, and an actix-web middleware sketch.
+  Closes #14.
+- `OAuthValidator::invalid_token_challenge()` and
+  `insufficient_scope_challenge()` (and so `refusal()`) always return a
+  valid header value. A hand-edited `ResolvedOAuthConfig` whose challenge
+  would not be one (a CR, LF or other control or non-ASCII character in
+  `resource` or a scope; `resolve` refuses every such config) still builds a
+  validator, as before, but it logs that once at `error` (the setting named,
+  the URL redacted) and uses a fallback: `Bearer error="invalid_token"` /
+  `Bearer error="insufficient_scope"`, with `scope` only when that is valid.
+  Before, those strings could split a header in a hand-built integration.
+  Both layers still refuse to build with such a validator
+  (`AuthLayerError::InvalidChallenge`), exactly as the axum layer did.
 
 ### Security
 
