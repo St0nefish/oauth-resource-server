@@ -74,7 +74,7 @@ pub(crate) const MAX_FETCH_BYTES: usize = 256 * 1024;
 
 /// Cap on keys taken from one JWK Set, for the same reason as [`MAX_FETCH_BYTES`]:
 /// every key is parsed and scanned on lookup, and no real AS publishes dozens.
-const MAX_JWKS_KEYS: usize = 64;
+pub(crate) const MAX_JWKS_KEYS: usize = 64;
 
 /// A failed key refresh: discovery, fetch, or a key set with nothing usable in
 /// it. The keys held before the attempt are kept.
@@ -189,10 +189,10 @@ pub(crate) fn http_client(
 /// own `alg` parameter declares (when present) and the configured allowlist. A
 /// token's `alg` must be in it, which is what stops an attacker-chosen header from
 /// steering an RSA key into an ECDSA verification, or any key into HMAC.
-struct CachedKey {
+pub(crate) struct CachedKey {
     kid: Option<String>,
     key: DecodingKey,
-    algorithms: Vec<Algorithm>,
+    pub(crate) algorithms: Vec<Algorithm>,
     /// The JWK declared no `alg` and more than one allowlisted algorithm fits
     /// its type — the RFC 8725 §3.1 deviation warned about when the key first
     /// appears.
@@ -493,18 +493,7 @@ impl JwksStore {
 
         let mut keys = Vec::new();
         for entry in entries.iter().take(MAX_JWKS_KEYS) {
-            // Parsed one key at a time: `jsonwebtoken::jwk::JwkSet` refuses the
-            // WHOLE set if any single key has a kty/crv/alg it does not model (an
-            // X25519 encryption key, say), and one exotic key must not take the
-            // usable ones down with it.
-            let jwk: Jwk = match serde_json::from_value(entry.clone()) {
-                Ok(jwk) => jwk,
-                Err(e) => {
-                    debug!(error = %e, "Skipping a JWKS entry this server cannot parse");
-                    continue;
-                }
-            };
-            if let Some(key) = cached_key(&jwk, &self.algorithms) {
+            if let Some(key) = parse_jwks_entry(entry, &self.algorithms) {
                 keys.push(key);
             }
         }
@@ -549,6 +538,25 @@ impl JwksStore {
         }
         serde_json::from_slice(&body).map_err(|e| context("response was not JSON", &e))
     }
+}
+
+/// Build a [`CachedKey`] from one raw JWK Set entry, or `None` when the entry
+/// is unparseable or the key must not be used (see [`cached_key`]).
+///
+/// Parsed one key at a time: `jsonwebtoken::jwk::JwkSet` refuses the WHOLE set
+/// if any single key has a kty/crv/alg it does not model (an X25519 encryption
+/// key, say), and one exotic key must not take the usable ones down with it.
+/// Pure — no I/O, never panics on hostile input — which is what lets the fuzz
+/// targets drive it directly.
+pub(crate) fn parse_jwks_entry(entry: &Value, allowed: &[Algorithm]) -> Option<CachedKey> {
+    let jwk: Jwk = match serde_json::from_value(entry.clone()) {
+        Ok(jwk) => jwk,
+        Err(e) => {
+            debug!(error = %e, "Skipping a JWKS entry this server cannot parse");
+            return None;
+        }
+    };
+    cached_key(&jwk, allowed)
 }
 
 /// Build a [`CachedKey`] from one JWK, or `None` when the key must not be used.
@@ -627,7 +635,7 @@ fn lookup(keys: &[CachedKey], kid: Option<&str>, alg: Algorithm) -> Option<Decod
 /// tested against publishes, including per-application issuers like Authentik's
 /// and Kanidm's), then RFC 8414 §3.1's form (the well-known segment inserted
 /// between host and path).
-fn discovery_urls(issuer: &str) -> Vec<String> {
+pub(crate) fn discovery_urls(issuer: &str) -> Vec<String> {
     let trimmed = issuer.trim_end_matches('/');
     let mut urls = vec![format!("{trimmed}/.well-known/openid-configuration")];
     if let Some((scheme, rest)) = trimmed.split_once("://") {
@@ -879,6 +887,82 @@ mod tests {
         }
         // Absent, as nearly every authorization server publishes it: usable.
         assert!(cached_key(&rsa_jwk(serde_json::json!({})), &all).is_some());
+    }
+
+    fn all_algorithms() -> Vec<Algorithm> {
+        crate::DEFAULT_ALGORITHMS
+            .iter()
+            .map(|a| crate::parse_algorithm(a).unwrap())
+            .collect()
+    }
+
+    fn rsa_entry(extra: Value) -> Value {
+        let mut entry = serde_json::json!({
+            "kty": "RSA", "kid": "k", "n": crate::testing::N_A, "e": "AQAB",
+        });
+        for (k, v) in extra.as_object().unwrap() {
+            entry[k] = v.clone();
+        }
+        entry
+    }
+
+    #[test]
+    fn a_plain_signature_entry_is_parsed_into_a_key() {
+        let all = all_algorithms();
+        let key = parse_jwks_entry(&rsa_entry(serde_json::json!({})), &all).unwrap();
+        assert_eq!(key.kid.as_deref(), Some("k"));
+        let key = parse_jwks_entry(&rsa_entry(serde_json::json!({"use": "sig"})), &all).unwrap();
+        assert_eq!(key.kid.as_deref(), Some("k"));
+    }
+
+    #[test]
+    fn an_encryption_use_entry_is_skipped() {
+        let all = all_algorithms();
+        for usage in ["enc", "something-else"] {
+            assert!(
+                parse_jwks_entry(&rsa_entry(serde_json::json!({ "use": usage })), &all).is_none(),
+                "use {usage} must not verify"
+            );
+        }
+    }
+
+    #[test]
+    fn a_key_ops_entry_without_verify_is_skipped_at_entry_level_too() {
+        let all = all_algorithms();
+        let entry = rsa_entry(serde_json::json!({ "key_ops": ["encrypt"] }));
+        assert!(parse_jwks_entry(&entry, &all).is_none());
+    }
+
+    #[test]
+    fn an_hmac_entry_is_skipped() {
+        let all = all_algorithms();
+        let entry = serde_json::json!({"kty": "oct", "kid": "hmac", "k": "c2VjcmV0"});
+        assert!(parse_jwks_entry(&entry, &all).is_none());
+    }
+
+    #[test]
+    fn an_unparseable_entry_is_skipped_not_fatal() {
+        let all = all_algorithms();
+        for entry in [
+            serde_json::json!({"kty": "OKP", "crv": "X25519", "kid": "x", "x": "AA"}),
+            serde_json::json!({"kty": "no-such-type"}),
+            serde_json::json!({"kid": "no kty at all"}),
+            serde_json::json!("not an object"),
+            serde_json::json!(null),
+            serde_json::json!(42),
+            serde_json::json!([]),
+        ] {
+            assert!(parse_jwks_entry(&entry, &all).is_none(), "{entry}");
+        }
+        // ...and the entry after one such skip is still usable.
+        assert!(parse_jwks_entry(&rsa_entry(serde_json::json!({})), &all).is_some());
+    }
+
+    #[test]
+    fn an_entry_outside_the_allowlist_is_skipped() {
+        let entry = rsa_entry(serde_json::json!({}));
+        assert!(parse_jwks_entry(&entry, &[Algorithm::ES256]).is_none());
+        assert!(parse_jwks_entry(&entry, &[]).is_none());
     }
 
     #[test]

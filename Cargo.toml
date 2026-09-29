@@ -20,6 +20,11 @@ categories = ["authentication", "web-programming::http-server"]
 # has no use for.
 include = ["src/**/*", "examples/**/*", "docs/**/*", "README.md", "LICENSE", "CHANGELOG.md"]
 
+# `fuzzing` is set by cargo-fuzz (see `fuzz/` and `src/lib.rs`'s `__fuzz` module),
+# not by a feature, so rustc must be told it is an expected cfg.
+[lints.rust]
+unexpected_cfgs = { level = "warn", check-cfg = ['cfg(fuzzing)'] }
+
 [package.metadata.docs.rs]
 all-features = true
 rustdoc-args = ["--cfg", "docsrs"]
@@ -46,6 +51,22 @@ axum = ["dep:axum", "dep:http", "dep:tower-layer", "dep:tower-service"]
 # CONSUMERS' TESTS. Never enable this in a production build.
 testing = ["tokio/net", "tokio/io-util", "dep:serde"]
 
+# Lower bounds are checked by CI's `minimal-versions` job (`cargo update -Z
+# direct-minimal-versions`, then a build with dev-dependencies removed). A
+# requirement tighter than a bare major is there for one of two reasons:
+#   - `jsonwebtoken` 9.2 and `tokio` 1.15 are where this crate builds: the
+#     next-older releases checked (jsonwebtoken 9.1, tokio 1.10) fail to
+#     compile. Neither is an exhaustive search for the oldest working release.
+#   - `subtle` 2.5, `tower-layer` and `tower-service` 0.3.3, `tracing` 0.1.29,
+#     `serde_json` 1.0.64 (a release with the `raw_value` feature `axum`
+#     needs) and `serde` 1.0.152 are not claims about this crate's own code:
+#     they are what the resolver needs so `direct-minimal-versions` can
+#     resolve against the requirements of `reqwest`, `axum` and
+#     `jsonwebtoken` at their own minimums (`serde` 1.0.100, the lowest that
+#     resolves, fails to compile `jsonwebtoken` 9.2; 1.0.152 is the one
+#     checked above it).
+# A floor is a compile-time claim only: the test suite runs against the latest
+# releases.
 [dependencies]
 # JWT verification: multi-algorithm signature checking (RSA PKCS#1 v1.5, RSA-PSS,
 # ECDSA P-256/P-384 and EdDSA, each key narrowed to the algorithms its own type
@@ -59,7 +80,7 @@ testing = ["tokio/net", "tokio/io-util", "dep:serde"]
 # uses `ring`, which a rustls-based HTTP stack already compiles, so this adds no new
 # crypto implementation there. Revisit when jsonwebtoken offers a backend that is
 # neither unpatched nor a new build-tooling requirement.
-jsonwebtoken = "9"
+jsonwebtoken = "9.2"
 # JWKS and discovery fetches. The TLS backend is chosen by this crate's features;
 # bodies are read under a size cap and parsed with serde_json, so no reqwest
 # feature beyond TLS is needed.
@@ -68,21 +89,21 @@ reqwest = { version = "0.12", default-features = false }
 # `Header` type drops (`crit`). The major version jsonwebtoken 9 already
 # compiles, so it adds no crate to the build.
 base64 = "0.23"
-serde_json = "1"
-tokio = { version = "1", features = ["sync", "time", "rt"] }
-tracing = "0.1"
-subtle = "2"
+serde_json = "1.0.64"
+tokio = { version = "1.15", features = ["sync", "time", "rt"] }
+tracing = "0.1.29"
+subtle = "2.5"
 thiserror = "2"
 
 # Enabled by the `serde` feature (config derives) and by `testing` (its minting
 # helpers take any `Serialize` claims).
-serde = { version = "1", features = ["derive"], optional = true }
+serde = { version = "1.0.152", features = ["derive"], optional = true }
 
 axum = { version = "0.8", optional = true, default-features = false, features = ["json"] }
 http = { version = "1", optional = true }
 # `AuthLayer` implements `tower::Layer`; the same small trait crates axum builds on.
-tower-layer = { version = "0.3", optional = true }
-tower-service = { version = "0.3", optional = true }
+tower-layer = { version = "0.3.3", optional = true }
+tower-service = { version = "0.3.3", optional = true }
 
 [dev-dependencies]
 tokio = { version = "1", features = ["macros", "rt", "rt-multi-thread", "net", "io-util", "time", "sync"] }

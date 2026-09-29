@@ -8,6 +8,36 @@ Before 1.0, a breaking change increments the minor version.
 
 ## [Unreleased]
 
+No public API or behavior changes.
+
+### Changed
+
+- Minimum versions of direct dependencies raised, checked with `cargo
+  update -Z direct-minimal-versions`: `jsonwebtoken` 9 -> 9.2 and `tokio`
+  1 -> 1.15 (the next-older releases tried do not compile), plus `tracing`
+  0.1 -> 0.1.29, `serde` 1 -> 1.0.152, `serde_json` 1 -> 1.0.64, `subtle`
+  2 -> 2.5, `tower-layer` and `tower-service` 0.3 -> 0.3.3, which are what the
+  resolver needs to resolve against `reqwest`'s and `axum`'s own minimums. A
+  build that already resolves to current releases is unaffected; only a lock
+  file pinning an older release of one of these needs updating. These are
+  compile-time floors, not exhaustive searches for the oldest working release
+  and not a claim that the test suite was run against them.
+- Internal: the per-entry JWK parse in the JWKS fetch path is now its own pure
+  function (`parse_jwks_entry`), behavior-identical, so it can be tested and
+  fuzzed on its own.
+
+### CI and tooling (maintainer-facing)
+
+- CI now also runs
+  `cargo semver-checks` against the latest crates.io release,
+  `cargo hack --feature-powerset`, a minimal-versions build and
+  `cargo deny check` (new `deny.toml`: licence allowlist, crates.io-only
+  sources, duplicate-version warnings, advisories); `release.yml` repeats the
+  `cargo deny` and semver checks on the tagged commit. A new `fuzz/` crate
+  fuzzes the crate's own parsers, run nightly by `fuzz.yml` (never on pull
+  requests); its entry points exist only under `--cfg fuzzing` and are not
+  part of the public API or the published package.
+
 ## [0.1.2] - 2026-09-28
 
 No library changes: the code, public API and behavior are identical to

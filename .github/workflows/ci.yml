@@ -8,7 +8,8 @@ name: CI
 # *skip*, not fail, `ci-pass` when an upstream job fails, and a skipped
 # required check is treated as passing — see `ci-pass`'s own comment).
 #
-# The heavy jobs (`checks`, `msrv`) run on the project's self-hosted runner,
+# The heavy jobs (`checks`, `msrv`, `semver`, `feature-powerset`,
+# `minimal-versions`) run on the project's self-hosted runner,
 # an ephemeral container: every job starts from a clean image, so nothing
 # carries over between runs except what `actions/cache` restores. A pull
 # request from a fork only runs after a maintainer approves the run. That
@@ -30,10 +31,30 @@ name: CI
 # hides a `cfg` that only appears when `rustls-tls` is off, since the TLS
 # backends are additive, not mutually exclusive), tests, a `-D warnings` doc build (every public item
 # needs a doc comment — see `#![warn(missing_docs)]` in `src/lib.rs`),
-# `cargo audit`, and the packaging checks (`cargo package --list` and
+# `cargo audit`, `cargo deny check` (advisories, licenses, bans and sources, per
+# `deny.toml`), and the packaging checks (`cargo package --list` and
 # `cargo publish --dry-run`) that catch a metadata mistake before a release
 # ever reaches `release.yml`. `release.yml`'s `verify` and `msrv` jobs
-# repeat these steps before a publish; keep the two lists in step.
+# repeat these steps before a publish, and its `semver` job repeats `semver`
+# below; keep the lists in step. (`feature-powerset` and `minimal-versions` are not
+# repeated there: they ran on master's post-merge CI, and are not re-verified
+# at release.)
+#
+# Three more jobs are separate from `checks` because each wants its own
+# toolchain or its own fresh dependency resolution, and running them alongside
+# keeps the wall-clock time at the slowest one:
+#   `semver`            cargo-semver-checks against the latest release on
+#                       crates.io, so an accidental breaking change fails CI.
+#                       Runs on rust 1.93 with cargo-semver-checks 0.50.0, both
+#                       pinned and moved together (see the job), not the
+#                       toolchain in rust-toolchain.toml.
+#   `feature-powerset`  cargo-hack builds every feature combination that can
+#                       compile (one TLS backend each, see the step).
+#   `minimal-versions`  builds against the oldest release every dependency
+#                       requirement allows, so a lower bound in Cargo.toml that
+#                       is too low fails CI. It rewrites Cargo.lock, which is
+#                       why it is not a step of `checks`.
+# Nightly fuzzing is not a PR job at all: see `fuzz.yml`.
 #
 # `msrv` is a separate job on a separate, explicitly-installed toolchain
 # (read from `Cargo.toml`'s `rust-version`, not from `rust-toolchain.toml` —
@@ -169,6 +190,16 @@ jobs:
         # Reads .cargo/audit.toml automatically.
         run: cargo audit
 
+      - name: Install cargo-deny
+        uses: taiki-e/install-action@4cef1412cce204788f482e778a0b9187f9626a29 # v2.87.21
+        with:
+          tool: cargo-deny
+
+      - name: Check licenses, bans, sources and advisories
+        # Reads deny.toml automatically. Duplicate crate versions are a
+        # warning there, not a failure; everything else is.
+        run: cargo deny check
+
       - name: cargo package --list
         # Confirms the `include` list in Cargo.toml actually resolves to the
         # files the package is meant to ship, without building a tarball.
@@ -232,27 +263,212 @@ jobs:
           MSRV: ${{ steps.msrv.outputs.version }}
         run: cargo "+${MSRV}" build --all-features --locked
 
+  semver:
+    runs-on: [self-hosted, linux, x64]
+    timeout-minutes: 30
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Install system dependencies
+        # `--all-features` below includes `native-tls` (OpenSSL).
+        run: |
+          sudo apt-get update && sudo apt-get install -y --no-install-recommends \
+            pkg-config libssl-dev
+
+      - name: Install Rust 1.93 toolchain (for cargo-semver-checks)
+        # Not rust-toolchain.toml's pin: cargo-semver-checks refuses a rustc
+        # older than the rustdoc JSON format it reads, and reads the
+        # baseline's docs with the same compiler. This toolchain and the
+        # install-action `tool:` version below move together: 0.50.0 needs
+        # 1.93 or newer. Raise both in one change; a floating `stable` would
+        # break every PR (and any release) when a new rustc changes the format.
+        uses: dtolnay/rust-toolchain@02cb101ec7c40f2c49e1d9714d64511d8e1b74de # master, 2026-09-12
+        with:
+          toolchain: "1.93"
+
+      - name: Cache cargo registry and build artifacts
+        uses: actions/cache@caa296126883cff596d87d8935842f9db880ef25 # v5.1.0
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: cargo-semver-${{ hashFiles('Cargo.lock') }}
+          restore-keys: cargo-semver-
+
+      - name: Install cargo-semver-checks
+        uses: taiki-e/install-action@4cef1412cce204788f482e778a0b9187f9626a29 # v2.87.21
+        with:
+          tool: cargo-semver-checks@0.50.0
+
+      - name: Check for breaking changes against the latest crates.io release
+        # The baseline is the newest version published on crates.io. While
+        # `Cargo.toml`'s version equals it, any breaking change fails; a
+        # deliberate one (a `0.x` minor bump under this crate's policy) must
+        # carry the version bump that announces it.
+        run: cargo +1.93 semver-checks check-release --all-features
+
+  feature-powerset:
+    runs-on: [self-hosted, linux, x64]
+    timeout-minutes: 30
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Install system dependencies
+        # The `native-tls` feature builds against OpenSSL.
+        run: |
+          sudo apt-get update && sudo apt-get install -y --no-install-recommends \
+            pkg-config libssl-dev
+
+      - name: Read pinned Rust toolchain version
+        id: rust_version
+        run: |
+          version=$(grep -m1 '^channel' rust-toolchain.toml | sed -E 's/channel *= *"([^"]+)"/\1/')
+          if [[ -z "$version" ]]; then
+            echo "::error::could not parse channel from rust-toolchain.toml"
+            exit 1
+          fi
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@02cb101ec7c40f2c49e1d9714d64511d8e1b74de # master, 2026-09-12
+        with:
+          toolchain: ${{ steps.rust_version.outputs.version }}
+
+      - name: Cache cargo registry and build artifacts
+        uses: actions/cache@caa296126883cff596d87d8935842f9db880ef25 # v5.1.0
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: cargo-powerset-${{ steps.rust_version.outputs.version }}-${{ hashFiles('Cargo.lock') }}
+          restore-keys: cargo-powerset-${{ steps.rust_version.outputs.version }}-
+
+      - name: Install cargo-hack
+        uses: taiki-e/install-action@4cef1412cce204788f482e778a0b9187f9626a29 # v2.87.21
+        with:
+          tool: cargo-hack
+
+      - name: Check every feature combination
+        # Every build needs a TLS backend (`compile_error!` otherwise), hence
+        # --at-least-one-of. The three backends are additive and only choose
+        # which reqwest feature is on, so they are made mutually exclusive
+        # here: each is combined with every subset of serde/env/axum/testing
+        # (64 builds), and the all-features combination, which is where the
+        # backends meet, is built by the clippy, test and doc steps in
+        # `checks`. Without the exclusion cargo-hack builds all 176
+        # combinations for no extra coverage. --no-dev-deps keeps
+        # dev-dependencies (which switch on axum, tokio and serde features)
+        # from hiding a feature the library needs and does not enable itself.
+        run: |
+          cargo hack check --feature-powerset --no-dev-deps \
+            --mutually-exclusive-features rustls-tls,native-tls,rustls-tls-native-roots \
+            --at-least-one-of rustls-tls,native-tls,rustls-tls-native-roots
+
+  minimal-versions:
+    runs-on: [self-hosted, linux, x64]
+    timeout-minutes: 30
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Install system dependencies
+        # `--all-features` below includes `native-tls` (OpenSSL).
+        run: |
+          sudo apt-get update && sudo apt-get install -y --no-install-recommends \
+            pkg-config libssl-dev
+
+      - name: Read pinned Rust toolchain version
+        id: rust_version
+        run: |
+          version=$(grep -m1 '^channel' rust-toolchain.toml | sed -E 's/channel *= *"([^"]+)"/\1/')
+          if [[ -z "$version" ]]; then
+            echo "::error::could not parse channel from rust-toolchain.toml"
+            exit 1
+          fi
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@02cb101ec7c40f2c49e1d9714d64511d8e1b74de # master, 2026-09-12
+        with:
+          toolchain: ${{ steps.rust_version.outputs.version }}
+
+      - name: Install nightly toolchain
+        # Only for `cargo update -Z direct-minimal-versions`, which is
+        # nightly-only. The build below uses the pinned toolchain.
+        uses: dtolnay/rust-toolchain@02cb101ec7c40f2c49e1d9714d64511d8e1b74de # master, 2026-09-12
+        with:
+          toolchain: nightly
+
+      - name: Cache cargo registry and build artifacts
+        uses: actions/cache@caa296126883cff596d87d8935842f9db880ef25 # v5.1.0
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: cargo-minver-${{ steps.rust_version.outputs.version }}-${{ hashFiles('Cargo.toml') }}
+          restore-keys: cargo-minver-${{ steps.rust_version.outputs.version }}-
+
+      - name: Install cargo-hack
+        uses: taiki-e/install-action@4cef1412cce204788f482e778a0b9187f9626a29 # v2.87.21
+        with:
+          tool: cargo-hack
+
+      - name: Remove dev-dependencies
+        # A consumer never resolves them, and their own floors (tower-http's,
+        # for one) would otherwise force this crate's bounds up for no reason.
+        # Rewrites Cargo.toml in this throwaway checkout only.
+        run: cargo hack --remove-dev-deps
+
+      - name: Resolve every direct dependency to its lowest allowed version
+        # Rewrites Cargo.lock; nothing after this job's build uses it.
+        run: cargo +nightly update -Z direct-minimal-versions
+
+      - name: Lift `time` off its ancient floor
+        # `simple_asn1` (via jsonwebtoken) allows `time` 0.3.x from 0.3.0, and
+        # `time` before 0.3.35 no longer compiles on current rustc. That is a
+        # transitive floor this crate cannot raise, so it is put back to the
+        # newest release; every direct dependency stays at its lowest.
+        run: cargo update -p time
+
+      - name: Build against the lowest versions
+        run: cargo build --all-features
+
   ci-pass:
-    needs: [checks, msrv]
+    needs: [checks, msrv, semver, feature-powerset, minimal-versions]
     if: always()
     runs-on: ubuntu-latest
     timeout-minutes: 5
     steps:
       # `needs:` alone would make GitHub SKIP this job (not fail it) when
-      # `checks` or `msrv` fails, and rulesets treat a skipped required check
+      # any upstream job fails, and rulesets treat a skipped required check
       # as passing — the ruleset's only required check is this job, so that
       # would silently defeat it. `if: always()` above forces this job to run
       # regardless of upstream outcome, and the explicit result check below
-      # is what actually fails it. Neither upstream job is ever legitimately
+      # is what actually fails it. No upstream job is ever legitimately
       # skipped, so anything but `success` (failure, cancelled, skipped)
       # fails the gate.
       - name: Require every upstream job to have succeeded
         env:
           CHECKS: ${{ needs.checks.result }}
           MSRV: ${{ needs.msrv.result }}
+          SEMVER: ${{ needs.semver.result }}
+          POWERSET: ${{ needs.feature-powerset.result }}
+          MINVERS: ${{ needs.minimal-versions.result }}
         run: |
-          if [[ "$CHECKS" != "success" || "$MSRV" != "success" ]]; then
-            echo "::error::one or more required jobs did not succeed (checks=${CHECKS}, msrv=${MSRV})"
+          if [[ "$CHECKS" != "success" || "$MSRV" != "success" || "$SEMVER" != "success" \
+                || "$POWERSET" != "success" || "$MINVERS" != "success" ]]; then
+            echo "::error::one or more required jobs did not succeed (checks=${CHECKS}, msrv=${MSRV}, semver=${SEMVER}, feature-powerset=${POWERSET}, minimal-versions=${MINVERS})"
             exit 1
           fi
           echo "all required checks passed"

@@ -71,3 +71,34 @@ the ones a report is most likely to concern:
   clearly-named constructor.
 
 See `CLAUDE.md` for the full list and the module each one lives in.
+
+## Assurance beyond the test suite
+
+CI checks more than the invariants above, so a regression in them is caught
+before a release rather than reported after it:
+
+- **API compatibility.** `cargo semver-checks` compares every pull request,
+  and every release commit, with the latest release on crates.io, so an
+  accidental breaking change to this crate's own API surface fails CI instead
+  of reaching a consumer on a compatible-version range. It cannot see a major
+  bump of `axum` or `http`, whose types appear in the public API; that stays a
+  manual policy check (see `CLAUDE.md`).
+- **Feature combinations and dependency floors.** `cargo hack` builds every
+  feature combination that can compile, and a build against the oldest
+  release each dependency requirement allows keeps the lower bounds in
+  `Cargo.toml` honest.
+- **Supply chain.** `cargo audit` and `cargo deny check` (`deny.toml`) fail on
+  a known advisory or a yanked crate, on a dependency licence outside an
+  explicit allowlist, and on any dependency source other than crates.io. Both
+  ignore lists are empty.
+- **Fuzzing.** `cargo-fuzz` targets in `fuzz/` run nightly against the crate's
+  own parsers: the `Bearer` header parser, the validator's pre-fetch header
+  checks (`check_header`, `check_crit`, `check_typ`), scope and principal
+  extraction, the RFC 9728 metadata URL and path builders, the discovery-URL
+  builder, and the per-entry JWK parse. They assert invariants as well as
+  looking for panics: for example, a token whose header carries `crit` is
+  never accepted, and no parsed key ends up with an empty or out-of-allowlist
+  algorithm set. They run nightly rather than on every pull request.
+
+Fuzzing exercises the parsers, not the full validation path; it complements
+the test suite rather than replacing it.

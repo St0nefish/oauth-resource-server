@@ -1,0 +1,66 @@
+# cargo-fuzz targets for oauth-resource-server's own parsers. Not part of the
+# published package (the root Cargo.toml's `include` list names what ships) and
+# not a member of any workspace: the empty `[workspace]` table keeps cargo from
+# treating it as one, so the root crate builds and publishes without it.
+#
+# Run from the repository root with a nightly toolchain, e.g.
+#   cargo +nightly fuzz run check_header -- -max_total_time=60
+# cargo-fuzz sets `--cfg fuzzing`, which is what compiles the library's
+# `__fuzz` module (src/__fuzz.rs) these targets call.
+[package]
+name = "oauth-resource-server-fuzz"
+version = "0.0.0"
+edition = "2021"
+publish = false
+
+[package.metadata]
+cargo-fuzz = true
+
+[dependencies]
+arbitrary = { version = "1", features = ["derive"] }
+libfuzzer-sys = "0.4"
+oauth-resource-server = { path = "..", features = ["axum", "testing"] }
+
+[workspace]
+
+[[bin]]
+name = "bearer_credential"
+path = "fuzz_targets/bearer_credential.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "check_header"
+path = "fuzz_targets/check_header.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "extract_claims"
+path = "fuzz_targets/extract_claims.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "metadata_urls"
+path = "fuzz_targets/metadata_urls.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "discovery_urls"
+path = "fuzz_targets/discovery_urls.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "jwks_entries"
+path = "fuzz_targets/jwks_entries.rs"
+test = false
+doc = false
+bench = false

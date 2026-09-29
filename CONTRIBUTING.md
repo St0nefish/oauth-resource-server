@@ -21,6 +21,7 @@ cargo test
 cargo build --examples --all-features
 RUSTDOCFLAGS="-D warnings" cargo doc --no-deps --all-features
 cargo audit
+cargo deny check
 cargo package --list
 cargo publish --dry-run
 ```
@@ -28,13 +29,57 @@ cargo publish --dry-run
 `cargo publish --dry-run` refuses a working tree with uncommitted changes;
 pass `--allow-dirty` when running it locally mid-change (`ci.yml` runs it
 against a clean checkout, so it never needs the flag there). `cargo audit`
-needs `cargo-audit` installed (`cargo install cargo-audit` or
-`cargo binstall cargo-audit`).
+and `cargo deny check` need `cargo-audit` and `cargo-deny` installed
+(`cargo install --locked cargo-audit cargo-deny`, or `cargo binstall`).
+`cargo deny check` reads `deny.toml`: a dependency with a licence that is
+not on its allowlist, a git or non-crates.io source, or a yanked or
+vulnerable crate fails it; two versions of one crate is only a warning.
 
-This list isn't quite everything CI runs: the `msrv` job also builds with
-the pinned MSRV toolchain (`cargo "+1.89" build --all-features --locked`,
-reading `rust-version` from `Cargo.toml`), which most contributors won't
-have installed locally and CI will catch regardless.
+This list isn't quite everything CI runs. Four more jobs run alongside it,
+and CI will catch them regardless if you skip them locally:
+
+```sh
+# msrv: the pinned MSRV toolchain, reading rust-version from Cargo.toml
+cargo "+1.89" build --all-features --locked
+
+# semver: fails on an accidental breaking change (needs cargo-semver-checks
+# 0.50.0 and rustc 1.93+ -- CI pins both and they move together; compares
+# with the latest release on crates.io)
+cargo +1.93 semver-checks check-release --all-features
+
+# feature-powerset: every feature combination builds (needs cargo-hack)
+cargo hack check --feature-powerset --no-dev-deps \
+  --mutually-exclusive-features rustls-tls,native-tls,rustls-tls-native-roots \
+  --at-least-one-of rustls-tls,native-tls,rustls-tls-native-roots
+
+# minimal-versions: every dependency lower bound in Cargo.toml really builds.
+# It rewrites Cargo.toml and Cargo.lock, so run it in a throwaway copy of the
+# tree (needs cargo-hack and a nightly toolchain)
+cargo hack --remove-dev-deps
+cargo +nightly update -Z direct-minimal-versions
+cargo update -p time
+cargo build --all-features
+```
+
+`semver` compares against the newest release on crates.io, so a PR that
+deliberately breaks the public API must bump `version` in `Cargo.toml` by a
+`0.x` minor in the same PR (see the semver policy in `CLAUDE.md`); that bump
+is what marks the break as intended. If `minimal-versions` fails, raise the
+named lower bound in `Cargo.toml` to a release that builds and say in the
+comment above `[dependencies]` whether it is a compile floor or only what the
+resolver needs.
+
+Fuzz targets for the crate's own parsers live in `fuzz/` and run nightly in
+`fuzz.yml`, not on PRs. To run one locally
+(`cargo install --locked cargo-fuzz`, nightly toolchain):
+
+```sh
+cargo +nightly fuzz run check_header -- -max_total_time=30
+```
+
+The targets reach internals through `src/__fuzz.rs`, which exists only under
+`--cfg fuzzing`. Do not make an internal `pub` to fuzz it; widen it to
+`pub(crate)` and add a function to that module.
 
 ## Ground rules
 
@@ -101,7 +146,8 @@ You don't need to keep your branch up to date with `master` — CI re-runs on
 `master` after every merge. Rebase only if GitHub reports a conflict.
 
 Merging a PR never publishes anything. A release happens in two steps: a
-merged PR bumps `version` in `Cargo.toml` and adds the matching
+merged PR bumps `version` in `Cargo.toml` (unless a breaking PR already did,
+which `semver` requires) and adds the matching
 `CHANGELOG.md` section, and then the maintainer publishes a GitHub release
 `vX.Y.Z` targeting that bump commit's SHA (not `master`, so a later merge
 cannot ride along into the release without a CHANGELOG entry). Publishing

@@ -134,7 +134,7 @@ impl CredentialSource {
 /// examples notwithstanding) — `bearer x` is the same credential as `Bearer x`,
 /// and refusing it would be a spurious 401 for a client that lower-cases scheme
 /// names. The token itself is taken verbatim, minus surrounding spaces.
-fn bearer_credential(header: &str) -> &str {
+pub(crate) fn bearer_credential(header: &str) -> &str {
     match header.split_once(' ') {
         Some((scheme, token)) if scheme.eq_ignore_ascii_case("bearer") => token.trim(),
         _ => "",
