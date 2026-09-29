@@ -293,6 +293,13 @@ list above updates every place that describes it **in the same commit**:
   one exists) — including anything a consumer's upgrade needs to know.
 - `SECURITY.md`'s "Security invariants this crate maintains" list, if the
   change adds, removes or narrows one of the invariants above.
+- `deny.toml` and `.cargo/audit.toml` — keep their vulnerability-advisory
+  ignores identical (both empty today), each with the reason and what would
+  let it go (`deny.toml` also gates yanked crates and, for direct
+  dependencies only, unmaintained ones, which `cargo audit` does not fail
+  on, so those are not mirrored); the
+  licence allowlist in `deny.toml` follows the dependency tree, so a new
+  dependency with a new licence is a deliberate edit there.
 - `CONTRIBUTING.md` — duplicates the full check matrix, the MSRV command, the
   `jsonwebtoken` pin rule, and the provider-label wording; a change to the CI
   matrix or to that wording goes here too.
@@ -311,10 +318,10 @@ from, and never a local plan/review label ("chunk p2", "round one").
 
 | File | Purpose |
 |---|---|
-| `lib.rs` | Crate root: the module tree, feature gating, and the no-TLS-backend `compile_error!`. `#![warn(missing_docs)]` + `#![forbid(unsafe_code)]`. Re-exports the core, always-available API at the crate root (`OAuthConfig`, `ConfigError`, `KeyNaming`/`KeyNamingBuf`, `OAuthValidator`, `AuthorizedToken`, `TokenRejection`, `Credential`, `authenticate`, `static_token_policy`, `Algorithm`/`AlgorithmError`, …); no `jsonwebtoken` type is re-exported or appears in a public signature. The feature-gated `env`, `axum` and `testing` modules stay public submodules a consumer reaches through their own path instead (`oauth_resource_server::axum::AuthLayer`, `oauth_resource_server::env::secret_from_env`) — nothing inside them is re-exported at the root |
+| `lib.rs` | Crate root: the module tree, feature gating, and the no-TLS-backend `compile_error!`. `#![warn(missing_docs)]` + `#![forbid(unsafe_code)]`. Re-exports the core, always-available API at the crate root (`OAuthConfig`, `ConfigError`, `KeyNaming`/`KeyNamingBuf`, `OAuthValidator`, `AuthorizedToken`, `TokenRejection`, `Credential`, `authenticate`, `static_token_policy`, `Algorithm`/`AlgorithmError`, …); no `jsonwebtoken` type is re-exported or appears in a public signature. The feature-gated `env`, `axum` and `testing` modules stay public submodules a consumer reaches through their own path instead (`oauth_resource_server::axum::AuthLayer`, `oauth_resource_server::env::secret_from_env`) — nothing inside them is re-exported at the root. `__fuzz` (`src/__fuzz.rs`, `#[doc(hidden)]`) is declared under `#[cfg(all(fuzzing, feature = "axum", feature = "testing"))]` only: the entry points the `fuzz/` crate uses to reach crate-internal parsers, never compiled in an ordinary build and never public API — a new fuzz target adds a function there and widens the target internal to `pub(crate)`, nothing more |
 | `config.rs` | `OAuthConfig` (the unvalidated, serde-deserializable input shape — every field `#[serde(default)]`, `deny_unknown_fields`, not `#[non_exhaustive]`) and `OAuthConfig::resolve` (all-or-nothing validation into `ResolvedOAuthConfig`, every problem collected at once via `check_url` and the scope/algorithm/leeway checks). `KeyNaming`/`KeyNamingBuf` (`Dotted`/`Env`) decide how a problem names a setting, carried onto `ResolvedOAuthConfig::key_naming` and `ConfigError` so log lines and errors produced after resolution name settings the same way the input did. `ConfigError::problems` is public, `naming` is private (`ConfigError::naming()` reads it). `required_scopes` (list) and `required_scope` (single) are unioned, trimmed, deduplicated, order-stable; an empty union means no scope check and needs `require_at_jwt` or `allow_unscoped_tokens`; an explicitly blank/whitespace entry in either is always an error, and every required or advertised scope must be a scope-token (`is_scope_token`). An omitted `scopes_supported` resolves to the required scopes. `check_url` refuses space/control/non-ASCII characters; a plain-`http` non-loopback URL needs `allow_insecure_http`. `ResolvedOAuthConfig` is `#[non_exhaustive]`; its `accepted_audiences()` is `audience` ∪ `audiences`. Owns the `WIKI_REWRITES` test-pinned strings — see Key conventions above |
 | `algorithms.rs` | The two independent algorithm gates, and the crate-owned `Algorithm` enum (no HMAC/`none` variant; `to_jwt`/`from_jwt` are the only bridge to `jsonwebtoken`). `DEFAULT_ALGORITHMS` (every asymmetric alg `ring`-backed `jsonwebtoken` 9 can verify) and `parse_algorithm` (refuses HMAC/`none` outright with a typed `AlgorithmError` — no config can enable them) bound the configured allowlist; `key_algorithms` (by JWK `kty`/curve) and `signing_algorithm` (a JWK's own declared `alg`, if present) bound what one key may verify. A token's `alg` must pass both, which is what stops an attacker-chosen header from steering an RSA key into an ECDSA verification or any key into HMAC |
-| `jwks.rs` | `JwksStore`: JWKS discovery (OIDC Discovery then RFC 8414, exact-issuer-match required), fetch (redirect policy `judge_redirect` refuses an https→http downgrade and, without `allow_insecure_http`, a hop to plain http on a non-loopback host; a discovered `jwks_uri` is held to the same opt-in; response capped at `MAX_FETCH_BYTES`, at most `MAX_JWKS_KEYS` keys parsed), caching, and per-key algorithm binding (`cached_key`, skipping non-signature — `use` other than `sig`, `key_ops` without `verify` — and unparseable keys one at a time rather than failing the whole set, and flagging an alg-less multi-algorithm key `ambiguous` for a one-time `warn`). `JWKS_MIN_REFETCH_INTERVAL` (60s) throttles an unknown-`kid` refetch; `JWKS_BACKGROUND_REFRESH_INTERVAL` (hourly) is the only thing that notices a withdrawn key, with `background_retry_delay` for a failed pass. Every fetch runs detached (`refresh_detached`) so a dropped caller cannot cancel it. The `RwLock`/`refresh_lock` split and the fail-closed-on-any-failure behavior are covered in the Architecture section above; `decoding_key`'s "exactly one candidate key with no `kid`" fallback (`lookup`) is documented on the function itself — it never tries more than one key per verification attempt |
+| `jwks.rs` | `JwksStore`: JWKS discovery (OIDC Discovery then RFC 8414, exact-issuer-match required), fetch (redirect policy `judge_redirect` refuses an https→http downgrade and, without `allow_insecure_http`, a hop to plain http on a non-loopback host; a discovered `jwks_uri` is held to the same opt-in; response capped at `MAX_FETCH_BYTES`, at most `MAX_JWKS_KEYS` keys parsed), caching, and per-key algorithm binding (`parse_jwks_entry`, the pure per-entry step of `fetch_jwks` — parse one JWK Set entry on its own, then `cached_key`, skipping non-signature — `use` other than `sig`, `key_ops` without `verify` — and unparseable keys one at a time rather than failing the whole set, and flagging an alg-less multi-algorithm key `ambiguous` for a one-time `warn`). `JWKS_MIN_REFETCH_INTERVAL` (60s) throttles an unknown-`kid` refetch; `JWKS_BACKGROUND_REFRESH_INTERVAL` (hourly) is the only thing that notices a withdrawn key, with `background_retry_delay` for a failed pass. Every fetch runs detached (`refresh_detached`) so a dropped caller cannot cancel it. The `RwLock`/`refresh_lock` split and the fail-closed-on-any-failure behavior are covered in the Architecture section above; `decoding_key`'s "exactly one candidate key with no `kid`" fallback (`lookup`) is documented on the function itself — it never tries more than one key per verification attempt |
 | `validator.rs` | `OAuthValidator`: built once from a `ResolvedOAuthConfig` (re-checks the audience/algorithm/leeway invariants `resolve` already enforced, since `ResolvedOAuthConfig`'s fields are public and may be hand-adjusted), then `validate`/`validate_cached` (the cache-only path `authenticate()`'s two-pass check uses) run header checks (`check_header`: size, JWS shape, `crit` via `check_crit`, `alg` allowlist, `typ` — see `token::check_typ`) before any key fetch, then `verify` (one `jsonwebtoken::decode` for signature + `iss`/`aud`/`exp`/`nbf`, then the exact-`iss`-string recheck, the `nbf` NumericDate check, the `cnf` refusal, then all-of scope matching). Also owns the RFC 9728 metadata document and the two `WWW-Authenticate` challenge strings (`invalid_token_challenge`/`insufficient_scope_challenge`, built from `challenge.rs`), `spawn_background_refresh` (a `Weak`-holding task that stops with the validator), and startup-only warning checks: a `required_scopes` entry missing from a non-empty `scopes_supported` (`unadvertised_scopes`; an empty one makes the challenge name the required scopes, so it is not warned about) (a guaranteed 403 for a client that only requests the advertised scopes), an unscoped config with `require_at_jwt` off (`unscoped_posture`, an ID token becomes a working bearer credential; `resolve` already refuses it without `allow_unscoped_tokens`), and a plain-`http://` issuer/`jwks_uri`/resource on a non-loopback host (refused by `resolve` without `allow_insecure_http`). `metadata()` returns `&Value`. The `# Runtime` section on `OAuthValidator` is the Tokio requirement. Documents the RFC 7662 opaque-token-introspection extension point in `OAuthValidator`'s own doc comment — not built, but the API is shaped so it could be added as a feature-gated alternative key source without a breaking change |
 | `token.rs` | `AuthorizedToken` (subject/principal/scopes; `#[non_exhaustive]`, `has_scope`) and `TokenRejection` (`Missing`/`Invalid(String)`/`InsufficientScope`, `#[non_exhaustive]` — the 401-vs-403 split RFC 6750 requires; a `std::error::Error` whose `Display` is the category only, never the `Invalid` reason). `extract_scopes`/`extract_principal` read every configured claim in every accepted shape (string, space-delimited or not; array); `check_typ` is the RFC 9068 `typ` gate `validator.rs` calls. `MAX_TOKEN_BYTES` (16 KiB) and `MAX_LOGGED_CHARS` (128, via `for_log`) bound, respectively, what a credential may be and what a token-derived string may look like in a log line |
 | `challenge.rs` | RFC 9728 metadata (`metadata_document`, which omits an empty `scopes_supported` per §3.2; `PROTECTED_RESOURCE_METADATA_PREFIX`; `resource_metadata_url`/`metadata_path` — the well-known segment goes between authority and path, not at the end, and the path is kept verbatim, trailing slash included, per §3.1) and the two RFC 6750 `WWW-Authenticate` builders (`invalid_token`, `insufficient_scope`), which omit the `scope` attribute entirely rather than sending it empty when there is nothing to name (RFC 6749 §3.3); the validator feeds the 401 the required scopes when `scopes_supported` is empty. `quoted` escapes a config-derived value for an HTTP quoted-string — defence against a typo producing a malformed header, not against an attacker |
@@ -421,13 +428,48 @@ The flow:
 - Work on a branch, open a PR against `master`. `.github/workflows/ci.yml`
   fans `checks` (fmt, four clippy runs, tests with all and with default
   features, `cargo build --examples --all-features`, a `-D warnings` doc
-  build, `cargo audit`, `cargo package --list`, `cargo publish --dry-run`) and
-  `msrv` (a separate build on the pinned `1.89` toolchain) into `ci-pass`.
-  `checks` and `msrv` run on the project's self-hosted runner (an ephemeral
-  container, labels `self-hosted`, `linux`, `x64`): each installs
-  `pkg-config`/`libssl-dev`, the toolchain named in `rust-toolchain.toml` via
-  `dtolnay/rust-toolchain`, and restores an `actions/cache` of the cargo
-  registry and `target/`. `ci-pass` runs on a GitHub-hosted runner.
+  build, `cargo audit`, `cargo deny check`, `cargo package --list`,
+  `cargo publish --dry-run`), `msrv` (a separate build on the pinned `1.89`
+  toolchain) and three more jobs — `semver` (`cargo semver-checks
+  check-release --all-features` against the latest release on crates.io, on
+  Rust 1.93 with `cargo-semver-checks@0.50.0`: the tool needs a recent rustc,
+  so the toolchain and the pinned tool version move together, and a floating
+  `stable` would break every PR when a new rustc changes the rustdoc JSON
+  format), `feature-powerset`
+  (`cargo hack check --feature-powerset`, one TLS backend per build) and
+  `minimal-versions` (`cargo update -Z direct-minimal-versions` with
+  dev-dependencies removed, then a build) — into `ci-pass`. All five run on
+  the project's self-hosted runner (an ephemeral container, labels
+  `self-hosted`, `linux`, `x64`): each installs `pkg-config`/`libssl-dev`, a
+  toolchain via `dtolnay/rust-toolchain` (the one named in
+  `rust-toolchain.toml`, except `semver`'s stable and `minimal-versions`'
+  extra nightly), and restores an `actions/cache` of the cargo registry and
+  `target/`; `cargo-audit`, `cargo-deny`, `cargo-hack` and
+  `cargo-semver-checks` come from a SHA-pinned `taiki-e/install-action`.
+  `ci-pass` runs on a GitHub-hosted runner and lists all five in its `needs`
+  and its explicit result check.
+- `semver` compares against the newest crates.io release, so while
+  `Cargo.toml`'s `version` still equals it, any breaking change fails CI. A
+  deliberate breaking change (a `0.x` minor under the policy below) carries
+  its `version` bump in the same PR; that bump is what tells the check it is
+  intended. `minimal-versions` is why some of `Cargo.toml`'s dependency
+  requirements are not bare majors, for two different reasons spelled out in
+  the comment above `[dependencies]`: `jsonwebtoken` 9.2 and `tokio` 1.15 are
+  where the crate builds (the next-older releases tried fail to compile),
+  while `subtle`, `tower-layer`, `tower-service`, `tracing`, `serde` and
+  `serde_json` are raised only so `direct-minimal-versions` can resolve
+  against `reqwest`'s and `axum`'s own minimums. None is an exhaustive search
+  for the oldest working release; a new dependency or bound that regresses
+  fails this job.
+- `.github/workflows/fuzz.yml` (nightly `schedule` plus `workflow_dispatch`,
+  never a PR or push trigger, GitHub-hosted) runs each `fuzz/` cargo-fuzz
+  target for a bounded time. The targets call `src/__fuzz.rs`, a
+  `#[doc(hidden)] pub mod __fuzz` that exists only under `--cfg fuzzing`
+  (which cargo-fuzz sets), so the internals it reaches are never public API;
+  `Cargo.toml`'s `[lints.rust] unexpected_cfgs` declares that cfg so
+  `clippy -D warnings` stays clean. `fuzz/` is its own package (empty
+  `[workspace]`, `publish = false`) and is outside `Cargo.toml`'s `include`
+  list, so `cargo package --list` never shows it.
 - `ci-pass` uses `if: always()` plus an explicit result check specifically so
   that a failed (or skipped, or cancelled) upstream job fails `ci-pass`
   rather than being skipped and read as passing — see the comment at the top
@@ -468,9 +510,13 @@ The flow:
   workflow file at the tagged commit), crates.io answers `404` for the version
   (`200` fails the first attempt — the release is for an already-published
   version; any other answer always fails), and `CHANGELOG.md` has a
-  non-empty `## [X.Y.Z]` section. Then `verify` and `msrv`
-  (self-hosted, read-only, no OIDC permission) repeat `ci.yml`'s `checks`
-  and `msrv` jobs step for step — keep the lists in step; `publish`
+  non-empty `## [X.Y.Z]` section. Then `verify`, `msrv` and `semver`
+  (self-hosted, read-only, no OIDC permission) repeat `ci.yml`'s `checks`,
+  `msrv` and `semver` jobs step for step — keep the lists in step
+  (`feature-powerset` and `minimal-versions` are not repeated: they ran on
+  master's post-merge CI and are not re-verified at release, while `semver`
+  depends on what crates.io holds and on this release's version bump);
+  `publish`
   (GitHub-hosted, in the `release` environment, the only job with
   `id-token: write`, running nothing but checkout, toolchain, auth and
   publish, with no restored cache) re-checks crates.io, then authenticates
@@ -483,7 +529,8 @@ The flow:
   token, and keep that job off the self-hosted runner, which has its host's
   Docker daemon socket mounted and runs unreviewed Dependabot code.
 - **To cut a release**: (1) merge a PR that bumps `version` in `Cargo.toml`
-  (and `Cargo.lock`) and moves `CHANGELOG.md`'s `[Unreleased]` entries under
+  (and `Cargo.lock`) — unless a breaking PR already bumped it, which the
+  `semver` job requires — and moves `CHANGELOG.md`'s `[Unreleased]` entries under
   `## [X.Y.Z] - <date>` (plus the link references at the bottom) — merging
   it publishes nothing; (2) the owner runs
   `gh release create vX.Y.Z --target <sha of the bump commit> --title vX.Y.Z --notes "..."`
@@ -495,11 +542,11 @@ The flow:
   "re-run failed jobs" on that run: `publish` skips the upload and succeeds
   if an earlier attempt already made it, and `release-notes` just writes the
   same notes again. Runs are grouped per release tag and never cancelled.
-- A genuine `verify`/`msrv` failure (the tagged commit is broken) cannot be
-  fixed by a re-run, which repeats the same commit. Merge the fix, then as
-  the owner delete the release and its tag
+- A genuine `verify`/`msrv`/`semver` failure (the tagged commit is broken)
+  cannot be fixed by a re-run, which repeats the same commit. Merge the fix,
+  then as the owner delete the release and its tag
   (`gh release delete vX.Y.Z --cleanup-tag`) and create the release again at
-  the new commit. Nothing was uploaded: `publish` needs both jobs.
+  the new commit. Nothing was uploaded: `publish` needs all of them.
 - `release.yml` must keep its filename, and `publish` must keep
   `environment: release`: crates.io trusted publishing is registered for
   this repository + `release.yml` + environment `release`. That
@@ -541,14 +588,40 @@ cargo test
 cargo build --examples --all-features
 RUSTDOCFLAGS="-D warnings" cargo doc --no-deps --all-features
 cargo audit                    # needs cargo-audit installed; reads .cargo/audit.toml
+cargo deny check               # needs cargo-deny installed; reads deny.toml
 cargo package --list
 cargo publish --dry-run        # pass --allow-dirty for a local, uncommitted tree
 ```
 
-The `msrv` CI job additionally builds on the pinned MSRV toolchain
-(`cargo "+1.89" build --all-features --locked`, reading `rust-version` from
-`Cargo.toml`) — most contributors won't have `1.89` installed locally and CI
-covers it regardless.
+Four more CI jobs run alongside `checks`; the last two need a nightly
+toolchain and `cargo-hack`/`cargo-semver-checks` installed:
+
+```bash
+# msrv job: reads rust-version from Cargo.toml; most contributors won't have 1.89
+cargo "+1.89" build --all-features --locked
+
+# semver job: cargo-semver-checks 0.50.0 needs rustc 1.93+; CI pins both, so
+# they move together
+cargo +1.93 semver-checks check-release --all-features
+
+# feature-powerset job
+cargo hack check --feature-powerset --no-dev-deps \
+  --mutually-exclusive-features rustls-tls,native-tls,rustls-tls-native-roots \
+  --at-least-one-of rustls-tls,native-tls,rustls-tls-native-roots
+
+# minimal-versions job: rewrites Cargo.toml and Cargo.lock, so run it in a
+# throwaway copy of the tree, not your working tree
+cargo hack --remove-dev-deps
+cargo +nightly update -Z direct-minimal-versions
+cargo update -p time
+cargo build --all-features
+```
+
+Fuzzing is not part of the PR matrix (`fuzz.yml` runs it nightly). To run a
+target locally: `cargo install --locked cargo-fuzz`, then
+`cargo +nightly fuzz run <target> -- -max_total_time=30` (targets:
+`bearer_credential`, `check_header`, `extract_claims`, `metadata_urls`,
+`discovery_urls`, `jwks_entries`). `cargo +nightly fuzz build` builds them all.
 
 ```bash
 cargo build   # plain library build (default features)

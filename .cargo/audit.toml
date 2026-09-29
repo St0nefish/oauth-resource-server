@@ -5,6 +5,9 @@
 # small. Add an entry here only for an advisory that is a genuine false
 # positive for this crate (the vulnerable code path is unreachable, or it's
 # a transitive dep we don't control and haven't yet had time to move off) —
-# and say why, and what would let the entry be removed.
+# and say why, and what would let the entry be removed. `deny.toml`'s
+# `[advisories] ignore` (also empty) must list exactly the same advisories:
+# `cargo deny check` and `cargo audit` both run in CI, and an advisory ignored
+# in one but not the other would fail the other.
 [advisories]
 ignore = []

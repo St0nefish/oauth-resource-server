@@ -93,6 +93,18 @@ pub mod env;
 #[cfg_attr(docsrs, doc(cfg(feature = "axum")))]
 pub mod axum;
 
+// Entry points for the `fuzz/` cargo-fuzz crate into internals that are not
+// public API. cargo-fuzz sets `--cfg fuzzing`; no ordinary build (including
+// docs.rs and every CI job but `fuzz.yml`) compiles this module. cargo-fuzz
+// sets the cfg for every crate in the build, so a project that fuzzes ITSELF
+// while depending on this crate compiles this one with `fuzzing` on as well.
+// That works either way: the module needs the `axum` and `testing` features
+// (`bearer_credential`, `resolved_config`), and is simply left out unless a
+// build enables both.
+#[cfg(all(fuzzing, feature = "axum", feature = "testing"))]
+#[doc(hidden)]
+pub mod __fuzz;
+
 #[cfg(any(test, feature = "testing"))]
 #[cfg_attr(docsrs, doc(cfg(feature = "testing")))]
 pub mod testing;

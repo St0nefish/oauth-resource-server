@@ -567,7 +567,7 @@ impl OAuthValidator {
 
     /// Everything that can be refused from the unverified header alone (size,
     /// shape, `crit`, `alg` allowlist, `typ`), before any key is looked up.
-    fn check_header(&self, token: &str) -> Result<CheckedHeader, TokenRejection> {
+    pub(crate) fn check_header(&self, token: &str) -> Result<CheckedHeader, TokenRejection> {
         if token.is_empty() {
             return Err(TokenRejection::Missing);
         }
@@ -816,7 +816,7 @@ impl OAuthValidator {
 
 /// The header fields a validation carries forward: the `kid` to look the key
 /// up by, and the allowlisted algorithm.
-struct CheckedHeader {
+pub(crate) struct CheckedHeader {
     kid: Option<String>,
     alg: Algorithm,
 }
@@ -828,7 +828,7 @@ struct CheckedHeader {
 /// protected header is read raw here. Called after `decode_header` succeeded,
 /// so the segment is known to be base64url JSON; it is at most the 16 KiB
 /// credential cap.
-fn check_crit(token: &str) -> Result<(), TokenRejection> {
+pub(crate) fn check_crit(token: &str) -> Result<(), TokenRejection> {
     let segment = token.split('.').next().unwrap_or_default();
     let header: Map<String, Value> = URL_SAFE_NO_PAD
         .decode(segment)

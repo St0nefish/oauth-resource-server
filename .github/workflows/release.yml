@@ -28,11 +28,11 @@ name: Release
 # starts no workflow run at all. Nothing in this workflow ever creates or
 # edits a tag.
 #
-# If `verify` or `msrv` fails because the tagged commit is genuinely broken,
+# If `verify`, `msrv` or `semver` fails because the tagged commit is genuinely broken,
 # "re-run failed jobs" cannot help — it re-runs the same commit. Merge the
 # fix, then, as the owner, delete the release and its tag
 # (`gh release delete vX.Y.Z --cleanup-tag`) and create the release again at
-# the new commit. Nothing was uploaded, since `publish` needs both jobs.
+# the new commit. Nothing was uploaded, since `publish` needs all three jobs.
 #
 # A prerelease is
 # handled like any other release: a version such as `0.2.0-rc.1` is
@@ -50,6 +50,11 @@ name: Release
 #            non-empty section for it (the release notes).
 #   verify   Self-hosted, read-only, no OIDC permission: the same steps as
 #   msrv     ci.yml's `checks` and `msrv` jobs, on the tagged commit.
+#   semver   ci.yml's `semver` job on the tagged commit. (ci.yml's
+#            `feature-powerset` and `minimal-versions` are not repeated: they
+#            ran on master's post-merge CI and are not re-verified at
+#            release. `semver` depends on what is on crates.io and on this
+#            release's version bump, so it is.)
 #   publish  The only job with `id-token: write`, in the `release`
 #            environment. Re-checks crates.io, then does nothing but
 #            checkout, toolchain, crates.io authentication and
@@ -337,6 +342,14 @@ jobs:
       - name: Audit dependencies
         run: cargo audit
 
+      - name: Install cargo-deny
+        uses: taiki-e/install-action@4cef1412cce204788f482e778a0b9187f9626a29 # v2.87.21
+        with:
+          tool: cargo-deny
+
+      - name: Check licenses, bans, sources and advisories
+        run: cargo deny check
+
       - name: cargo package --list
         run: cargo package --list
 
@@ -390,6 +403,54 @@ jobs:
           MSRV: ${{ steps.msrv.outputs.version }}
         run: cargo "+${MSRV}" build --all-features --locked
 
+  # cargo-semver-checks against the newest version on crates.io, on the exact
+  # commit about to be published. `check` has just confirmed this version is
+  # not on crates.io yet, so the baseline is the previous release and the
+  # bumped `Cargo.toml` version is what allows a breaking change: a breaking
+  # change under a patch bump (or an unbumped version) fails here, before
+  # anything is uploaded. Repeats ci.yml's `semver` job step for step.
+  semver:
+    needs: check
+    runs-on: [self-hosted, linux, x64]
+    timeout-minutes: 30
+    steps:
+      - name: Checkout the tagged commit
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ github.sha }}
+          persist-credentials: false
+
+      - name: Install system dependencies
+        # `--all-features` below includes `native-tls` (OpenSSL).
+        run: |
+          sudo apt-get update && sudo apt-get install -y --no-install-recommends \
+            pkg-config libssl-dev
+
+      - name: Install Rust 1.93 toolchain (for cargo-semver-checks)
+        # Not rust-toolchain.toml's pin: see ci.yml's `semver` job. This
+        # toolchain and the `tool:` version below move together.
+        uses: dtolnay/rust-toolchain@02cb101ec7c40f2c49e1d9714d64511d8e1b74de # master, 2026-09-12
+        with:
+          toolchain: "1.93"
+
+      - name: Cache cargo registry and build artifacts
+        uses: actions/cache@caa296126883cff596d87d8935842f9db880ef25 # v5.1.0
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: cargo-semver-${{ hashFiles('Cargo.lock') }}
+          restore-keys: cargo-semver-
+
+      - name: Install cargo-semver-checks
+        uses: taiki-e/install-action@4cef1412cce204788f482e778a0b9187f9626a29 # v2.87.21
+        with:
+          tool: cargo-semver-checks@0.50.0
+
+      - name: Check for breaking changes against the latest crates.io release
+        run: cargo +1.93 semver-checks check-release --all-features
+
   # The only job that can mint a crates.io token. Any step in a job with
   # `id-token: write` can request the OIDC token crates-io-auth-action
   # exchanges, so this job runs as little code as possible: no
@@ -398,7 +459,7 @@ jobs:
   # own verification build still runs the normal dependencies' build
   # scripts. GitHub-hosted, and in the `release` environment — see the header.
   publish:
-    needs: [check, verify, msrv]
+    needs: [check, verify, msrv, semver]
     runs-on: ubuntu-latest
     timeout-minutes: 30
     environment: release
