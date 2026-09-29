@@ -68,7 +68,14 @@ the ones a report is most likely to concern:
   fetch is made) unless explicitly opted into;
 - `AuthLayer` cannot be constructed in a state that silently passes every
   request through unauthenticated — that requires an explicit,
-  clearly-named constructor.
+  clearly-named constructor. An `optional()` layer still needs a credential
+  mechanism, and passes through only a request that presents no credential
+  at all (a `DPoP`-scheme or tab-separated `Bearer` value counts as
+  presented); anything presented is refused exactly as without `optional()`,
+  and a credential an outer layer inserted is removed, not passed on;
+- the `Credential`/`AuthorizedToken` axum extractors never turn a missing
+  credential into access: they answer with the layer's own 401 and challenge,
+  and with 500 on a route no `AuthLayer` covers (their `Option` forms too).
 
 See `CLAUDE.md` for the full list and the module each one lives in.
 

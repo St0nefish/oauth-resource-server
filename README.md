@@ -81,7 +81,7 @@ oauth-resource-server = { version = "0.1", features = ["axum", "serde"] }
 | `native-tls` | no | The platform TLS backend (OpenSSL on Linux), trusting the operating system's certificate store. |
 | `serde` | no | `Deserialize`/`Serialize` for `OAuthConfig`, to load it from YAML, TOML, JSON or any other serde format. |
 | `env` | no | The `env` module: load the config and secrets from environment variables, with `VAR_FILE` support. |
-| `axum` | no | The `axum` module: the `AuthLayer` middleware and `metadata_router`. |
+| `axum` | no | The `axum` module: the `AuthLayer` middleware, `metadata_router`, and axum extractors for `Credential` and `AuthorizedToken`. |
 | `testing` | no | Throwaway signing keys, token minting and a fake JWKS server, for **your tests only**. Never enable it in a production build. |
 
 The core (config, validator, `authenticate`, `static_token_policy`) is always
@@ -208,13 +208,13 @@ starts a fake authorization server on a loopback port, so it needs no network.
 ### Reading the caller in a handler
 
 On success the layer inserts a `Credential` into the request extensions and,
-for an OAuth token, the `AuthorizedToken` as well:
+for an OAuth token, the `AuthorizedToken` as well. Both are axum extractors,
+so a handler takes them as arguments:
 
 ```rust
-use axum::Extension;
 use oauth_resource_server::Credential;
 
-async fn whoami(Extension(credential): Extension<Credential>) -> String {
+async fn whoami(credential: Credential) -> String {
     match credential {
         Credential::OAuth(token) => format!(
             "subject {:?}, known as {:?}, with scopes {:?}",
@@ -227,9 +227,36 @@ async fn whoami(Extension(credential): Extension<Credential>) -> String {
 }
 ```
 
+When the layer inserted nothing, the extractors refuse the request themselves,
+and never pass it to the handler:
+
+| The request… | `Credential` / `AuthorizedToken` | `Option<Credential>` / `Option<AuthorizedToken>` |
+|---|---|---|
+| was accepted by the layer | the value | `Some(value)` |
+| passed an `optional()` layer with no credential, or an `allow_unauthenticated()` layer | the layer's own 401 and `WWW-Authenticate` challenge | `None` |
+| was accepted with the static token (`AuthorizedToken` only, unless an outer layer inserted one; see below) | the layer's own 401 and challenge | `None` |
+| is on a route no `AuthLayer` covers | 500, logged at `error` | 500, logged at `error` |
+
+"The layer's own 401" comes from the same code as the layer's refusals, so it
+has the same status, challenge and `on_reject` body. A route outside every
+layer is a mistake in the server's wiring, not something a caller can fix by
+authenticating. It gets a 500 rather than a 401, because a 401 would send an
+OAuth client into an authorization flow that can never succeed there. Even
+`Option<..>` refuses in that case, so a wiring mistake can never read as an
+anonymous caller. `Extension<Credential>` and `Extension<AuthorizedToken>`
+still work as before.
+
+Nested layers: an `optional()` layer first removes any `Credential` and
+`AuthorizedToken` an outer layer inserted, so its handlers only ever see what
+it accepted itself. Strict layers never remove anything, so the extensions
+accumulate. `Credential` is the innermost layer's decision, but an
+`AuthorizedToken` may come from an outer layer. For example, an inner
+static-key layer under an outer OAuth layer leaves the outer layer's token in
+place. Read `Credential` when the innermost decision is what matters.
+
 When a static token is also configured, extract `Credential` rather than
-`AuthorizedToken`: a static-token request has no `AuthorizedToken`, so
-`Extension<AuthorizedToken>` would fail for it. Key per-user decisions on
+`AuthorizedToken`: a static-token request has no `AuthorizedToken`, so an
+`AuthorizedToken` extractor refuses it with a 401. Key per-user decisions on
 `subject`, the verbatim signed `sub`; `principal` comes from a configurable
 claim list and is meant for logs.
 
@@ -238,18 +265,18 @@ finer check, such as a write scope on some routes, decide in the handler, and
 decide **fail-closed**: allow only a credential you positively recognize.
 
 ```rust
-use axum::Extension;
 use axum::http::StatusCode;
 use oauth_resource_server::Credential;
 
-async fn delete_thing(credential: Option<Extension<Credential>>) -> StatusCode {
-    let allowed = match credential.as_deref() {
+async fn delete_thing(credential: Option<Credential>) -> StatusCode {
+    let allowed = match &credential {
         Some(Credential::OAuth(token)) => token.has_scope("api:write"),
         // The static API key has no scopes. Whether it may write is your
         // decision; say so explicitly rather than falling through.
         Some(Credential::StaticToken) => false,
-        // No credential at all (an `allow_unauthenticated` layer inserts
-        // nothing), or a kind this code does not know: deny.
+        // No credential at all (an `optional()` or `allow_unauthenticated()`
+        // layer passed the request through), or a kind this code does not
+        // know: deny.
         _ => false,
     };
     if !allowed {
@@ -260,13 +287,66 @@ async fn delete_thing(credential: Option<Extension<Credential>>) -> StatusCode {
 }
 ```
 
-Avoid `Option<Extension<AuthorizedToken>>` with an
+Avoid `Option<AuthorizedToken>` with an
 `if let Some(token) = .. { if !token.has_scope(..) { deny } }` check: `None`
-covers both a static-token request and every request under
-`AuthLayer::allow_unauthenticated()`, so that shape lets both through the
-write check. You can also put a second layer with its own validator on those
+covers a static-token request and every request that an `optional()` or
+`allow_unauthenticated()` layer passed through, so that shape lets all of them
+through the write check. You can also put a second layer with its own validator on those
 routes. Scopes are matched exactly, with no hierarchy: if your authorization
-server means `api:write` to imply `api:read`, check for either here.
+server means `api:write` to imply `api:read`, check for either here. A typed
+per-handler scope extractor is not provided yet.
+
+### Optional authentication
+
+For routes that serve everyone but personalize for an authenticated caller,
+or an API that is open for reads but authenticated for writes,
+`AuthLayerBuilder::optional()` lets a request that presents **no** credential
+through with nothing inserted. A credential that is presented but not accepted
+is still refused, exactly as without `optional()`:
+
+```rust
+use std::sync::Arc;
+
+use axum::{Router, routing::get};
+use oauth_resource_server::axum::{AuthLayer, AuthLayerError};
+use oauth_resource_server::{AuthorizedToken, OAuthValidator};
+
+async fn front_page(token: Option<AuthorizedToken>) -> String {
+    match token {
+        Some(token) => format!("welcome back, {:?}", token.principal),
+        None => "welcome, visitor".to_string(),
+    }
+}
+
+fn app(oauth: Arc<OAuthValidator>) -> Result<Router, AuthLayerError> {
+    let optional = AuthLayer::builder().oauth(oauth).optional().build()?;
+    Ok(Router::new()
+        .route("/", get(front_page))
+        .route_layer(optional))
+}
+```
+
+| The request carries… | An `optional()` layer |
+|---|---|
+| no credential: every configured header absent or blank | passes it through; the handler sees `None` |
+| a valid credential with the required scopes | inserts it, as without `optional()` |
+| an invalid, expired or unknown credential, or the wrong static token | the same 401 and challenge as without `optional()` |
+| a valid token without the required scopes | the same 403 and challenge as without `optional()` |
+
+"Blank" is what `authenticate()` reports as `Missing`: an empty or
+whitespace-only value, `Bearer` followed by nothing, or an `Authorization`
+value that uses some other scheme (`Basic ...`), which carries no bearer
+credential. Some values count as a presented credential even so, and get
+exactly the refusal a non-optional layer sends:
+
+- a header value that is not visible ASCII;
+- a non-blank later value of a repeated header;
+- any `DPoP ...` value, because a sender-constrained token must be refused,
+  not served as anonymous;
+- `Bearer` followed by a tab and a token.
+
+`optional()` still requires a static token or a validator to build. See the
+security model below.
 
 ### Reading the verified claims
 
@@ -281,7 +361,6 @@ deserializes it into your own type.
 ```rust
 use std::time::SystemTime;
 
-use axum::Extension;
 use oauth_resource_server::AuthorizedToken;
 use serde::Deserialize;
 
@@ -291,7 +370,7 @@ struct MyClaims {
     groups: Vec<String>,
 }
 
-async fn admin_only(Extension(token): Extension<AuthorizedToken>) -> String {
+async fn admin_only(token: AuthorizedToken) -> String {
     let groups = token.claims_as::<MyClaims>().map(|c| c.groups).unwrap_or_default();
     if !groups.iter().any(|g| g == "admins") {
         return "not an admin".to_string();
@@ -305,6 +384,12 @@ async fn admin_only(Extension(token): Extension<AuthorizedToken>) -> String {
     )
 }
 ```
+
+The `AuthorizedToken` extractor behaves as the table in [Reading the caller in
+a handler](#reading-the-caller-in-a-handler) describes: a request the layer
+inserted no token into, such as a static-key request or an `optional()`
+pass-through, is refused before the handler runs. Take `Option<AuthorizedToken>`
+to serve those requests too.
 
 The claims are exactly what the signature covered, and they are bounded by the
 16 KiB credential cap. They can hold personal data, so `Debug` on an
@@ -861,6 +946,29 @@ verified claims and token metadata) or a
   and a `StaticTokenDecision::Unauthenticated` handed to `AuthLayer::from_decision`
   or `build_with_decision` (which `static_token_policy` returns only with
   `allow_unauthenticated = true`); both must be asked for by name.
+- **Optional authentication only skips what was never presented.** An
+  `optional()` layer passes a request through only when every value of every
+  configured credential header is absent or blank. Blank means empty or
+  whitespace, `Bearer` followed by nothing, or another scheme in a `Bearer`
+  source. A header value that is not visible ASCII, a non-blank later value
+  of a repeated header, any `DPoP`-scheme value, and `Bearer` followed by a
+  tab and a token all count as presented. Anything presented gets exactly
+  the refusal a non-optional layer sends (401 for an invalid, expired or
+  unknown credential, 403 for insufficient scope, with the same challenge and
+  `on_reject` body). A caller gains nothing it could not get by leaving its
+  credential headers off, so a handler behind an optional layer must treat
+  `None` as unauthenticated. `optional()` still needs a static token or a
+  validator to build. It also removes any credential an outer layer inserted,
+  so `None` after its pass-through is never replaced by an outer layer's
+  token.
+- **The extractors fail closed.** `Credential` and `AuthorizedToken` refuse a
+  request the layer inserted nothing into with that layer's own 401 and
+  challenge, built by the same code as its other refusals. On a route no
+  `AuthLayer` covers, they and their `Option<..>` forms answer 500 and log at
+  `error`. They never read that case as anonymous. A required extractor behind
+  `allow_unauthenticated()`, or an `AuthorizedToken` extractor behind a layer
+  with no validator, is a 401 no credential can satisfy, and is also logged at
+  `error`.
 - **Every refusal carries a challenge.** With OAuth configured, every 401 and
   403 carries `WWW-Authenticate` with `resource_metadata`, including a request
   that failed with a static token, since the server cannot tell which
@@ -1120,7 +1228,7 @@ fits MCP's authorization model:
 request's `http::Extensions` — the same place [Reading the caller in a
 handler](#reading-the-caller-in-a-handler) reads `Credential` from in a plain
 axum handler. A tool handler runs one layer further in, inside the MCP SDK's
-JSON-RPC dispatch, so it has no `axum::Extension` extractor of its own; it
+JSON-RPC dispatch, so it has no axum extractor of its own; it
 needs the original `http::request::Parts` (extensions included), which is
 what carries the value here:
 
