@@ -412,6 +412,12 @@ async fn no_credential_is_the_layers_401_and_no_layer_is_a_500() {
         post(&bare, None, &call("search")).await,
         (500, None, Vec::new())
     );
+    // ...not a byte of it: a body that fails as soon as it is polled would
+    // turn a read into a 400, so the 500 proves the check came first.
+    assert_eq!(
+        send(&bare, http::Method::POST, None, unread()).await,
+        (500, None, Vec::new())
+    );
 }
 
 /// A body whose size hint claims it is exactly empty, but which yields data.

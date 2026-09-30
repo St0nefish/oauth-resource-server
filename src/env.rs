@@ -9,12 +9,18 @@
 //! field per `<PREFIX><FIELD>` variable, and [`OAuthConfig::resolve`]s it.
 //!
 //! Every function here has a `_lookup` twin that takes the variable lookup and
-//! file reader as arguments instead of calling `std::env::var`/
-//! `std::fs::read_to_string` directly, so tests can exercise every case
-//! without mutating the process environment — `std::env::set_var` is `unsafe`
-//! as of the 2024 edition.
+//! file reader as arguments instead of calling `std::env::var` and reading
+//! the file directly, so tests can exercise every case without mutating the
+//! process environment — `std::env::set_var` is `unsafe` as of the 2024
+//! edition.
+//!
+//! A `_FILE` is read only when it is a regular file, and at most
+//! [`MAX_SECRET_FILE_BYTES`] (64 KiB) of it: `X_FILE=/dev/zero` or a
+//! directory is refused at once ([`EnvError::NotAFile`],
+//! [`EnvError::FileTooLarge`]) rather than exhausting memory or blocking
+//! startup, as a FIFO nobody writes to would.
 
-use std::io;
+use std::io::{self, Read};
 
 use zeroize::Zeroizing;
 
@@ -60,6 +66,29 @@ pub enum EnvError {
         #[source]
         source: io::Error,
     },
+    /// `<var>_FILE` names something other than a regular file — a directory,
+    /// a FIFO, a device such as `/dev/zero` — which is refused before it is
+    /// opened: reading one could block startup forever or never end.
+    #[error("{var}_FILE={path}: not a regular file")]
+    #[non_exhaustive]
+    NotAFile {
+        /// The plain variable name.
+        var: String,
+        /// The path named by `<var>_FILE`.
+        path: String,
+    },
+    /// The file named by `<var>_FILE` is larger than
+    /// [`MAX_SECRET_FILE_BYTES`] (64 KiB). No secret or config value is
+    /// anywhere near that size; such a file is the wrong file. At most one
+    /// byte past the limit is read.
+    #[error("{var}_FILE={path}: secret file is over the 65536-byte limit")]
+    #[non_exhaustive]
+    FileTooLarge {
+        /// The plain variable name.
+        var: String,
+        /// The path named by `<var>_FILE`.
+        path: String,
+    },
     /// The file named by `<var>_FILE` was read successfully but was empty (or
     /// all whitespace). Unlike a blank `VAR`, this is an error rather than
     /// "unset": a secrets-mount file that exists but is empty is far more
@@ -92,6 +121,100 @@ pub enum EnvError {
         /// Every failure, in the order the variables were read.
         errors: Vec<EnvError>,
     },
+}
+
+/// The first claim name the top-level JSON object `json` (already known to
+/// parse as one) holds more than once, read as `(name, value)` pairs.
+fn duplicated_claim(json: &str) -> Option<String> {
+    let pairs: Vec<(String, serde::de::IgnoredAny)> = serde_json::from_str::<Pairs>(json).ok()?.0;
+    let mut seen = std::collections::HashSet::new();
+    pairs
+        .into_iter()
+        .map(|(name, _)| name)
+        .find(|name| !seen.insert(name.clone()))
+}
+
+/// A JSON object read as its `(key, value)` pairs in order, duplicates kept.
+struct Pairs(Vec<(String, serde::de::IgnoredAny)>);
+
+impl<'de> serde::Deserialize<'de> for Pairs {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        struct Visit;
+        impl<'de> serde::de::Visitor<'de> for Visit {
+            type Value = Pairs;
+            fn expecting(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+                f.write_str("a JSON object")
+            }
+            fn visit_map<A: serde::de::MapAccess<'de>>(
+                self,
+                mut map: A,
+            ) -> Result<Pairs, A::Error> {
+                let mut pairs = Vec::new();
+                while let Some(pair) = map.next_entry()? {
+                    pairs.push(pair);
+                }
+                Ok(Pairs(pairs))
+            }
+        }
+        deserializer.deserialize_map(Visit)
+    }
+}
+
+/// The largest file a `<VAR>_FILE` variable may name: 64 KiB. A bigger one
+/// is [`EnvError::FileTooLarge`], with at most one byte past this read.
+pub const MAX_SECRET_FILE_BYTES: usize = 64 * 1024;
+
+/// Why [`read_secret_file`] refused a file before or while reading it,
+/// carried inside the `io::Error` so the `_lookup` functions' reader
+/// signature stays `Fn(&str) -> io::Result<String>`.
+#[derive(Debug, thiserror::Error)]
+enum FileRefused {
+    #[error("not a regular file")]
+    NotAFile,
+    #[error("over the size limit")]
+    TooLarge,
+}
+
+/// The file reader every `_env` function uses: a regular file only (checked
+/// on the path before opening — opening a FIFO blocks until a writer comes —
+/// and again on the open file), at most [`MAX_SECRET_FILE_BYTES`] + 1 bytes
+/// of it, UTF-8. The bytes read are wiped once copied into the `String`.
+fn read_secret_file(path: &str) -> io::Result<String> {
+    let refused = |why| io::Error::new(io::ErrorKind::InvalidInput, why);
+    if !std::fs::metadata(path)?.is_file() {
+        return Err(refused(FileRefused::NotAFile));
+    }
+    let file = std::fs::File::open(path)?;
+    if !file.metadata()?.is_file() {
+        return Err(refused(FileRefused::NotAFile));
+    }
+    let mut bytes = Zeroizing::new(Vec::new());
+    file.take(MAX_SECRET_FILE_BYTES as u64 + 1)
+        .read_to_end(&mut bytes)?;
+    if bytes.len() > MAX_SECRET_FILE_BYTES {
+        return Err(refused(FileRefused::TooLarge));
+    }
+    std::str::from_utf8(&bytes).map(str::to_owned).map_err(|_| {
+        io::Error::new(
+            io::ErrorKind::InvalidData,
+            "stream did not contain valid UTF-8",
+        )
+    })
+}
+
+/// The [`EnvError`] for a failed `<var>_FILE` read: [`EnvError::NotAFile`]
+/// or [`EnvError::FileTooLarge`] for [`read_secret_file`]'s own refusals,
+/// [`EnvError::ReadFailed`] for anything else.
+fn file_error(var: &str, path: String, source: io::Error) -> EnvError {
+    let var = var.to_string();
+    match source
+        .get_ref()
+        .and_then(|e| e.downcast_ref::<FileRefused>())
+    {
+        Some(FileRefused::NotAFile) => EnvError::NotAFile { var, path },
+        Some(FileRefused::TooLarge) => EnvError::FileTooLarge { var, path },
+        None => EnvError::ReadFailed { var, path, source },
+    }
 }
 
 fn join_errors(errors: &[EnvError]) -> String {
@@ -127,6 +250,10 @@ pub const NEXT_KEY_LABEL: &str = "next";
 /// # Errors
 ///
 /// - [`EnvError::BothSet`] when `var` and `<var>_FILE` are both set.
+/// - [`EnvError::NotAFile`] when `<var>_FILE` names something other than a
+///   regular file (a directory, a FIFO, `/dev/zero`).
+/// - [`EnvError::FileTooLarge`] when that file is over
+///   [`MAX_SECRET_FILE_BYTES`].
 /// - [`EnvError::ReadFailed`] when the file named by `<var>_FILE` cannot be
 ///   read.
 /// - [`EnvError::EmptyFile`] when that file is empty after trimming.
@@ -149,11 +276,7 @@ pub const NEXT_KEY_LABEL: &str = "next";
 /// }
 /// ```
 pub fn secret_from_env(var: &str) -> Result<Option<String>, EnvError> {
-    secret_from_lookup(
-        var,
-        |v| std::env::var(v).ok(),
-        |path| std::fs::read_to_string(path),
-    )
+    secret_from_lookup(var, |v| std::env::var(v).ok(), read_secret_file)
 }
 
 /// [`secret_from_env`] with the variable lookup and file reader injected, so
@@ -162,7 +285,8 @@ pub fn secret_from_env(var: &str) -> Result<Option<String>, EnvError> {
 /// `std::env::set_var` or touching the real filesystem.
 ///
 /// `lookup` returns a variable's value (or `None` when unset); `read_file`
-/// reads the file at a path. `read_file` is called only when `<var>_FILE` is
+/// reads the file at a path (what it returns is held to
+/// [`MAX_SECRET_FILE_BYTES`] as a real file is). `read_file` is called only when `<var>_FILE` is
 /// set and `var` is not.
 ///
 /// # Errors
@@ -227,11 +351,16 @@ fn secret_zeroizing(
         }),
         (Some(v), None) => Ok(Some(Zeroizing::new(v.trim().to_string()))),
         (None, Some(path)) => {
-            let raw = Zeroizing::new(read_file(&path).map_err(|source| EnvError::ReadFailed {
-                var: var.to_string(),
-                path: path.clone(),
-                source,
-            })?);
+            let raw = Zeroizing::new(
+                read_file(&path).map_err(|source| file_error(var, path.clone(), source))?,
+            );
+            // An injected reader is held to the same cap as the real one.
+            if raw.len() > MAX_SECRET_FILE_BYTES {
+                return Err(EnvError::FileTooLarge {
+                    var: var.to_string(),
+                    path,
+                });
+            }
             let value = Zeroizing::new(raw.trim().to_string());
             if value.is_empty() {
                 return Err(EnvError::EmptyFile {
@@ -301,11 +430,7 @@ fn secret_zeroizing(
 /// }
 /// ```
 pub fn static_tokens_from_env(var: &str) -> Result<Option<StaticTokens>, EnvError> {
-    static_tokens_from_lookup(
-        var,
-        |v| std::env::var(v).ok(),
-        |path| std::fs::read_to_string(path),
-    )
+    static_tokens_from_lookup(var, |v| std::env::var(v).ok(), read_secret_file)
 }
 
 /// [`static_tokens_from_env`] with the variable lookup and file reader
@@ -439,7 +564,10 @@ fn error_text(err: &EnvError) -> String {
 fn error_keys(err: &EnvError) -> Vec<String> {
     match err {
         EnvError::BothSet { var, .. } => vec![var.clone(), format!("{var}_FILE")],
-        EnvError::ReadFailed { var, .. } | EnvError::EmptyFile { var, .. } => {
+        EnvError::ReadFailed { var, .. }
+        | EnvError::EmptyFile { var, .. }
+        | EnvError::NotAFile { var, .. }
+        | EnvError::FileTooLarge { var, .. } => {
             vec![format!("{var}_FILE")]
         }
         EnvError::NextWithoutCurrent { var } => vec![var.clone(), format!("{var}_NEXT")],
@@ -589,11 +717,7 @@ impl IdentifyingVars {
 /// # }
 /// ```
 pub fn oauth_config_from_env(prefix: &str) -> Result<Option<ResolvedOAuthConfig>, ConfigError> {
-    oauth_config_from_lookup(
-        prefix,
-        |v| std::env::var(v).ok(),
-        |path| std::fs::read_to_string(path),
-    )
+    oauth_config_from_lookup(prefix, |v| std::env::var(v).ok(), read_secret_file)
 }
 
 /// [`oauth_config_from_env`] with the variable lookup and file reader
@@ -806,11 +930,7 @@ fn reconcile(problems: Vec<String>, details: Vec<ConfigProblem>) -> Vec<ConfigPr
 /// problems carried in [`EnvOAuthConfig::problems`] rather than returned
 /// here, so [`EnvOAuthConfig::resolve`] reports them together with its own.
 pub fn unresolved_oauth_config_from_env(prefix: &str) -> Option<EnvOAuthConfig> {
-    unresolved_oauth_config_from_lookup(
-        prefix,
-        |v| std::env::var(v).ok(),
-        |path| std::fs::read_to_string(path),
-    )
+    unresolved_oauth_config_from_lookup(prefix, |v| std::env::var(v).ok(), read_secret_file)
 }
 
 /// [`unresolved_oauth_config_from_env`] with the variable lookup and file
@@ -891,6 +1011,15 @@ where
     }
 
     cfg.required_scope = take(field("required_scope"), &mut problems);
+    // A set-but-blank value reads as unset above (every variable does); for
+    // this one, as in a config file, blank is always an error
+    // (`BlankRequiredScope` from `resolve`), never "no scope configured".
+    if cfg.required_scope.is_none()
+        && lookup(&naming.key("required_scope"))
+            .is_some_and(|v| !v.is_empty() && v.trim().is_empty())
+    {
+        cfg.required_scope = Some(String::new());
+    }
     if let Some(v) = take(field("required_scopes"), &mut problems) {
         cfg.required_scopes = split_list(&v);
     }
@@ -939,7 +1068,20 @@ where
         // string, number or boolean, which a whitespace-split list cannot
         // carry. `resolve` checks the entries themselves.
         match serde_json::from_str::<serde_json::Value>(&v) {
-            Ok(serde_json::Value::Object(map)) => cfg.required_claims = map.into_iter().collect(),
+            Ok(serde_json::Value::Object(map)) => match duplicated_claim(&v) {
+                // `serde_json::Map` keeps the last of a repeated key; which
+                // one an operator meant is not ours to guess.
+                Some(name) => problems.push(ConfigProblem::new(
+                    ProblemKind::InvalidRequiredClaim,
+                    [naming.key("required_claims")],
+                    format!(
+                        "{} names {:?} more than once — each claim may appear once",
+                        naming.key("required_claims"),
+                        crate::token::for_log(&name)
+                    ),
+                )),
+                None => cfg.required_claims = map.into_iter().collect(),
+            },
             Ok(_) => problems.push(ConfigProblem::new(
                 ProblemKind::EnvParse,
                 [naming.key("required_claims")],
@@ -2057,6 +2199,168 @@ mod tests {
                     vec!["APP_OAUTH_REQUIRED_CLAIMS".to_string()]
                 ),
             ]
+        );
+    }
+
+    // ── _FILE hardening, duplicates and blank scopes ─────────────────────────
+
+    /// A path in the system temp directory unique to this test and process.
+    fn temp_path(name: &str) -> std::path::PathBuf {
+        std::env::temp_dir().join(format!(
+            "oauth-resource-server-{}-{name}",
+            std::process::id()
+        ))
+    }
+
+    #[test]
+    fn a_file_var_naming_a_directory_is_not_a_file_and_is_never_read() {
+        let dir = std::env::temp_dir();
+        let dir = dir.to_str().unwrap().to_string();
+        let lookup = |name: &str| (name == "KEY_FILE").then(|| dir.clone());
+        match secret_from_lookup("KEY", lookup, read_secret_file) {
+            Err(EnvError::NotAFile { var, path }) => {
+                assert_eq!((var.as_str(), path.as_str()), ("KEY", dir.as_str()));
+            }
+            other => panic!("{other:?}"),
+        }
+        let err = secret_from_lookup("KEY", lookup, read_secret_file).unwrap_err();
+        assert_eq!(
+            err.to_string(),
+            format!("KEY_FILE={dir}: not a regular file")
+        );
+        assert_eq!(error_keys(&err), ["KEY_FILE"]);
+    }
+
+    #[test]
+    fn a_file_over_the_cap_is_refused_and_one_at_the_cap_is_read() {
+        let over = temp_path("over-cap");
+        let at = temp_path("at-cap");
+        std::fs::write(&over, "x".repeat(MAX_SECRET_FILE_BYTES + 1)).unwrap();
+        std::fs::write(&at, "y".repeat(MAX_SECRET_FILE_BYTES)).unwrap();
+        let over_s = over.to_str().unwrap().to_string();
+        let at_s = at.to_str().unwrap().to_string();
+        let result_over = secret_from_lookup(
+            "KEY",
+            |n: &str| (n == "KEY_FILE").then(|| over_s.clone()),
+            read_secret_file,
+        );
+        let result_at = secret_from_lookup(
+            "KEY",
+            |n: &str| (n == "KEY_FILE").then(|| at_s.clone()),
+            read_secret_file,
+        );
+        let _ = std::fs::remove_file(&over);
+        let _ = std::fs::remove_file(&at);
+        match result_over {
+            Err(EnvError::FileTooLarge { var, path }) => {
+                assert_eq!((var.as_str(), path.as_str()), ("KEY", over_s.as_str()));
+            }
+            other => panic!("{:?}", other.map(|v| v.map(|s| s.len()))),
+        }
+        assert_eq!(result_at.unwrap().unwrap().len(), MAX_SECRET_FILE_BYTES);
+
+        // An injected reader is held to the same cap.
+        let big = "z".repeat(MAX_SECRET_FILE_BYTES + 1);
+        let err = secret_from_lookup(
+            "KEY",
+            |n: &str| (n == "KEY_FILE").then(|| "/run/secrets/key".to_string()),
+            |_: &str| Ok(big.clone()),
+        )
+        .unwrap_err();
+        assert!(matches!(err, EnvError::FileTooLarge { .. }), "{err:?}");
+        // ...and a config variable's file too, reported as an env problem.
+        let vars = HashMap::from([
+            ("APP_OAUTH_ISSUER_FILE", "/run/secrets/issuer"),
+            ("APP_OAUTH_AUDIENCE", "client-a"),
+            ("APP_OAUTH_RESOURCE", "https://kb.example.test/"),
+        ]);
+        let err =
+            oauth_config_from_lookup("APP_OAUTH_", lookup_from(&vars), |_: &str| Ok(big.clone()))
+                .unwrap_err();
+        assert_eq!(err.problem_details()[0].kind(), ProblemKind::EnvLoad);
+        assert_eq!(err.problem_details()[0].keys(), ["APP_OAUTH_ISSUER_FILE"]);
+    }
+
+    #[test]
+    fn a_readable_small_file_still_reads_and_trims() {
+        let path = temp_path("small");
+        std::fs::write(&path, "s3cret\n").unwrap();
+        let p = path.to_str().unwrap().to_string();
+        let got = secret_from_lookup(
+            "KEY",
+            |n: &str| (n == "KEY_FILE").then(|| p.clone()),
+            read_secret_file,
+        );
+        let missing = secret_from_lookup(
+            "KEY",
+            |n: &str| (n == "KEY_FILE").then(|| format!("{p}-missing")),
+            read_secret_file,
+        );
+        let _ = std::fs::remove_file(&path);
+        assert_eq!(got.unwrap().as_deref(), Some("s3cret"));
+        assert!(
+            matches!(missing, Err(EnvError::ReadFailed { .. })),
+            "{missing:?}"
+        );
+    }
+
+    /// `serde_json::Map` keeps the last of a repeated key; `REQUIRED_CLAIMS`
+    /// naming a claim twice is refused instead, never read as either value.
+    #[test]
+    fn a_claim_named_twice_in_required_claims_is_refused() {
+        let files = HashMap::new();
+        for json in [
+            r#"{"tid": "good", "tid": "evil"}"#,
+            r#"{"a": 1, "tid": "good", "b": true, "tid": "good"}"#,
+        ] {
+            let mut vars = policy_vars();
+            vars.insert("APP_OAUTH_REQUIRED_CLAIMS", json);
+            let err =
+                oauth_config_from_lookup("APP_OAUTH_", lookup_from(&vars), files_from(&files))
+                    .unwrap_err();
+            let details = err.problem_details();
+            assert_eq!(details.len(), 1, "{err}");
+            assert_eq!(details[0].kind(), ProblemKind::InvalidRequiredClaim);
+            assert_eq!(details[0].keys(), ["APP_OAUTH_REQUIRED_CLAIMS"]);
+            assert!(err.problems[0].contains("\"tid\" more than once"), "{err}");
+            assert!(!err.problems[0].contains("evil"), "{err}");
+        }
+    }
+
+    /// A whitespace-only `REQUIRED_SCOPE` is the config file's
+    /// `BlankRequiredScope`, not "unset" — which, with
+    /// `ALLOW_UNSCOPED_TOKENS=true`, would have meant no scope check at all.
+    #[test]
+    fn a_blank_required_scope_variable_is_an_error_not_unset() {
+        let files = HashMap::new();
+        for allow_unscoped in [None, Some("true")] {
+            let mut vars = policy_vars();
+            vars.insert("APP_OAUTH_REQUIRED_SCOPE", "   ");
+            if let Some(v) = allow_unscoped {
+                vars.insert("APP_OAUTH_ALLOW_UNSCOPED_TOKENS", v);
+            }
+            let err =
+                oauth_config_from_lookup("APP_OAUTH_", lookup_from(&vars), files_from(&files))
+                    .unwrap_err();
+            let kinds: Vec<_> = err.problem_details().iter().map(|p| p.kind()).collect();
+            assert!(kinds.contains(&ProblemKind::BlankRequiredScope), "{err}");
+            assert!(
+                err.problem_details()
+                    .iter()
+                    .any(|p| p.keys() == ["APP_OAUTH_REQUIRED_SCOPE"]),
+                "{err}"
+            );
+        }
+        // Empty is still plain unset.
+        let mut vars = policy_vars();
+        vars.insert("APP_OAUTH_REQUIRED_SCOPE", "");
+        vars.insert("APP_OAUTH_REQUIRE_AT_JWT", "true");
+        assert!(
+            oauth_config_from_lookup("APP_OAUTH_", lookup_from(&vars), files_from(&files))
+                .unwrap()
+                .unwrap()
+                .required_scopes
+                .is_empty()
         );
     }
 

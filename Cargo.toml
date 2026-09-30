@@ -37,7 +37,10 @@ default = ["rustls-tls"]
 # (webpki-roots): it ignores the OS trust store and SSL_CERT_FILE, so an
 # authorization server behind a private CA needs one of the other two.
 rustls-tls = ["reqwest/rustls-tls"]
-# rustls, trusting the operating system's certificate store instead.
+# rustls, trusting the operating system's certificate store: added to the
+# Mozilla roots while `rustls-tls` (the default) is on too, since reqwest
+# loads both into one root store; instead of them only with
+# `default-features = false`.
 rustls-tls-native-roots = ["reqwest/rustls-tls-native-roots"]
 # The platform TLS library (OpenSSL on Linux), trusting the OS store.
 native-tls = ["reqwest/native-tls"]

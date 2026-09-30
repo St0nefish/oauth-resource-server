@@ -78,13 +78,13 @@ oauth-resource-server = { version = "0.2", features = ["axum", "serde"] }
 | Feature | Default | What it enables |
 |---|---|---|
 | `rustls-tls` | yes | The rustls TLS backend for fetching the JWKS and discovery documents, trusting **only the Mozilla root certificates compiled into the binary**. |
-| `rustls-tls-native-roots` | no | rustls, trusting the operating system's certificate store instead (for an authorization server behind a private CA). |
+| `rustls-tls-native-roots` | no | rustls, trusting the operating system's certificate store (for an authorization server behind a private CA) — **in addition to** the Mozilla roots while the default `rustls-tls` is on too (reqwest merges both into one root store), and **instead of** them only with `default-features = false`. |
 | `native-tls` | no | The platform TLS backend (OpenSSL on Linux), trusting the operating system's certificate store. Enabled together with a rustls feature, it is the one used (reqwest's choice), so the OS store applies rather than the Mozilla roots. |
-| `serde` | no | `Deserialize`/`Serialize` for `OAuthConfig`, to load it from YAML, TOML, JSON or any other serde format. |
+| `serde` | no | `Deserialize`/`Serialize` for `OAuthConfig`, to load it from YAML, TOML, JSON or any other serde format, and `Serialize` for `InvalidToken` (as its kind label, never the log-only detail). |
 | `env` | no | The `env` module: load the config and secrets from environment variables, with `VAR_FILE` support. |
 | `tower` | no | The `http_layer` module: `HttpAuthLayer`, an authentication layer for any `tower` service over `http::Request<B>` (hyper, tonic, ...), whatever its body types. See [Using with other frameworks](#using-with-other-frameworks). |
 | `axum` | no | The `axum` module: the `AuthLayer` middleware, `metadata_router`, axum extractors for `Credential` and `AuthorizedToken`, and per-route scopes (`RequireScopes`, the `Scoped<S>` extractor). Implies `tower`. |
-| `mcp` | no | The `mcp` module, an integration helper for [Model Context Protocol](https://modelcontextprotocol.io) servers: `McpToolScopes`, a tower layer that requires scopes per tool by reading the JSON-RPC `tools/call` in the request body. `serde_json` only, no MCP SDK. Implies `tower`. See [Per-tool scopes](#per-tool-scopes-mcptoolscopes). |
+| `mcp` | no | The `mcp` module, an integration helper for [Model Context Protocol](https://modelcontextprotocol.io) servers: `McpToolScopes`, a tower layer that requires scopes per tool by reading the JSON-RPC `tools/call` in the request body. No MCP SDK: it parses with `serde_json` and reads the body with `http-body` and `bytes`, all already in every build. Implies `tower`. See [Per-tool scopes](#per-tool-scopes-mcptoolscopes). |
 | `metrics` | no | Counters and a gauge for authentication decisions and JWKS refreshes, through the [`metrics`](https://docs.rs/metrics) facade, and the `observability` module naming them. See [Observability](#observability). Off, it adds no dependency and records nothing. |
 | `testing` | no | A fake authorization server (`TestAuthority`), a fluent token builder, and the throwaway signing keys behind them, for **your tests only**. Never enable it in a production build. It follows semver like the rest of the crate. |
 
@@ -107,7 +107,18 @@ under it. Either add the CA in code with
 `OAuthValidator::builder(..).add_root_certificate_pem(..)`, which works with
 every backend, or use `rustls-tls-native-roots` (rustls plus the OS store) or
 `native-tls` (the platform library plus the OS store) and install the CA into
-the OS store as usual. With `native-tls` and a rustls feature both enabled,
+the OS store as usual. `rustls-tls-native-roots` **adds** the OS store to the
+Mozilla roots while the default `rustls-tls` feature stays on — reqwest loads
+both into one root store — so to trust the OS store *instead*, turn the
+defaults off:
+
+```toml
+[dependencies]
+oauth-resource-server = { version = "0.2", default-features = false, features = ["rustls-tls-native-roots", "axum", "serde"] }
+```
+
+(and the same `default-features = false` on any `[dev-dependencies]` entry,
+for the reason given below for `native-tls`). With `native-tls` and a rustls feature both enabled,
 reqwest uses native-tls, so the OS store is what applies (and what
 `add_root_certificate_pem` adds to), not the Mozilla roots.
 
@@ -1091,8 +1102,11 @@ static-only layer), `oauth` for an OAuth access token (including a
 credential that was neither, when OAuth is configured: the refusal comes from
 the validator), and `none` when no credential was presented or none could be
 checked. `misconfigured` marks the `error`-level "Server misconfiguration"
-events (a route no layer covers, a required extractor or scope behind
-`allow_unauthenticated`, scopes behind a layer with no validator).
+events: wirings no request can satisfy, such as a route no layer covers, a
+required extractor or scope behind `allow_unauthenticated` (with no enforcing
+layer around it), an `AuthorizedToken` or `Scoped` extractor or scopes behind
+a layer with no validator, and a `StaticTokenMatch` extractor behind a layer
+with no static token.
 
 The events, at the levels the module docs list (targets
 `oauth_resource_server::axum` and `oauth_resource_server::http_layer`):
@@ -1103,7 +1117,7 @@ The events, at the levels the module docs list (targets
 | `Static bearer auth accepted` | `debug` | `accepted` |
 | `No credential presented; optional auth passes the request through` | `debug` | `passed_through` |
 | `No bearer credential presented` | `debug` | `rejected` (`missing`, with OAuth configured) |
-| `OAuth bearer auth rejected` / `Bearer auth rejected` | `warn` | `rejected` |
+| `OAuth bearer auth rejected` / `Bearer auth rejected` | `warn` | `rejected` (including a layer's 403 `insufficient_scope` for the validator's own required scopes, which the validator also logs at `info`: `OAuth token is valid but lacks the required scope`) |
 | `The credential lacks the scopes this route requires` / `… this handler requires` | `info` | `rejected` (`insufficient_scope`, 403) |
 | `Server misconfiguration: …` | `error` | `rejected` (`misconfigured`) |
 
@@ -1212,8 +1226,8 @@ error messages spell them (`KeyNaming::Dotted("oauth")` gives `oauth.issuer`,
 | `scopes_supported` | `Option<Vec<String>>` | `None`, which resolves to the required scopes | The scopes advertised in the metadata document and in the 401 challenge. Declarative only; each entry a scope-token. **List every required scope here** if you set it: clients request what is advertised, and a required scope they are not told about means 403 on every call. An explicit `[]` advertises nothing: the metadata omits `scopes_supported` (RFC 9728 §3.2) and the 401 names the required scopes instead. **This default is identical on the `serde` and `env` paths** — `resolve` applies it either way, so a serde user who sets only `required_scope` gets the same advertised scopes an env user does. The one path-specific difference is in [Environment variables](#environment-variables): the `env` loader cannot express an explicit empty list. |
 | `scope_claims` | `Vec<String>` | `["scope", "scp"]` | The claims scopes are read from. Each is read as a space-delimited string or an array of strings, and the results are combined. Must not be empty. |
 | `principal_claims` | `Vec<String>` | `["preferred_username", "sub"]` | Claims tried in order to name the caller in logs (`AuthorizedToken::principal`). `email` is left out so addresses do not reach logs unless you add it. |
-| `algorithms` | `Vec<String>` | `RS256 RS384 RS512 PS256 PS384 PS512 ES256 ES384 EdDSA` | The signature algorithms a token may use, as case-sensitive JWS names. `HS256`, `HS384`, `HS512` and `none` are always refused. |
-| `leeway_secs` | `u64` | `60` | Clock-skew allowance for `exp` and `nbf`. At most `300`; a larger value is an error, not clamped. |
+| `algorithms` | `Vec<String>` | `RS256 RS384 RS512 PS256 PS384 PS512 ES256 ES384 EdDSA` | The signature algorithms a token may use, as case-sensitive JWS names. `HS256`, `HS384`, `HS512` and `none` are always refused. A JWKS key on a curve the verifier cannot use (P-521, whose `ES512` `ring` does not verify) or not meant for signatures (X25519, X448) is skipped whatever this lists, as is an RSA key whose modulus is not 2048 to 8192 bits. |
+| `leeway_secs` | `u64` | `60` | Clock-skew allowance for `exp` and `nbf`, and for `max_token_age_secs`' `iat` checks. At most `MAX_LEEWAY_SECS` (`300`); a larger value is an error, not clamped. |
 | `require_at_jwt` | `bool` | `false` | Require the token header's `typ` to be `at+jwt` (or `application/at+jwt`), as RFC 9068 §4 requires. Off is a deliberate, documented deviation; see [ID tokens](#id-tokens-and-the-lenient-typ-default). Turn it on if your server emits it. |
 | `allow_unscoped_tokens` | `bool` | `false` | Accept a config with no required scope and `require_at_jwt` off. Without it, `resolve` refuses that combination, because it would accept OIDC ID tokens as access tokens. |
 | `allow_insecure_http` | `bool` | `false` | Accept a plain-`http` `issuer`, `jwks_uri` or `resource` on a non-loopback host, for an in-cluster address on a trusted network. Also governs a `jwks_uri` discovered from a plain-`http` issuer and every redirect followed while fetching keys. Loopback hosts never need it. |
@@ -1284,6 +1298,13 @@ refused one is a `ValidatorError`, never silently dropped.
 Every fetch whose URL is on a loopback host (`localhost`, `*.localhost`,
 `127.0.0.0/8`, `::1`) uses a separate client with no proxy of any kind, so a
 loopback fetch never goes through a proxy, explicit or from the environment.
+`localhost` and `*.localhost` are recognized **by name**, so that client also
+resolves every name itself, to `::1` and `127.0.0.1` (keeping the URL's
+port), never through DNS: some resolvers (musl, glibc without
+nss-myhostname, some container DNS servers) forward `*.localhost` upstream,
+where whoever controls that DNS could otherwise receive a cleartext,
+proxy-free key fetch. A fetch that starts on a loopback URL may not be
+redirected off loopback at all.
 Every other fetch uses reqwest's own proxy handling untouched: the
 `HTTP_PROXY`/`HTTPS_PROXY`/`ALL_PROXY`/`NO_PROXY` environment variables (and,
 on macOS and Windows, the system proxy settings when reqwest's `system-proxy`
@@ -1380,16 +1401,25 @@ ways:
   (`MAX_TOKEN_AGE_SECS` unset means no age check).
 - **`REQUIRED_CLAIMS`** is one JSON object:
   `MYAPP_OAUTH_REQUIRED_CLAIMS='{"tid": "<tenant id>", "groups": "api-users"}'`.
-  Anything but a JSON object is an `EnvParse` problem.
+  Anything but a JSON object is an `EnvParse` problem; an object naming one
+  claim twice is `InvalidRequiredClaim`, never "the last one wins" (a config
+  file naming one twice fails to deserialize, for the same reason).
 - **Values are trimmed.** A variable that is empty after trimming counts as
-  unset, but a `_FILE` whose contents are empty after trimming is an error.
+  unset — except `REQUIRED_SCOPE`: set to whitespace only, it is
+  `BlankRequiredScope`, as a blank `required_scope` in a config file is, never
+  "no scope". A `_FILE` whose contents are empty after trimming is an error.
   Setting both `VAR` and `VAR_FILE` is an error.
+- **A `_FILE` must be a regular file of at most 64 KiB**
+  (`env::MAX_SECRET_FILE_BYTES`). A directory, FIFO or device (`/dev/zero`)
+  is refused before it is opened (`EnvError::NotAFile`), and a bigger file
+  after reading one byte past the limit (`EnvError::FileTooLarge`), so a
+  wrong path can neither block startup nor exhaust memory.
 - **Every problem is reported at once.** Load and parse problems are listed in
   one `ConfigError` together with the problems `resolve` finds. Loader
   problems have kind `ProblemKind::EnvLoad` (a variable or `_FILE` that could
   not be read) or `ProblemKind::EnvParse` (a value that did not parse), and
   `keys()` names the variables to look at (`VAR` and `VAR_FILE` when both were
-  set, `VAR_FILE` when its file could not be read or was empty, the variable
+  set, `VAR_FILE` when its file could not be used, the variable
   itself for a parse problem); `EnvOAuthConfig::problem_details()` lists them
   before `resolve`. A `problems` entry you edit or add on the loaded value
   reaches the `ConfigError` as `ProblemKind::Other`.
@@ -1405,8 +1435,9 @@ A static API key is not an `OAuthConfig` field; it is read on its own:
 | `secret_from_env(var)` | `<VAR>` or `<VAR>_FILE` | the one key, or `None` |
 | `static_tokens_from_env(var)` | the above, plus `<VAR>_NEXT` or `<VAR>_NEXT_FILE` | a `StaticTokens` set: `"current"`, and `"next"` while a rotation is under way (one entry when the two are equal), or `None`; `<VAR>_NEXT` without `<VAR>` is an error |
 
-Both trim values, treat a blank variable as unset, refuse an empty `_FILE`,
-and refuse a variable set together with its `_FILE`. See
+Both trim values, treat a blank variable as unset, refuse an empty,
+oversized or not-a-regular `_FILE`, and refuse a variable set together with
+its `_FILE`. See
 [Rotating a static API key](#rotating-a-static-api-key-with-zero-downtime).
 
 ## Security model
@@ -1417,7 +1448,8 @@ For each candidate credential, `OAuthValidator::validate`:
 
 1. **Refuses what it can from the unverified header, before any key lookup:**
    an empty credential (`Missing`), one over 16 KiB, one that is not three
-   dot-separated segments (not a JWT), a header that does not parse, a header
+   dot-separated segments (not a JWT), a header that does not parse (a `kid`
+   that is present but not a string, `"kid": null` included, is one), a header
    that lists critical extensions in `crit` (RFC 7515 §4.1.11: this crate
    understands none, so any `crit`, even an empty one, is refused), an `alg`
    not in `algorithms`, and a `typ` that is not an access-token type. Junk
@@ -1429,7 +1461,8 @@ For each candidate credential, `OAuthValidator::validate`:
 3. **Verifies the signature, `iss`, `aud`, `exp` and `nbf` in one
    `jsonwebtoken::decode` call,** so no claim check can run apart from the
    signature check. `exp`, `iss` and `aud` must be present; `nbf` is checked
-   when present; `leeway_secs` applies to both times.
+   when present; `leeway_secs` applies to both times (and to the `iat` checks
+   of `max_token_age_secs`).
 4. **Re-checks the claims the decoder does not police:** `iss` must be a
    single string equal to `issuer`, byte for byte (the decoder alone would
    accept an array containing it); a present `nbf` must be a NumericDate, a
@@ -1520,13 +1553,15 @@ an `InvalidToken`'s `kind()` names the check that failed).
   credential the caller meant. A custom `on_reject` cannot remove it, and a
   config whose challenge would not be a valid header makes
   `AuthLayerBuilder::build` fail rather than send challenge-less 401s (the
-  validator itself then logs at `error` and falls back to a bare `Bearer`
-  challenge, so `refusal()` never returns a header a line break could
-  split). With
+  validator itself then logs at `error` and falls back to a minimal
+  `Bearer error="…"` challenge — its `scope` only when that is valid, no
+  `resource_metadata` — so `refusal()` never returns a header a line break
+  could split). With
   only a static token, 401s carry `Bearer error="invalid_token"` unless the
   application opts out with `static_challenge(None)`. The status and the
-  challenge are decided by one function, `refusal()`, which the axum layer,
-  the tower layer and a hand-built integration all use, so the three cannot
+  challenge are decided in one place: the crate-private decision behind the
+  public `refusal()` is the same one the axum layer and the tower layer call,
+  so a hand-built integration on `refusal()` and either layer cannot
   disagree about a refusal.
 - **Weak configurations are refused, not just logged.** `resolve` refuses a
   plain-`http` `issuer`, `jwks_uri` or `resource` on a non-loopback host, a
@@ -1544,9 +1579,14 @@ an `InvalidToken`'s `kind()` names the check that failed).
   metadata names, but that document is used only when its `issuer` equals the
   configured one byte-for-byte, and it may not downgrade an `https` issuer to
   `http`. Responses are capped at 256 KiB and 64 keys, fetches time out after
-  10 seconds (1 to 60 s with `fetch_timeout`), at most three redirects are
-  followed, a redirect from `https` to `http` is refused, and one to plain
-  `http` on a non-loopback host is refused without `allow_insecure_http`.
+  10 seconds (1 to 60 s with `fetch_timeout`), only a `2xx` answer is read,
+  at most three redirects are followed, a redirect from `https` to `http` is
+  refused, one to plain `http` on a non-loopback host is refused without
+  `allow_insecure_http`, and a fetch that starts on a loopback URL may not be
+  redirected off loopback (it runs on the proxy-free client). A discovered
+  `jwks_uri` whose fetch fails is discovered again on the next refresh, so an
+  authorization server that moves its key set is followed without a
+  restart.
   None of the [fetch options](#fetch-options-code-not-config) loosens any of
   this, and a key set passed to `initial_jwks` gets the same size cap, key cap
   and per-key checks as a fetched one.
@@ -1557,8 +1597,12 @@ an `InvalidToken`'s `kind()` names the check that failed).
   the keys. That is why a plain-`http` proxy on a non-loopback host needs no
   opt-in; a plain-`http` fetch through it already needed
   `allow_insecure_http` for its own URL, and a fetch of a loopback URL never
-  goes through any proxy, explicit or from the environment. One residual:
-  the proxy-free client is chosen from the URL a fetch starts at, so a
+  goes through any proxy, explicit or from the environment. The proxy-free
+  client is chosen from the URL a fetch starts at; a redirect from a loopback
+  URL to a non-loopback one is refused, so that client never carries a hop
+  the operator's proxy should have seen, and it resolves every name to
+  loopback itself, so `localhost`/`*.localhost` — exempted by name — never
+  reach DNS. One residual: a
   redirect from a non-loopback URL to a loopback one is followed by the
   normal client and, with an environment or system proxy (never an explicit
   one, which skips loopback hosts), can go through it, as it always has.
@@ -2017,8 +2061,8 @@ fits MCP's authorization model:
 With the `mcp` feature, `oauth_resource_server::mcp::McpToolScopes` is a tower
 layer for the MCP endpoint, placed behind the auth layer. It gives every
 request a default requirement and each named tool its own, reading the tool
-name from a `tools/call` in the POST body (the same example is compiled in
-the `mcp` module's documentation):
+name from a `tools/call` in the POST body (the `mcp` module's documentation
+compiles the same layering behind an `HttpAuthLayer`):
 
 ```text
 use axum::Router;
@@ -2050,6 +2094,7 @@ needs:
 | a JSON-RPC batch | every scope any of its messages needs |
 | a body that is not JSON, a `tools/call` with no readable `params.name`, or a message repeating `method`, `params` or `params.name` | every scope in the configuration (default and all tools) |
 | a body over the limit (`body_limit`, 1 MiB by default, 4 KiB to 64 MiB) | refused with 413, unread past the limit |
+| a body that fails while it is being read (the client disconnects, a transport error) | refused with a bare 400, logged at `warn` (no challenge: nothing about the credential was wrong) |
 
 Anything it cannot classify with certainty gets the strictest set rather
 than the default, because the MCP server's parser might read that body as a
@@ -2221,6 +2266,13 @@ keys are public, so anything that trusts them trusts everyone):
 oauth-resource-server = { version = "0.2", features = ["testing"] }
 ```
 
+That keeps it out of a production build under Cargo's feature resolver
+version 2, the default since edition 2021. A package on edition 2018 or
+earlier without `resolver = "2"` uses version 1, which unifies
+dev-dependency features into `cargo build` too, so `testing` (its module and
+its public keys, though no validator path changes) would be compiled into
+the binary: set `resolver = "2"` there.
+
 `testing::TestAuthority` is a fake authorization server on a loopback port. It
 serves discovery (OpenID Connect and RFC 8414) and a JWKS, and hands you a
 config and tokens that agree with it, with neutral defaults: resource
@@ -2337,13 +2389,19 @@ fixes a vulnerability.
 A new minor release is required for:
 
 - Raising the MSRV.
-- A major-version bump of a dependency whose types appear in the public API.
-  Only `axum` and `http` qualify, under the `axum` feature: `metadata_router`
-  returns an `axum::Router<S>`, `require_auth` takes axum's `State`,
-  `Request` and `Next`, `CredentialSource` holds an `http::HeaderName`, and
-  `static_challenge` takes an `http::HeaderValue`. The JWT library is not
-  part of the API (`Algorithm` is this crate's own type), so replacing it is
-  not a breaking change.
+- A major-version bump of a dependency whose types appear in the public API:
+  `serde` and `serde_json`, always (`AuthorizedToken::claims_as` is bounded
+  by `DeserializeOwned`, `claims()` and `metadata()` return `serde_json`
+  types); `http`, `tower-layer` and `tower-service` under the `tower`
+  feature (`CredentialSource` holds an `http::HeaderName`, `static_challenge`
+  takes an `http::HeaderValue`, and both layers implement `tower_layer::Layer`
+  and their services `tower_service::Service` over `http::Request`);
+  `http-body` and `bytes` under the `mcp` feature (`McpToolScopesService`'s
+  request body is bounded by `http_body::Body + From<bytes::Bytes>`); and
+  `axum` under the `axum` feature (`metadata_router` returns an
+  `axum::Router<S>`, `require_auth` takes axum's `State`, `Request` and
+  `Next`). The JWT library is not part of the API (`Algorithm` is this
+  crate's own type), so replacing it is not a breaking change.
 - A new configuration field. Types that may grow are `#[non_exhaustive]`, but
   `OAuthConfig` deliberately is not, so it can be built with struct-literal
   syntax.

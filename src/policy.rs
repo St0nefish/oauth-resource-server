@@ -87,10 +87,12 @@ pub struct NoAuthConfigured;
 ///
 /// - `static_token`: the configured secret, read by the caller (from an
 ///   environment variable, a file, a vault...) so this stays a pure, testable
-///   function. `Some("")` counts as unset. Whitespace is not trimmed here — a
-///   secret loader that trims (such as the `env` feature's) does it first — and
-///   an untrimmed whitespace-only value stays configured: a blank credential is
-///   never matched, so it admits nobody rather than opening anything.
+///   function. `Some("")` counts as unset. A whitespace-only value (a
+///   secret loader that trims, such as the `env` feature's, never returns
+///   one) can never be matched, so it is not a static token either — but it
+///   is never "nothing configured": with no OAuth it is [`NoAuthConfigured`]
+///   even when `allow_unauthenticated` is set, so a blank secret can neither
+///   open the routes nor build a layer that silently admits nobody.
 /// - `oauth`: the RESOLVED OAuth config — `Some` only when OAuth is genuinely
 ///   on ([`crate::OAuthConfig::resolve`] returns `None` for a disabled block) —
 ///   so neither `accept_static_bearer: false` nor a disabled OAuth block can be
@@ -131,13 +133,17 @@ pub fn static_token_policy(
     oauth: Option<&ResolvedOAuthConfig>,
     allow_unauthenticated: bool,
 ) -> Result<StaticTokenDecision, NoAuthConfigured> {
-    let static_token = static_token.filter(|v| !v.is_empty());
+    // Set but blank: unusable as a secret, and never a reason to open up.
+    let blank = static_token
+        .as_deref()
+        .is_some_and(|v| !v.is_empty() && v.trim().is_empty());
+    let static_token = static_token.filter(|v| !v.trim().is_empty());
     match (static_token, oauth) {
         (Some(_), Some(o)) if !o.accept_static_bearer => Ok(StaticTokenDecision::StaticIgnored),
         (Some(token), Some(_)) => Ok(StaticTokenDecision::StaticAndOAuth(token)),
         (Some(token), None) => Ok(StaticTokenDecision::StaticOnly(token)),
         (None, Some(_)) => Ok(StaticTokenDecision::OAuthOnly),
-        (None, None) if allow_unauthenticated => Ok(StaticTokenDecision::Unauthenticated),
+        (None, None) if allow_unauthenticated && !blank => Ok(StaticTokenDecision::Unauthenticated),
         (None, None) => Err(NoAuthConfigured),
     }
 }
@@ -222,12 +228,27 @@ mod tests {
     }
 
     #[test]
-    fn a_whitespace_token_stays_configured() {
-        // Not trimmed here: treating it as unset would let `allow_unauthenticated`
-        // turn it into an open server; kept, it admits nobody.
+    fn a_whitespace_token_is_never_a_credential_and_never_opens_the_routes() {
+        // Kept, it would build a layer that admits nobody without saying so;
+        // treated as unset, `allow_unauthenticated` would open the server.
+        // Neither: with nothing else configured it is refused either way.
+        for blank in [" ", "  ", "\t\n"] {
+            for allow in [false, true] {
+                assert!(
+                    static_token_policy(Some(blank.into()), None, allow).is_err(),
+                    "{blank:?} allow_unauthenticated={allow}"
+                );
+            }
+            let oauth = testing::resolved_config("http://127.0.0.1:1/jwks");
+            assert_eq!(
+                static_token_policy(Some(blank.into()), Some(&oauth), true).unwrap(),
+                OAuthOnly
+            );
+        }
+        // An empty one is still plain "unset".
         assert_eq!(
-            static_token_policy(Some("  ".into()), None, true).unwrap(),
-            StaticOnly("  ".into())
+            static_token_policy(Some(String::new()), None, true).unwrap(),
+            Unauthenticated
         );
     }
 

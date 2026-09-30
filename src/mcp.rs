@@ -57,6 +57,7 @@
 //! | a JSON-RPC **batch** (an array) | every scope any of its messages requires: all of them must be authorized, or none is served |
 //! | a body that is not JSON, or a `tools/call` without a readable string `params.name`, or a message with a repeated `method`, `params` or `params.name` | the **strictest** set: the default and every tool's scopes together |
 //! | a body larger than the [limit](McpToolScopes::body_limit) | refused with 413, unread beyond the limit |
+//! | a body that fails while it is being read (a client disconnect, a transport error) | refused with a bare 400, logged at `warn` |
 //!
 //! Every request's body is read and classified, whatever the method — MCP's
 //! own transport sends JSON-RPC in `POST`s only, but another JSON-RPC server

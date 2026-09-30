@@ -4,13 +4,7 @@
 
 ## Checklist
 
-- [ ] `cargo fmt --all -- --check` passes
-- [ ] `cargo clippy --all-targets --all-features -- -D warnings` passes
-- [ ] `cargo clippy --all-targets -- -D warnings` (default features) passes
-- [ ] `cargo clippy --all-targets --no-default-features --features native-tls -- -D warnings` passes
-- [ ] `cargo test --all-features` and `cargo test` pass
-- [ ] `cargo build --examples --all-features` passes
-- [ ] `RUSTDOCFLAGS="-D warnings" cargo doc --no-deps --all-features` passes
+- [ ] The full check matrix in [CONTRIBUTING.md](../CONTRIBUTING.md#before-you-open-a-pr) passes locally (fmt, every clippy feature set, both test runs, the `rustls-tls,mcp` doctests, examples, `-D warnings` docs, `cargo audit`, `cargo deny check`, `cargo package --list`, `cargo publish --dry-run`); the msrv, semver, feature-powerset and minimal-versions jobs listed there run in CI regardless
 - [ ] Every new/changed public item has a doc comment (`# Errors`/`# Security` where relevant)
 - [ ] Docs updated in the same PR: rustdoc, `examples/` (if it demonstrates the changed surface), `README.md`, `docs/providers.md` (if provider-specific), `CHANGELOG.md`
 - [ ] If this touches token/key validation: the security invariant it affects is named below, and no invariant in `CLAUDE.md` is weakened

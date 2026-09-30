@@ -19,8 +19,10 @@ use std::collections::HashSet;
 use std::sync::{Arc, PoisonError};
 use std::time::{Duration, Instant, SystemTime};
 
+use base64::Engine as _;
+use base64::engine::general_purpose::URL_SAFE_NO_PAD;
 use jsonwebtoken::DecodingKey;
-use jsonwebtoken::jwk::{Jwk, KeyOperations, PublicKeyUse};
+use jsonwebtoken::jwk::{AlgorithmParameters, Jwk, KeyOperations, PublicKeyUse};
 use serde_json::Value;
 use tokio::sync::{Mutex, OwnedMutexGuard, RwLock};
 use tracing::{Instrument, Span, debug, info, warn};
@@ -30,7 +32,8 @@ use crate::config::{KeyNamingBuf, ResolvedOAuthConfig};
 use crate::observe::record_field;
 use crate::token::{InvalidTokenKind, TokenRejection, describe_kid, for_log};
 use crate::validator::{
-    is_canonical_url, parsed_plain_http_non_loopback, plain_http_non_loopback, url_is_loopback,
+    is_canonical_url, is_loopback_url, parsed_plain_http_non_loopback, plain_http_non_loopback,
+    url_is_loopback,
 };
 
 /// How long an unknown `kid` is allowed to trigger a JWKS refetch again.
@@ -348,9 +351,15 @@ enum Hop {
 /// non-loopback host is held to the same `allow_insecure_http` rule as a
 /// configured URL (`opt_in_key` names that setting), so a loopback `jwks_uri`
 /// or issuer cannot redirect key fetches onto a cleartext network path
-/// without the opt-in. Some servers redirect their JWKS path (a trailing-slash
-/// rewrite, say); a handful of hops covers that, and an unbounded chain only
-/// stretches a refresh out.
+/// without the opt-in. A fetch that STARTED on a loopback URL (`previous[0]`,
+/// the URL [`HttpClients::for_url`] chose the proxy-free
+/// [`HttpClients::loopback`] client for) may not leave loopback at all: that
+/// client has no proxy and resolves every name to loopback
+/// ([`LoopbackResolver`]), so a hop off loopback would either skip the
+/// explicit or environment proxy the operator set for every non-loopback
+/// fetch or connect somewhere it does not name. Some servers redirect their
+/// JWKS path (a trailing-slash rewrite, say); a handful of hops covers that,
+/// and an unbounded chain only stretches a refresh out.
 fn judge_redirect(
     next: &reqwest::Url,
     previous: &[reqwest::Url],
@@ -359,6 +368,13 @@ fn judge_redirect(
 ) -> Hop {
     if next.scheme() != "https" && previous.iter().any(|u| u.scheme() == "https") {
         return Hop::Refuse("redirect from https to a non-https URL refused".to_string());
+    }
+    if previous.first().is_some_and(is_loopback_url) && !is_loopback_url(next) {
+        return Hop::Refuse(format!(
+            "redirect from a loopback URL to a non-loopback host ({}) refused — a fetch that \
+             starts on loopback stays on loopback",
+            for_log(&redact_url(next.as_str()))
+        ));
     }
     let insecure = parsed_plain_http_non_loopback(next);
     if insecure && !allow_insecure_http {
@@ -427,7 +443,10 @@ pub(crate) struct HttpClients {
     /// environment and system proxies off once a proxy is set), skipping
     /// [`PROXY_BYPASS`].
     pub(crate) normal: reqwest::Client,
-    /// Every fetch whose URL is loopback: `no_proxy()`, no proxy of any kind.
+    /// Every fetch whose URL is loopback: `no_proxy()`, no proxy of any kind,
+    /// and [`LoopbackResolver`] in place of the system resolver, so a
+    /// `localhost`/`*.localhost` name reaches this host whatever the
+    /// resolver would have answered.
     pub(crate) loopback: reqwest::Client,
 }
 
@@ -437,12 +456,14 @@ impl HttpClients {
     /// [`HttpClients::normal`].
     ///
     /// Chosen once per fetch, from its first URL; redirects are followed
-    /// inside the chosen client. A redirect from a non-loopback URL to a
-    /// loopback one therefore stays in `normal`, and with an environment or
-    /// system proxy (never an explicit one, which skips [`PROXY_BYPASS`])
-    /// that hop can go through the proxy, as it always has. Such a hop is
-    /// either https to https — TLS end to end through a `CONNECT` tunnel,
-    /// the certificate still checked — or plain http, which
+    /// inside the chosen client. A redirect from a loopback URL to a
+    /// non-loopback one is refused by [`judge_redirect`], so the proxy-free
+    /// `loopback` client never carries a hop off this host. A redirect from a
+    /// non-loopback URL to a loopback one stays in `normal`, and with an
+    /// environment or system proxy (never an explicit one, which skips
+    /// [`PROXY_BYPASS`]) that hop can go through the proxy, as it always
+    /// has. Such a hop is either https to https — TLS end to end through a
+    /// `CONNECT` tunnel, the certificate still checked — or plain http, which
     /// [`judge_redirect`] follows only after an https-free chain and, off
     /// loopback, only with `allow_insecure_http`.
     pub(crate) fn for_url(&self, url: &str) -> &reqwest::Client {
@@ -478,8 +499,37 @@ pub(crate) fn http_clients(
         normal: normal.build()?,
         loopback: client_builder(allow_insecure_http, opt_in_key, settings)
             .no_proxy()
+            .dns_resolver(Arc::new(LoopbackResolver))
             .build()?,
     })
+}
+
+/// The [`HttpClients::loopback`] client's resolver: every name resolves to
+/// `[::1]` and `127.0.0.1`, never through DNS.
+///
+/// That client only ever fetches a URL [`url_is_loopback`] accepted — an IP
+/// literal in `127.0.0.0/8` or `::1`, which never reaches a resolver, or the
+/// NAME `localhost` or `*.localhost` — and [`judge_redirect`] keeps every
+/// redirect hop of such a fetch on loopback too. RFC 6761 §6.3 only says a
+/// resolver SHOULD answer `*.localhost` with loopback: glibc without
+/// nss-myhostname, musl and some container DNS servers forward it upstream,
+/// where anyone who controls that DNS could point it elsewhere and receive a
+/// cleartext, proxy-free key fetch the operator believed stayed on this
+/// host. Pinning the answer here makes the name-based exemption mean what it
+/// says. The port is the URL's: reqwest replaces the `0` given here with it
+/// (or the scheme's default).
+struct LoopbackResolver;
+
+impl reqwest::dns::Resolve for LoopbackResolver {
+    fn resolve(&self, _name: reqwest::dns::Name) -> reqwest::dns::Resolving {
+        let addrs: Vec<std::net::SocketAddr> = vec![
+            (std::net::Ipv6Addr::LOCALHOST, 0).into(),
+            (std::net::Ipv4Addr::LOCALHOST, 0).into(),
+        ];
+        Box::pin(std::future::ready(Ok(
+            Box::new(addrs.into_iter()) as reqwest::dns::Addrs
+        )))
+    }
 }
 
 /// A client builder with the timeout, extra roots and redirect policy both
@@ -550,9 +600,12 @@ struct Tracked {
     /// one below, so a credential in the URL never reaches a status page.
     public: KeySetStatus,
     /// The `jwks_uri` the fetch uses, unredacted: the configured one when
-    /// there is one; otherwise `None` until discovery fills it in, after
-    /// which it is fixed for the life of the process (a new value means a
-    /// config change, which means a new validator).
+    /// there is one (fixed for the life of the process — a new value means a
+    /// config change, which means a new validator); otherwise `None` until
+    /// discovery fills it in, and `None` again after a fetch of the
+    /// discovered one fails, so the next refresh re-reads the metadata (an
+    /// authorization server that moved its JWKS is followed without a
+    /// restart). The public copy keeps showing the last one discovered.
     jwks_uri: Option<String>,
     /// How many refreshes have started, stamped with `last_attempt`. Lets a
     /// refresh task that died tell whether a newer attempt has run since.
@@ -578,6 +631,9 @@ pub(crate) struct JwksStore {
     /// See [`crate::OAuthConfig::allow_insecure_http`]: whether a discovered
     /// `jwks_uri` may be plain http on a non-loopback host.
     allow_insecure_http: bool,
+    /// No `jwks_uri` is configured, so the one fetched comes from discovery
+    /// and is dropped after a failed fetch (see [`Tracked::jwks_uri`]).
+    discovers_jwks_uri: bool,
     algorithms: Vec<Algorithm>,
     naming: KeyNamingBuf,
     http: HttpClients,
@@ -624,7 +680,9 @@ impl JwksStore {
         seed: Vec<CachedKey>,
     ) -> Self {
         let mut tracked = Tracked::default();
-        tracked.set_jwks_uri(config.jwks_uri.clone().filter(|uri| !uri.trim().is_empty()));
+        let configured_uri = config.jwks_uri.clone().filter(|uri| !uri.trim().is_empty());
+        let discovers_jwks_uri = configured_uri.is_none();
+        tracked.set_jwks_uri(configured_uri);
         tracked.public.keys = seed.len();
         warn_about_new_ambiguous_keys(&[], &seed, &config.key_naming);
         let issuer_host = jwks_host(&config.issuer);
@@ -633,6 +691,7 @@ impl JwksStore {
             issuer: config.issuer.clone(),
             issuer_host,
             allow_insecure_http: config.allow_insecure_http,
+            discovers_jwks_uri,
             algorithms: config.algorithms.clone(),
             naming: config.key_naming.clone(),
             http,
@@ -915,10 +974,18 @@ impl JwksStore {
             }
         };
         let shown = redact_url(&jwks_uri);
-        let keys = self
-            .fetch_jwks(&jwks_uri)
-            .await
-            .map_err(|e| e.context(format_args!("fetching the JWKS from {shown}")))?;
+        let keys = match self.fetch_jwks(&jwks_uri).await {
+            Ok(keys) => keys,
+            Err(e) => {
+                if self.discovers_jwks_uri {
+                    // Re-read the metadata next time: the authorization
+                    // server may have moved its JWKS. The public status keeps
+                    // showing the URI that failed.
+                    self.status_fields().jwks_uri = None;
+                }
+                return Err(e.context(format_args!("fetching the JWKS from {shown}")));
+            }
+        };
         let count = keys.len();
         debug!(count, jwks_uri = %shown, "Fetched JWKS");
         let previous = std::mem::replace(&mut self.jwks.write().await.keys, keys);
@@ -1011,9 +1078,14 @@ impl JwksStore {
             .header(reqwest::header::ACCEPT, "application/json")
             .send()
             .await
-            .map_err(|e| fetch(context("request failed", &e.without_url())))?
-            .error_for_status()
-            .map_err(|e| fetch(context("non-success status", &e.without_url())))?;
+            .map_err(|e| fetch(context("request failed", &e.without_url())))?;
+        // Success only: `error_for_status` lets a 3xx through (one with no
+        // `Location`, which reqwest cannot follow), and a redirect's body is
+        // not the document asked for.
+        let status = resp.status();
+        if !status.is_success() {
+            return Err(fetch(format!("non-success status: {status}")));
+        }
         if let Some(len) = resp.content_length()
             && len > MAX_FETCH_BYTES as u64
         {
@@ -1190,6 +1262,17 @@ fn cached_key(jwk: &Jwk, allowed: &[Algorithm]) -> Option<CachedKey> {
         return None;
     }
     let ambiguous = jwk.common.key_algorithm.is_none() && algorithms.len() > 1;
+    if let AlgorithmParameters::RSA(rsa) = &jwk.algorithm
+        && !rsa_components_can_verify(&rsa.n, &rsa.e)
+    {
+        warn!(
+            kid = ?jwk.common.key_id.as_deref().map(for_log),
+            "Skipping an RSA JWKS entry that cannot verify any signature (its modulus is not \
+             2048 to 8192 bits, or its exponent is not an odd number from 3 to 2^33 - 1, \
+             minimally encoded)"
+        );
+        return None;
+    }
     match DecodingKey::from_jwk(jwk) {
         Ok(key) => Some(CachedKey {
             kid: jwk.common.key_id.clone(),
@@ -1206,6 +1289,32 @@ fn cached_key(jwk: &Jwk, allowed: &[Algorithm]) -> Option<CachedKey> {
             None
         }
     }
+}
+
+/// Whether RSA components `n` and `e` (base64url, as in a JWK) could verify
+/// any signature at all: the rules `ring`, which jsonwebtoken verifies with,
+/// applies only at verification time — an odd modulus of 2048 to 8192 bits
+/// exactly (no leading zero byte), and an odd exponent
+/// from 3 to 2^33 - 1 with no leading zero byte. A key failing them was
+/// once counted as held (`KeySetStatus::keys`, `is_ready`) while verifying
+/// nothing; skipping it here makes the count mean usable keys.
+fn rsa_components_can_verify(n: &str, e: &str) -> bool {
+    let (Ok(n), Ok(e)) = (URL_SAFE_NO_PAD.decode(n), URL_SAFE_NO_PAD.decode(e)) else {
+        return false;
+    };
+    // Bit length as ring counts it: the top byte must be non-zero (no
+    // leading zero), so the length is exact.
+    let modulus_bits = match n.first() {
+        Some(&top) if top != 0 => (n.len() - 1) * 8 + (8 - top.leading_zeros() as usize),
+        _ => 0,
+    };
+    let modulus_ok = (2048..=8192).contains(&modulus_bits) && n.last().is_some_and(|b| b & 1 == 1);
+    let exponent_ok = (1..=5).contains(&e.len())
+        && e[0] != 0
+        && e[e.len() - 1] & 1 == 1
+        && (3..=(1u64 << 33) - 1)
+            .contains(&e.iter().fold(0u64, |acc, b| (acc << 8) | u64::from(*b)));
+    modulus_ok && exponent_ok
 }
 
 /// Find the key for `kid` that can verify `alg`.
@@ -1447,38 +1556,60 @@ mod tests {
     fn redirects_are_held_to_the_insecure_http_policy() {
         let url = |s: &str| reqwest::Url::parse(s).unwrap();
         let loopback = [url("http://127.0.0.1:9000/jwks")];
+        let plain = [url("http://idp.internal.test/start")];
         let https = [url("https://auth.example.com/jwks")];
-        // Loopback http → non-loopback http: refused without the opt-in, warned with it.
-        let Hop::Refuse(reason) = judge_redirect(
-            &url("http://idp.internal.test/jwks"),
-            &loopback,
-            false,
-            OPT_IN,
-        ) else {
+        // Non-loopback http → non-loopback http: refused without the opt-in,
+        // warned with it.
+        let Hop::Refuse(reason) =
+            judge_redirect(&url("http://idp.internal.test/jwks"), &plain, false, OPT_IN)
+        else {
             panic!("a cleartext non-loopback hop must be refused without the opt-in");
         };
         assert!(reason.contains(OPT_IN), "{reason}");
         assert_eq!(
-            judge_redirect(
-                &url("http://idp.internal.test/jwks"),
-                &loopback,
-                true,
-                OPT_IN
-            ),
+            judge_redirect(&url("http://idp.internal.test/jwks"), &plain, true, OPT_IN),
             Hop::FollowInsecure
         );
-        // Loopback → loopback, and anything → https, are plain follows.
+        // A fetch that started on loopback never leaves it — https, plain
+        // http, with or without the opt-in, and after a loopback hop too:
+        // the proxy-free loopback client would carry the hop.
+        for target in [
+            "http://idp.internal.test/jwks",
+            "https://idp.example.com/keys",
+            "http://203.0.113.1/keys",
+            "http://localhost.example.test/keys",
+        ] {
+            for opt_in in [false, true] {
+                let Hop::Refuse(reason) = judge_redirect(&url(target), &loopback, opt_in, OPT_IN)
+                else {
+                    panic!("{target} after a loopback start must be refused");
+                };
+                assert!(
+                    reason.contains("loopback URL to a non-loopback host"),
+                    "{reason}"
+                );
+            }
+            let chain = [loopback[0].clone(), url("http://localhost:9000/moved")];
+            assert!(matches!(
+                judge_redirect(&url(target), &chain, true, OPT_IN),
+                Hop::Refuse(_)
+            ));
+        }
+        // Loopback → loopback, and non-loopback → https, are plain follows.
+        for target in [
+            "http://localhost:9000/keys",
+            "http://127.0.0.2:9000/keys",
+            "http://[::1]:9000/keys",
+            "http://app.localhost:9000/keys",
+        ] {
+            assert_eq!(
+                judge_redirect(&url(target), &loopback, false, OPT_IN),
+                Hop::Follow,
+                "{target}"
+            );
+        }
         assert_eq!(
-            judge_redirect(&url("http://localhost:9000/keys"), &loopback, false, OPT_IN),
-            Hop::Follow
-        );
-        assert_eq!(
-            judge_redirect(
-                &url("https://idp.example.com/keys"),
-                &loopback,
-                false,
-                OPT_IN
-            ),
+            judge_redirect(&url("https://idp.example.com/keys"), &plain, false, OPT_IN),
             Hop::Follow
         );
         // https → http is refused whatever the opt-in says, loopback included.
@@ -1646,6 +1777,110 @@ mod tests {
         let key = cached_key(&rsa_jwk(serde_json::json!({})), &[Algorithm::RS256]).unwrap();
         assert!(!key.ambiguous);
         assert_eq!(key.algorithms, [Algorithm::RS256]);
+    }
+
+    #[test]
+    fn an_rsa_key_that_cannot_verify_is_skipped() {
+        let all = all_algorithms();
+        let b64 = |bytes: &[u8]| URL_SAFE_NO_PAD.encode(bytes);
+        let mut modulus = vec![0xc5_u8; 256];
+        modulus[255] = 0x01;
+        let odd_2048 = b64(&modulus);
+        // Usable: the fixture key, and any odd 2048..=8192-bit modulus with an
+        // odd exponent from 3 up.
+        assert!(rsa_components_can_verify(crate::testing::N_A, "AQAB"));
+        assert!(rsa_components_can_verify(&odd_2048, "Aw"));
+        assert!(rsa_components_can_verify(&b64(&[0xff; 1024]), "AQAB"));
+        for (what, n, e) in [
+            ("empty e", odd_2048.clone(), String::new()),
+            ("e = 1", odd_2048.clone(), b64(&[1])),
+            ("even e", odd_2048.clone(), b64(&[0x01, 0x00, 0x00])),
+            (
+                "e with a leading zero",
+                odd_2048.clone(),
+                b64(&[0, 1, 0, 1]),
+            ),
+            (
+                "e over 2^33 - 1",
+                odd_2048.clone(),
+                b64(&[0x02, 0, 0, 0, 1]),
+            ),
+            ("e over 5 bytes", odd_2048.clone(), b64(&[1, 0, 0, 0, 0, 1])),
+            ("empty n", String::new(), "AQAB".into()),
+            ("n under 2048 bits", b64(&[0xc5; 255]), "AQAB".into()),
+            (
+                "n of 2047 bits",
+                b64(&[&[0x7f][..], &modulus[1..]].concat()),
+                "AQAB".into(),
+            ),
+            (
+                "n of 2041 bits",
+                b64(&[&[0x01][..], &modulus[1..]].concat()),
+                "AQAB".into(),
+            ),
+            ("n over 8192 bits", b64(&[0xc5; 1025]), "AQAB".into()),
+            ("even n", b64(&[0xc4; 256]), "AQAB".into()),
+            (
+                "n with a leading zero",
+                b64(&[&[0][..], &modulus[..]].concat()),
+                "AQAB".into(),
+            ),
+            ("n not base64url", "!!".repeat(200), "AQAB".into()),
+        ] {
+            assert!(!rsa_components_can_verify(&n, &e), "{what}");
+            let entry = serde_json::json!({"kty": "RSA", "kid": "k", "n": n, "e": e});
+            assert!(parse_jwks_entry(&entry, &all).is_none(), "{what}");
+        }
+        // The key cap still counts every entry considered, usable or not.
+        let naming = KeyNamingBuf::Dotted("oauth".into());
+        let bad = serde_json::json!({"kty": "RSA", "kid": "bad", "n": odd_2048, "e": ""});
+        let mut entries = vec![bad; MAX_JWKS_KEYS];
+        entries.push(rsa_entry(serde_json::json!({})));
+        let doc = serde_json::json!({ "keys": entries });
+        let err = keys_from_jwk_set(&doc, &all, &naming).err().unwrap();
+        assert_eq!(err.kind(), RefreshErrorKind::NoUsableKeys);
+    }
+
+    /// The `loopback` client reaches this host for a name only its own
+    /// resolver can map there: `.invalid` (RFC 6761 §6.4) never resolves, so
+    /// the `normal` client, on the system resolver, fails on the very same
+    /// URL — the success is the `.dns_resolver(..)` wiring and nothing else.
+    #[tokio::test]
+    async fn the_loopback_client_resolves_a_name_no_dns_would() {
+        let jwks = crate::testing::spawn_jwks_server("200 OK", crate::testing::jwks_body()).await;
+        let url = jwks.url.replace("127.0.0.1", "nonexistent-name.invalid");
+        let clients = http_clients(false, OPT_IN, &FetchSettings::default()).unwrap();
+        let fetched = clients.loopback.get(&url).send().await.unwrap();
+        assert!(fetched.status().is_success(), "{}", fetched.status());
+        assert_eq!(
+            jwks.hits.load(std::sync::atomic::Ordering::SeqCst),
+            1,
+            "the URL's port was kept"
+        );
+        assert!(
+            clients.normal.get(&url).send().await.is_err(),
+            "the system resolver must not resolve {url}"
+        );
+        assert_eq!(jwks.hits.load(std::sync::atomic::Ordering::SeqCst), 1);
+    }
+
+    /// The loopback client's resolver answers every name with loopback and
+    /// never asks DNS, whatever the name.
+    #[tokio::test]
+    async fn the_loopback_resolver_answers_every_name_with_loopback() {
+        use reqwest::dns::Resolve;
+        for name in ["localhost", "idp.localhost", "example.test", "a.b.c"] {
+            let addrs: Vec<std::net::SocketAddr> = LoopbackResolver
+                .resolve(name.parse().unwrap())
+                .await
+                .unwrap()
+                .collect();
+            assert_eq!(addrs.len(), 2, "{name}");
+            assert!(
+                addrs.iter().all(|a| a.ip().is_loopback() && a.port() == 0),
+                "{name}: {addrs:?}"
+            );
+        }
     }
 
     #[test]
