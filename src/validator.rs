@@ -5437,21 +5437,32 @@ mod tests {
     async fn a_signed_token_over_the_size_cap_is_too_large_without_a_fetch() {
         let jwks = spawn_jwks_server("200 OK", jwks_body()).await;
         let v = validator(&jwks.url);
-        let body = claims(serde_json::json!({"scope": "mcp:read"}));
-        let fits = |kid_len: usize| mint(KEY_A_PEM, &"k".repeat(kid_len), &body);
-        // The longest kid that keeps the token at the cap, then one more byte.
+        // A token of an exact length: a long `kid` gets near it, then a
+        // short padding claim fine-tunes it (base64url lengths skip every
+        // value that is 1 mod 4, so one knob alone cannot hit every length).
+        let token = |kid_len: usize, pad: usize| {
+            let body = claims(serde_json::json!({"scope": "mcp:read", "pad": "p".repeat(pad)}));
+            mint(KEY_A_PEM, &"k".repeat(kid_len), &body)
+        };
         let (mut kid_len, mut too_long) = (0, MAX_TOKEN_BYTES);
         while too_long - kid_len > 1 {
             let mid = (kid_len + too_long) / 2;
-            if fits(mid).len() <= MAX_TOKEN_BYTES {
+            if token(mid, 0).len() <= MAX_TOKEN_BYTES {
                 kid_len = mid;
             } else {
                 too_long = mid;
             }
         }
-        let at_cap = fits(kid_len);
-        let over = fits(kid_len + 1);
-        assert!(at_cap.len() <= MAX_TOKEN_BYTES && over.len() > MAX_TOKEN_BYTES);
+        let exactly = |len: usize| {
+            (kid_len.saturating_sub(8)..=kid_len)
+                .flat_map(|k| (0..8).map(move |p| (k, p)))
+                .map(|(k, p)| token(k, p))
+                .find(|t| t.len() == len)
+                .expect("a token of exactly that length")
+        };
+        let at_cap = exactly(MAX_TOKEN_BYTES);
+        let over = exactly(MAX_TOKEN_BYTES + 1);
+        assert_eq!(over.len(), MAX_TOKEN_BYTES + 1);
         match v.validate(&over).await {
             Err(TokenRejection::Invalid(invalid)) => {
                 assert_eq!(invalid.kind(), InvalidTokenKind::TooLarge)
@@ -5511,9 +5522,15 @@ mod tests {
         );
         set("/keys", "200 OK", jwks_body());
         let mut cfg = oauth_config("");
-        cfg.issuer = issuer;
+        cfg.issuer = issuer.clone();
         let v = OAuthValidator::build(&cfg, Duration::ZERO).unwrap();
+        let token = mint(
+            KEY_A_PEM,
+            KID_A,
+            &claims(serde_json::json!({"iss": issuer, "scope": "mcp:read"})),
+        );
         assert_eq!(v.refresh_now().await.unwrap(), 1);
+        assert!(v.validate(&token).await.is_ok());
         set(METADATA, "404 Not Found", "{}".into());
         set("/keys", "404 Not Found", "{}".into());
         assert_eq!(
@@ -5526,5 +5543,8 @@ mod tests {
         );
         assert_eq!(v.key_set_status().keys, 1);
         assert!(v.is_ready());
+        // The counter only moves on success: prove the keys themselves are
+        // still there by verifying with them.
+        assert!(v.validate(&token).await.is_ok());
     }
 }

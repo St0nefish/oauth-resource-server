@@ -1293,8 +1293,8 @@ fn cached_key(jwk: &Jwk, allowed: &[Algorithm]) -> Option<CachedKey> {
 
 /// Whether RSA components `n` and `e` (base64url, as in a JWK) could verify
 /// any signature at all: the rules `ring`, which jsonwebtoken verifies with,
-/// applies only at verification time — a modulus of 2048 to 8192 bits (256
-/// to 1024 bytes, the top byte non-zero) that is odd, and an odd exponent
+/// applies only at verification time — an odd modulus of 2048 to 8192 bits
+/// exactly (no leading zero byte), and an odd exponent
 /// from 3 to 2^33 - 1 with no leading zero byte. A key failing them was
 /// once counted as held (`KeySetStatus::keys`, `is_ready`) while verifying
 /// nothing; skipping it here makes the count mean usable keys.
@@ -1302,9 +1302,13 @@ fn rsa_components_can_verify(n: &str, e: &str) -> bool {
     let (Ok(n), Ok(e)) = (URL_SAFE_NO_PAD.decode(n), URL_SAFE_NO_PAD.decode(e)) else {
         return false;
     };
-    let modulus_ok = (256..=1024).contains(&n.len())
-        && n.first().is_some_and(|b| *b != 0)
-        && n.last().is_some_and(|b| b & 1 == 1);
+    // Bit length as ring counts it: the top byte must be non-zero (no
+    // leading zero), so the length is exact.
+    let modulus_bits = match n.first() {
+        Some(&top) if top != 0 => (n.len() - 1) * 8 + (8 - top.leading_zeros() as usize),
+        _ => 0,
+    };
+    let modulus_ok = (2048..=8192).contains(&modulus_bits) && n.last().is_some_and(|b| b & 1 == 1);
     let exponent_ok = (1..=5).contains(&e.len())
         && e[0] != 0
         && e[e.len() - 1] & 1 == 1
@@ -1804,6 +1808,16 @@ mod tests {
             ("e over 5 bytes", odd_2048.clone(), b64(&[1, 0, 0, 0, 0, 1])),
             ("empty n", String::new(), "AQAB".into()),
             ("n under 2048 bits", b64(&[0xc5; 255]), "AQAB".into()),
+            (
+                "n of 2047 bits",
+                b64(&[&[0x7f][..], &modulus[1..]].concat()),
+                "AQAB".into(),
+            ),
+            (
+                "n of 2041 bits",
+                b64(&[&[0x01][..], &modulus[1..]].concat()),
+                "AQAB".into(),
+            ),
             ("n over 8192 bits", b64(&[0xc5; 1025]), "AQAB".into()),
             ("even n", b64(&[0xc4; 256]), "AQAB".into()),
             (
@@ -1825,6 +1839,29 @@ mod tests {
         let doc = serde_json::json!({ "keys": entries });
         let err = keys_from_jwk_set(&doc, &all, &naming).err().unwrap();
         assert_eq!(err.kind(), RefreshErrorKind::NoUsableKeys);
+    }
+
+    /// The `loopback` client reaches this host for a name only its own
+    /// resolver can map there: `.invalid` (RFC 6761 §6.4) never resolves, so
+    /// the `normal` client, on the system resolver, fails on the very same
+    /// URL — the success is the `.dns_resolver(..)` wiring and nothing else.
+    #[tokio::test]
+    async fn the_loopback_client_resolves_a_name_no_dns_would() {
+        let jwks = crate::testing::spawn_jwks_server("200 OK", crate::testing::jwks_body()).await;
+        let url = jwks.url.replace("127.0.0.1", "nonexistent-name.invalid");
+        let clients = http_clients(false, OPT_IN, &FetchSettings::default()).unwrap();
+        let fetched = clients.loopback.get(&url).send().await.unwrap();
+        assert!(fetched.status().is_success(), "{}", fetched.status());
+        assert_eq!(
+            jwks.hits.load(std::sync::atomic::Ordering::SeqCst),
+            1,
+            "the URL's port was kept"
+        );
+        assert!(
+            clients.normal.get(&url).send().await.is_err(),
+            "the system resolver must not resolve {url}"
+        );
+        assert_eq!(jwks.hits.load(std::sync::atomic::Ordering::SeqCst), 1);
     }
 
     /// The loopback client's resolver answers every name with loopback and

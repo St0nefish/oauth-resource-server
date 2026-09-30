@@ -190,6 +190,49 @@ async fn a_credential_in_a_url_never_reaches_a_log_line() {
         "{text}"
     );
 
+    //    The same two paths from a NON-loopback start, which an explicit
+    //    proxy stands in for: it answers the first fetch with the redirect.
+    //    Without the opt-in the plain-http hop is refused; with it, the
+    //    `following a redirect` warning is logged (the hop then fails: the
+    //    proxy knows no such URL). Both show the target redacted.
+    let start = "http://jwks.example.test/jwks";
+    let proxy = testing::spawn_http_server(
+        HashMap::from([(start.to_string(), (status, String::new()))]),
+        None,
+    )
+    .await;
+    for allow_insecure_http in [false, true] {
+        let mut cfg = testing::resolved_config(start);
+        cfg.allow_insecure_http = allow_insecure_http;
+        let v = Arc::new(
+            OAuthValidator::builder(&cfg)
+                .proxy(&proxy.base)
+                .build()
+                .unwrap(),
+        );
+        let task = v.spawn_background_refresh();
+        failures += 1;
+        logs.wait_for(FAILED, failures).await;
+        task.abort();
+    }
+    let text = logs.text();
+    assert!(
+        text.contains(
+            "redirect to plain http on a non-loopback host (http://***@0.0.0.0:1/keys?***) refused"
+        ),
+        "{text}"
+    );
+    assert!(
+        text.contains("following a redirect to plain http"),
+        "{text}"
+    );
+    assert!(
+        text.lines()
+            .any(|line| line.contains("following a redirect to plain http")
+                && line.contains("http://***@0.0.0.0:1/keys?***")),
+        "{text}"
+    );
+
     // 6. The validator's startup warnings for a plain-http, non-loopback
     //    issuer, jwks_uri and resource, all carrying userinfo (and the
     //    jwks_uri a query) under `allow_insecure_http`. No I/O.
