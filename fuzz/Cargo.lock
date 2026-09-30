@@ -599,7 +599,9 @@ version = "0.2.0"
 dependencies = [
  "axum",
  "base64 0.23.1",
+ "bytes",
  "http",
+ "http-body",
  "jsonwebtoken",
  "reqwest",
  "serde",
@@ -610,6 +612,7 @@ dependencies = [
  "tower-layer",
  "tower-service",
  "tracing",
+ "zeroize",
 ]
 
 [[package]]

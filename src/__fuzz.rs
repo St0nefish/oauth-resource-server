@@ -3,7 +3,7 @@
 //! Compiled only under `--cfg fuzzing` (which cargo-fuzz sets) and hidden from
 //! rustdoc, so none of it is public API: no ordinary build, docs.rs render or
 //! downstream consumer ever sees this module. Needs the `axum` and `testing`
-//! features (the fuzz crate enables both).
+//! features (the fuzz crate enables both, and `mcp` for `mcp_tool_calls`).
 //!
 //! Each function drives one internal with attacker-shaped input and asserts the
 //! properties that must hold for *every* input, so a fuzzer finds a broken
@@ -126,6 +126,72 @@ pub fn metadata_urls(resource: &str) {
     assert!(crate::challenge::metadata_path(&url).starts_with('/'));
     // `metadata_path` also takes any string, not only the URL builder's output.
     assert!(crate::challenge::metadata_path(resource).starts_with('/'));
+}
+
+/// `OAuthValidator::insufficient_scope_challenge_for` on arbitrary scopes and
+/// description: always a header value, always the `insufficient_scope`
+/// error, and the description can never close its quoted string early, carry
+/// an escape, or add an attribute.
+pub fn scope_challenge(scopes: &[String], description: Option<&str>) {
+    let scopes: Vec<&str> = scopes.iter().map(String::as_str).collect();
+    let challenge = validators()[0].insufficient_scope_challenge_for(&scopes, description);
+    assert!(
+        crate::challenge::is_header_value(&challenge),
+        "{challenge:?}"
+    );
+    assert!(challenge.starts_with("Bearer error=\"insufficient_scope\""));
+    if let Some((_, described)) = challenge.split_once(", error_description=\"") {
+        assert_eq!(described.matches('"').count(), 1, "{challenge:?}");
+        assert!(described.ends_with('"'), "{challenge:?}");
+        assert!(!described.contains('\\'), "{challenge:?}");
+    }
+}
+
+/// `mcp::classify`, the tool-name extraction behind `McpToolScopes`, against
+/// `serde_json::Value` as an oracle: it reads a body as messages exactly when
+/// the body is a JSON object or array; a `ToolCall(name)` is a message whose
+/// `method` is `"tools/call"` and whose `params.name` is `name`; a
+/// `NotToolCall` is a message whose `method` is not `"tools/call"`.
+/// (`Ambiguous` — repeated members, no readable name — may be anything.)
+#[cfg(feature = "mcp")]
+pub fn mcp_tool_calls(body: &[u8]) {
+    use crate::mcp::{Classified, NamedMessage as Message};
+
+    let oracle = serde_json::from_slice::<Value>(body).ok();
+    let elements: Option<Vec<&Value>> = match &oracle {
+        Some(Value::Array(items)) => Some(items.iter().collect()),
+        Some(object @ Value::Object(_)) => Some(vec![object]),
+        _ => None,
+    };
+    match (crate::mcp::classify(body), elements) {
+        (Classified::Unreadable, None) => {}
+        (Classified::Messages(messages), Some(elements)) => {
+            assert_eq!(messages.len(), elements.len());
+            for (message, element) in messages.iter().zip(elements) {
+                let method = element.get("method").and_then(Value::as_str);
+                match message {
+                    Message::ToolCall(name) => {
+                        assert_eq!(method, Some("tools/call"));
+                        assert_eq!(
+                            element
+                                .get("params")
+                                .and_then(|p| p.get("name"))
+                                .and_then(Value::as_str),
+                            Some(name.as_str())
+                        );
+                    }
+                    Message::NotToolCall => {
+                        assert!(element.is_object());
+                        assert_ne!(method, Some("tools/call"));
+                    }
+                    Message::Ambiguous => {}
+                }
+            }
+        }
+        (classified, elements) => {
+            panic!("classify disagrees with serde_json: {classified:?} vs {elements:?}")
+        }
+    }
 }
 
 /// `jwks::discovery_urls`: OIDC first, at most one RFC 8414 fallback.

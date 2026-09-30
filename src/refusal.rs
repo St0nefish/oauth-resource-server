@@ -25,6 +25,11 @@ use crate::validator::OAuthValidator;
 /// as well as a wrong one.
 pub const DEFAULT_STATIC_CHALLENGE: &str = "Bearer error=\"invalid_token\"";
 
+/// The 403 challenge a per-request scope refusal carries when no OAuth
+/// validator is configured (RFC 6750 §3.1's `insufficient_scope`, with no
+/// `resource_metadata` or `scope` to name).
+pub(crate) const BARE_INSUFFICIENT_SCOPE_CHALLENGE: &str = "Bearer error=\"insufficient_scope\"";
+
 /// The HTTP refusal a [`TokenRejection`] calls for; see [`refusal`].
 ///
 /// `#[non_exhaustive]`: read its fields; more may be added without a breaking
@@ -165,6 +170,80 @@ pub fn refusal_with_static_challenge(
     }
 }
 
+/// [`refusal`] for a request that needed `scopes` on top of the validator's
+/// own required scopes — a per-route or per-operation requirement checked
+/// with [`crate::AuthorizedToken::require_scopes`]. Everything but the 403
+/// challenge is exactly [`refusal`]'s: the same status for every rejection,
+/// the same 401 challenge, [`DEFAULT_STATIC_CHALLENGE`] on a 401 without
+/// OAuth. Without OAuth a 403 carries `Bearer error="insufficient_scope"`
+/// (RFC 6750 §3.1) rather than the static 401 challenge [`refusal`] gives.
+///
+/// With OAuth, [`TokenRejection::InsufficientScope`] carries
+/// [`OAuthValidator::insufficient_scope_challenge_for`] naming the
+/// validator's `required_scopes` followed by `scopes` (deduplicated): every
+/// scope this request needs, so a client that re-authorizes for exactly that
+/// set passes both checks. `description` becomes its `error_description`
+/// (sanitized as that method documents; `None` for none). This is the same
+/// challenge the layers' `require_scopes`, the `RequireScopes` route layer,
+/// the `Scoped` extractor and the `mcp` feature send for the same scopes.
+///
+/// # Examples
+///
+/// ```no_run
+/// use oauth_resource_server::{
+///     Credential, OAuthValidator, TokenRejection, authenticate, refusal, refusal_for_scopes,
+/// };
+///
+/// # async fn handle(oauth: &OAuthValidator, bearer: Option<&str>) {
+/// let token = match authenticate(bearer, None, Some(oauth)).await {
+///     Ok(Credential::OAuth(token)) => token,
+///     Ok(_) => unreachable!("no static token was given"),
+///     Err(rejection) => {
+///         let r = refusal(&rejection, Some(oauth));
+///         # let _ = r;
+///         return; // respond with r.status and r.www_authenticate
+///     }
+/// };
+/// // This operation needs a write scope on top of the validator's floor.
+/// if let Err(missing) = token.require_scopes(&["docs:write"]) {
+///     let r = refusal_for_scopes(&missing.into(), Some(oauth), &["docs:write"], None);
+///     assert_eq!(r.status, 403);
+///     # let _ = r;
+///     return; // respond with r.status and r.www_authenticate
+/// }
+/// # }
+/// ```
+pub fn refusal_for_scopes(
+    rejection: &TokenRejection,
+    oauth: Option<&OAuthValidator>,
+    scopes: &[&str],
+    description: Option<&str>,
+) -> Refusal {
+    let oauth_challenges = oauth.map(|v| {
+        (
+            v.invalid_token_challenge(),
+            v.insufficient_scope_challenge_for(&v.scopes_with_floor(scopes), description),
+        )
+    });
+    let (status, challenge) = select(
+        rejection,
+        oauth_challenges
+            .as_ref()
+            .map(|(i, s)| (i.as_str(), s.as_str())),
+        Some(DEFAULT_STATIC_CHALLENGE),
+    );
+    // Without OAuth a 403 still names its error (RFC 6750 §3.1), as the
+    // layers' route-level refusals do: the static 401 challenge would not.
+    let challenge = match (rejection, oauth) {
+        (TokenRejection::InsufficientScope, None) => Some(BARE_INSUFFICIENT_SCOPE_CHALLENGE),
+        _ => challenge,
+    };
+    Refusal {
+        status,
+        www_authenticate: challenge.map(str::to_owned),
+    }
+}
+
 /// The one decision behind every refusal this crate builds: the status for
 /// `rejection`, and which of the given challenges it carries.
 /// `oauth_challenges` is `(invalid_token, insufficient_scope)`, `Some` exactly
@@ -276,6 +355,51 @@ mod tests {
             assert!(is_header_value(&challenge), "{challenge}");
             assert!(challenge.contains("resource_metadata="), "{challenge}");
         }
+    }
+
+    #[test]
+    fn refusal_for_scopes_differs_from_refusal_only_in_the_403_challenge() {
+        let v = OAuthValidator::new(&crate::testing::resolved_config("http://127.0.0.1:1/jwks"))
+            .unwrap();
+        for rejection in [TokenRejection::Missing, TokenRejection::Invalid("x".into())] {
+            assert_eq!(
+                refusal_for_scopes(&rejection, Some(&v), &["mcp:write"], Some("d")),
+                refusal(&rejection, Some(&v))
+            );
+            assert_eq!(
+                refusal_for_scopes(&rejection, None, &["mcp:write"], None),
+                refusal(&rejection, None)
+            );
+        }
+        let r = refusal_for_scopes(
+            &TokenRejection::InsufficientScope,
+            Some(&v),
+            &["mcp:write", "mcp:read"],
+            Some("write needed"),
+        );
+        assert_eq!(r.status, 403);
+        // The validator's floor first, then the request's own, once each.
+        assert_eq!(
+            r.www_authenticate.as_deref(),
+            Some(
+                "Bearer error=\"insufficient_scope\", scope=\"mcp:read mcp:write\", \
+                 resource_metadata=\"https://kb.example.test/.well-known/oauth-protected-resource/mcp\", \
+                 error_description=\"write needed\""
+            )
+        );
+        // No extra scopes: exactly `refusal()`'s 403.
+        assert_eq!(
+            refusal_for_scopes(&TokenRejection::InsufficientScope, Some(&v), &[], None),
+            refusal(&TokenRejection::InsufficientScope, Some(&v))
+        );
+        // Without OAuth a 403 carries the bare `insufficient_scope`
+        // challenge, never the static 401 one.
+        let r = refusal_for_scopes(&TokenRejection::InsufficientScope, None, &["x"], None);
+        assert_eq!(r.status, 403);
+        assert_eq!(
+            r.www_authenticate.as_deref(),
+            Some("Bearer error=\"insufficient_scope\"")
+        );
     }
 
     #[test]

@@ -18,6 +18,7 @@ cargo clippy --all-targets --no-default-features --features native-tls -- -D war
 cargo clippy --all-targets --no-default-features --features rustls-tls-native-roots -- -D warnings
 cargo test --all-features
 cargo test
+cargo test --doc --no-default-features --features rustls-tls,mcp   # doc examples without axum
 cargo build --examples --all-features
 RUSTDOCFLAGS="-D warnings" cargo doc --no-deps --all-features
 cargo audit

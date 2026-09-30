@@ -53,6 +53,8 @@ jobs:
           - metadata_urls
           - discovery_urls
           - jwks_entries
+          - scope_challenge
+          - mcp_tool_calls
     steps:
       - name: Checkout code
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1

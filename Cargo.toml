@@ -53,6 +53,11 @@ tower = ["dep:http", "dep:tower-layer", "dep:tower-service"]
 # module re-exports `CredentialSource`, `RejectContext` and `AuthLayerError`
 # from it.
 axum = ["tower", "dep:axum"]
+# `mcp` module: per-tool scope requirements for an MCP server's JSON-RPC
+# endpoint (`McpToolScopes`), a tower layer behind either authentication
+# layer. Implies `tower`; reads request bodies with `http-body`/`bytes` and
+# parses them with `serde_json` — no MCP SDK dependency.
+mcp = ["tower", "dep:http-body", "dep:bytes"]
 # `testing` module: throwaway keys, token minting and a fake JWKS server for
 # CONSUMERS' TESTS. Never enable this in a production build.
 testing = ["tokio/net", "tokio/io-util"]
@@ -118,6 +123,12 @@ http = { version = "1", optional = true }
 # `AuthLayer` implements `tower::Layer`; the same small trait crates axum builds on.
 tower-layer = { version = "0.3.3", optional = true }
 tower-service = { version = "0.3.3", optional = true }
+# The `mcp` feature reads a request body frame by frame (under a size cap) and
+# rebuilds it from the bytes read. Both are already in every build through
+# reqwest's hyper (and axum's), so they add no crate. `bytes` 1.2 is what
+# `direct-minimal-versions` needs to resolve against axum's own floor.
+http-body = { version = "1", optional = true }
+bytes = { version = "1.2", optional = true }
 
 [dev-dependencies]
 tokio = { version = "1", features = ["macros", "rt", "rt-multi-thread", "net", "io-util", "time", "sync", "test-util"] }
