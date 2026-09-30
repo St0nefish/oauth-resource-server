@@ -769,8 +769,10 @@ carries the request's method, URI and headers, so the body can follow
 `Accept`. Never put the detail inside `TokenRejection::Invalid` in the body:
 it says which check failed, which is an oracle for an attacker. The layer
 logs it instead. (Its `kind()` is coarser, but this crate's own responses
-never carry it either; whether to expose it is your decision.) `RejectContext`'s `Debug` prints header names but no header
-values, and the credential headers are marked sensitive, so
+never carry it either; whether to expose it is your decision.)
+`RejectContext`'s `Debug` prints header names but no header
+values, and the URI's path with any query shown as `?***` (a client may put
+an `access_token` there), and the credential headers are marked sensitive, so
 `tracing::warn!(?cx)` in the callback does not log the token.
 
 ### Metrics: counting refusals by kind
@@ -1422,7 +1424,16 @@ an `InvalidToken`'s `kind()` names the check that failed).
   principal are truncated to 128 characters when logged; scope values are
   logged in full (on an insufficient-scope refusal at `info`, and on an
   accepted token at `debug`), bounded only by the 16 KiB credential cap.
-  Rejection reasons go to the log, never to the client.
+  Rejection reasons go to the log, never to the client. A credential in the
+  `issuer`, `jwks_uri` or `resource` URL (userinfo, or a query) is masked
+  (`***@`, `?***`) wherever this crate shows it: every log line, error and
+  configuration problem, and the `Debug` output of `OAuthConfig`,
+  `ResolvedOAuthConfig`, `EnvOAuthConfig`, `AuthorizedToken`, the validator,
+  the layers and their builders. The refused request's URI in a
+  `RejectContext` `Debug` is its path, with any query shown as `?***` (a
+  client may send its token there, RFC 6750 §2.3); the layers log the path
+  only. The RFC 9728 metadata document and the challenges publish
+  `issuer` and `resource` as configured.
 - **The static token is compared in constant time** (with `subtle`). Its
   length is not hidden. With several static tokens, every candidate is
   compared with every entry, with no early exit once one matches, and the

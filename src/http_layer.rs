@@ -227,10 +227,12 @@ pub(crate) fn bearer_credential(header: &str) -> &str {
 /// `#[non_exhaustive]`: read its fields; more may be added without a breaking
 /// change.
 ///
-/// Its `Debug` prints the rejection, the status, the method, URI and version,
-/// and the request's header NAMES — never a header value, so
-/// `tracing::warn!(?cx, "refused")` cannot log the presented credential (which,
-/// for an insufficient-scope refusal, is a validly signed, unexpired token).
+/// Its `Debug` prints the rejection, the status, the method, the URI's path
+/// (any query as `?***`: a client may send an RFC 6750 §2.3 `access_token`
+/// there) and version, and the request's header NAMES — never a header value,
+/// so `tracing::warn!(?cx, "refused")` cannot log the presented credential
+/// (which, for an insufficient-scope refusal, is a validly signed, unexpired
+/// token).
 #[non_exhaustive]
 pub struct RejectContext<'a> {
     /// Why the request was refused. [`TokenRejection::Invalid`]'s reason is for
@@ -256,10 +258,21 @@ impl std::fmt::Debug for RejectContext<'_> {
             .field("rejection", self.rejection)
             .field("status", &self.status)
             .field("method", &self.request.method)
-            .field("uri", &self.request.uri)
+            // The path only: a query may carry a credential (RFC 6750 §2.3
+            // `access_token`), so it shows as `?***`, as `redact_url` would.
+            .field("uri", &redacted_request_uri(&self.request.uri))
             .field("version", &self.request.version)
             .field("header_names", &header_names)
             .finish_non_exhaustive()
+    }
+}
+
+/// `uri`'s path, plus `?***` when it has a query: what a `Debug` of a request
+/// may show. The query can carry a bearer token (RFC 6750 §2.3).
+fn redacted_request_uri(uri: &http::Uri) -> String {
+    match uri.query() {
+        Some(_) => format!("{}?***", uri.path()),
+        None => uri.path().to_string(),
     }
 }
 
