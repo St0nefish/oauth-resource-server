@@ -163,7 +163,8 @@ bytes = "1"
 # tests (`src/builder.rs`). Already in the tree through reqwest's rustls
 # backend; default features off so it adds `ring`, never `aws-lc-rs`.
 tokio-rustls = { version = "0.26", default-features = false, features = ["ring", "tls12"] }
-# `tests/metrics.rs`: a recorder that keeps every value for the assertions.
+# `tests/observability_metrics.rs`: a recorder that keeps every value for
+# the assertions.
 metrics-util = { version = "0.20", default-features = false, features = ["debugging"] }
 
 # Each example names the features it needs, so `cargo build --examples` with

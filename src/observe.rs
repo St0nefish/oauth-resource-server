@@ -126,38 +126,93 @@ pub(crate) fn status(rejection: &TokenRejection) -> u16 {
     crate::refusal::select::<str>(rejection, None, None).0
 }
 
+/// The `stage` label of `oauth_rs_requests_total`: which check made the
+/// decision, so one request's layer acceptance and a later route refusal can
+/// be told apart (decisions, not requests, are counted).
+#[cfg(feature = "tower")]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum Stage {
+    /// Either authentication layer (`AuthLayer`, `HttpAuthLayer`), including
+    /// an `allow_unauthenticated` one. Exactly one per request per layer.
+    Layer,
+    /// A route-level scope check: `RequireScopes`, `McpToolScopes`.
+    Route,
+    /// An axum extractor in the handler: `AuthorizedToken`, `Credential`,
+    /// `StaticTokenMatch`, `Scoped`.
+    Handler,
+}
+
+#[cfg(feature = "tower")]
+impl Stage {
+    // A metric label only (not a log field), so read with `metrics` alone.
+    #[cfg_attr(not(feature = "metrics"), allow(dead_code))]
+    pub(crate) fn as_str(self) -> &'static str {
+        match self {
+            Self::Layer => "layer",
+            Self::Route => "route",
+            Self::Handler => "handler",
+        }
+    }
+}
+
 /// Count one authentication decision in `oauth_rs_requests_total` (feature
 /// `metrics`; nothing at all without it).
 #[cfg(feature = "tower")]
 #[inline]
-pub(crate) fn count_request(outcome: Outcome, mechanism: Mechanism, reason: &'static str) {
+pub(crate) fn count_request(
+    stage: Stage,
+    outcome: Outcome,
+    mechanism: Mechanism,
+    reason: &'static str,
+) {
     #[cfg(feature = "metrics")]
     ::metrics::counter!(
         crate::observability::REQUESTS_TOTAL,
+        "stage" => stage.as_str(),
         "outcome" => outcome.as_str(),
         "mechanism" => mechanism.as_str(),
         "reason" => reason,
     )
     .increment(1);
     #[cfg(not(feature = "metrics"))]
-    let _ = (outcome, mechanism, reason);
+    let _ = (stage, outcome, mechanism, reason);
 }
 
 /// Count one finished key refresh in `oauth_rs_jwks_refresh_total` (`result`
 /// is `success` or a `RefreshErrorKind` label) and set `oauth_rs_jwks_keys`
-/// to the number of keys now held (feature `metrics`; nothing without it).
+/// to the number of keys now held, both labelled `issuer_host` (feature
+/// `metrics`; nothing without it).
 #[inline]
-pub(crate) fn count_refresh(result: &'static str, keys: usize) {
+pub(crate) fn count_refresh(issuer_host: &str, result: &'static str, keys: usize) {
+    #[cfg(feature = "metrics")]
+    ::metrics::counter!(
+        crate::observability::JWKS_REFRESH_TOTAL,
+        "issuer_host" => issuer_host.to_owned(),
+        "result" => result,
+    )
+    .increment(1);
+    #[cfg(not(feature = "metrics"))]
+    let _ = result;
+    set_keys(issuer_host, keys);
+}
+
+/// Set `oauth_rs_jwks_keys{issuer_host}` (feature `metrics`): after every
+/// refresh, and once when the validator is built, so seeded keys
+/// (`initial_jwks`) show before the first refresh.
+#[inline]
+pub(crate) fn set_keys(issuer_host: &str, keys: usize) {
     #[cfg(feature = "metrics")]
     {
-        ::metrics::counter!(crate::observability::JWKS_REFRESH_TOTAL, "result" => result)
-            .increment(1);
         // Precision loss only above 2^53 keys; the key set is capped at 64.
         #[allow(clippy::cast_precision_loss)]
-        ::metrics::gauge!(crate::observability::JWKS_KEYS).set(keys as f64);
+        ::metrics::gauge!(
+            crate::observability::JWKS_KEYS,
+            "issuer_host" => issuer_host.to_owned(),
+        )
+        .set(keys as f64);
     }
     #[cfg(not(feature = "metrics"))]
-    let _ = (result, keys);
+    let _ = (issuer_host, keys);
 }
 
 #[cfg(test)]

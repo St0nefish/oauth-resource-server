@@ -974,21 +974,41 @@ impl OAuthValidator {
         // The error text can echo attacker-supplied header content (an unknown
         // `alg` string, verbatim), so it is truncated like every other
         // token-derived string that reaches a log line.
-        let header = decode_header(token).map_err(|e| {
-            TokenRejection::invalid(
-                InvalidTokenKind::MalformedHeader,
-                format!("malformed token header: {}", for_log(&e.to_string())),
-            )
-        })?;
+        let header = match decode_header(token) {
+            Ok(header) => header,
+            Err(e) => {
+                // The header jsonwebtoken cannot read (an unknown `alg` such
+                // as `none` or `HS1`, a missing one, bad base64) is where the
+                // span fields matter most: record what the raw JSON says.
+                if !span.is_disabled() {
+                    let (kid, alg) = raw_header_fields(token);
+                    if let Some(kid) = kid {
+                        record_field(span, "kid", for_log_field(&kid).as_str());
+                    }
+                    if let Some(alg) = alg {
+                        record_field(span, "alg", for_log_field(&alg).as_str());
+                    }
+                }
+                return Err(TokenRejection::invalid(
+                    InvalidTokenKind::MalformedHeader,
+                    format!("malformed token header: {}", for_log(&e.to_string())),
+                ));
+            }
+        };
         if !span.is_disabled() {
             if let Some(kid) = header.kid.as_deref() {
                 record_field(span, "kid", for_log_field(kid).as_str());
             }
-            record_field(
-                span,
-                "alg",
-                for_log_field(&format!("{:?}", header.alg)).as_str(),
-            );
+            // The crate's own label; an HMAC `alg` (no `Algorithm` variant)
+            // is read from the raw header instead of jsonwebtoken's `Debug`.
+            match Algorithm::from_jwt(header.alg) {
+                Some(alg) => record_field(span, "alg", alg.as_str()),
+                None => {
+                    if let (_, Some(alg)) = raw_header_fields(token) {
+                        record_field(span, "alg", for_log_field(&alg).as_str());
+                    }
+                }
+            }
         }
         check_crit(token)?;
         let alg = Algorithm::from_jwt(header.alg)
@@ -1445,6 +1465,26 @@ impl OAuthValidator {
 pub(crate) struct CheckedHeader {
     kid: Option<String>,
     alg: Algorithm,
+}
+
+/// The unverified header's `kid` and `alg` as strings, read from its raw
+/// JSON: for a span field only, when jsonwebtoken's `Header` cannot say (an
+/// `alg` it does not know, or an HMAC one this crate has no `Algorithm`
+/// for). Called after the size cap and the three-segment check, so the
+/// segment is at most `MAX_TOKEN_BYTES`; a value that is not a string, or a
+/// header that is not base64url JSON, gives `None`. The caller bounds and
+/// escapes the result with `for_log_field`.
+fn raw_header_fields(token: &str) -> (Option<String>, Option<String>) {
+    let segment = token.split('.').next().unwrap_or_default();
+    let Some(header) = URL_SAFE_NO_PAD
+        .decode(segment)
+        .ok()
+        .and_then(|bytes| serde_json::from_slice::<Map<String, Value>>(&bytes).ok())
+    else {
+        return (None, None);
+    };
+    let field = |name: &str| header.get(name).and_then(Value::as_str).map(str::to_owned);
+    (field("kid"), field("alg"))
 }
 
 /// RFC 7515 §4.1.11: a recipient that does not understand every extension a

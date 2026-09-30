@@ -135,17 +135,21 @@ response body are byte-for-byte what 0.1 sent.
     entry.
   - Tracing spans: `oauth_rs.validate` and `oauth_rs.validate_cached`
     (`debug`; the unverified header's `kid` and `alg`, cut to 128
-    characters with anything outside printable ASCII escaped, and the
-    outcome), `oauth_rs.jwks_refresh` and `oauth_rs.jwks_discovery`
+    characters with anything outside printable ASCII escaped — the raw
+    strings when the header cannot be parsed — and the outcome), `oauth_rs.jwks_refresh` and `oauth_rs.jwks_discovery`
     (`info`; the JWKS/issuer host only, the result, the keys held). A
     refresh a request triggers is a child of that request's span. A
     disabled span formats and allocates nothing.
   - A `metrics` feature (off by default; the `metrics` 0.24 facade, MSRV
-    1.71.1): counters `oauth_rs_requests_total{outcome, mechanism, reason}`
-    and `oauth_rs_jwks_refresh_total{result}`, and a gauge
-    `oauth_rs_jwks_keys`, named in the new `observability` module
-    (`describe_metrics()` registers HELP text). Without the feature there is
-    no new dependency.
+    1.71.1): counters
+    `oauth_rs_requests_total{stage, outcome, mechanism, reason}` (one per
+    decision; `stage` is `layer`, `route` or `handler`) and
+    `oauth_rs_jwks_refresh_total{issuer_host, result}`, and a gauge
+    `oauth_rs_jwks_keys{issuer_host}` (set at construction too, so seeded
+    keys show), named in the new `observability` module
+    (`describe_metrics()` registers HELP text and units). `issuer_host` is
+    the configured issuer's host, one value per validator. Without the
+    feature there is no new dependency.
   - The field, span and metric names and their values are covered by
     semver (the README's new "Observability" section lists them all);
     message text still is not.
@@ -561,7 +565,11 @@ response body are byte-for-byte what 0.1 sent.
   feature's JSON-RPC classification, against `serde_json::Value` as an
   oracle). The `feature-powerset` job now also covers `mcp`, and `metrics`
   grouped with `testing` (`--group-features metrics,testing`: neither has a
-  `cfg` touching the other, so this keeps 160 builds instead of 320).
+  `cfg` touching the other, so this keeps 160 builds instead of 320). Two
+  clippy runs were added to `checks` and `verify`,
+  `--no-default-features --features rustls-tls,tower` and
+  `rustls-tls,metrics,mcp`, after a dead-code warning shipped in every
+  `tower`-only build (`all_scope_tokens`, now `cfg(feature = "axum")`).
 
 ## [0.1.2] - 2026-09-28
 

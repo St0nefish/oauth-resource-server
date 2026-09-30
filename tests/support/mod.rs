@@ -15,7 +15,7 @@ use http::{Method, Request};
 use oauth_resource_server::axum::{AuthLayer, RequireScopes};
 use oauth_resource_server::mcp::McpToolScopes;
 use oauth_resource_server::testing::TestAuthority;
-use oauth_resource_server::{OAuthValidator, StaticTokens};
+use oauth_resource_server::{AuthorizedToken, OAuthValidator, StaticTokens};
 use tower::ServiceExt;
 
 /// The static token; it must never appear in any captured output.
@@ -59,6 +59,7 @@ pub async fn fixture() -> Fixture {
         .unwrap();
     let strict_routes = Router::new()
         .route("/any", get(ok))
+        .route("/who", get(who))
         .merge(
             Router::new()
                 .route("/admin", get(ok))
@@ -87,6 +88,12 @@ pub async fn fixture() -> Fixture {
 
 async fn ok() -> &'static str {
     "ok"
+}
+
+/// A handler that needs an OAuth token: a static token reaches it and is
+/// refused by the extractor.
+async fn who(token: AuthorizedToken) -> String {
+    token.subject.unwrap_or_default()
 }
 
 /// Send one request; the response status.

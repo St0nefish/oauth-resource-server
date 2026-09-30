@@ -61,32 +61,48 @@ type Case = (
     Vec<(Series, f64)>,
 );
 
-/// A `requests_total` series.
+/// A `requests_total` series decided by an authentication layer.
 fn request(outcome: &str, mechanism: &str, reason: &str) -> Series {
+    decided("layer", outcome, mechanism, reason)
+}
+
+/// A `requests_total` series decided at `stage`.
+fn decided(stage: &str, outcome: &str, mechanism: &str, reason: &str) -> Series {
     (
         REQUESTS_TOTAL.into(),
         vec![
             format!("mechanism={mechanism}"),
             format!("outcome={outcome}"),
             format!("reason={reason}"),
+            format!("stage={stage}"),
         ],
     )
 }
 
-fn refresh(result: &str) -> Series {
-    (JWKS_REFRESH_TOTAL.into(), vec![format!("result={result}")])
+fn refresh(host: &str, result: &str) -> Series {
+    (
+        JWKS_REFRESH_TOTAL.into(),
+        vec![format!("issuer_host={host}"), format!("result={result}")],
+    )
 }
 
-fn keys() -> Series {
-    (JWKS_KEYS.into(), vec![])
+fn keys(host: &str) -> Series {
+    (JWKS_KEYS.into(), vec![format!("issuer_host={host}")])
 }
 
-/// Everything but the keys gauge, which a snapshot reports (as 0) after
-/// it was once set; asserted separately where a refresh ran.
-fn counters(mut seen: BTreeMap<Series, f64>) -> BTreeMap<Series, f64> {
-    seen.remove(&keys());
-    seen
+/// Every counter: the keys gauges are left out, since a snapshot reports
+/// every gauge ever set (as 0 once read); they are asserted one by one.
+fn counters(seen: &BTreeMap<Series, f64>) -> BTreeMap<Series, f64> {
+    seen.iter()
+        .filter(|((name, _), _)| name != JWKS_KEYS)
+        .map(|(k, v)| (k.clone(), *v))
+        .collect()
 }
+
+/// The `TestAuthority` and every other in-process server listen here.
+const LOOPBACK: &str = "127.0.0.1";
+/// `testing::ISSUER`'s host.
+const FIXTURE_ISSUER_HOST: &str = "authentik.example.test";
 
 #[tokio::test]
 async fn every_outcome_and_refresh_is_counted_with_stable_labels() {
@@ -103,14 +119,15 @@ async fn every_outcome_and_refresh_is_counted_with_stable_labels() {
     assert_eq!(send(app, Method::GET, "/any", Some(&valid), "").await, 200);
     let held = f.validator.key_set_status().keys;
     assert!(held > 0);
+    let seen = take(&snapshotter);
     assert_eq!(
-        take(&snapshotter),
+        counters(&seen),
         BTreeMap::from([
             (request("accepted", "oauth", "none"), 1.0),
-            (refresh("success"), 1.0),
-            (keys(), held as f64),
+            (refresh(LOOPBACK, "success"), 1.0),
         ])
     );
+    assert_eq!(seen[&keys(LOOPBACK)], held as f64);
 
     let cases: Vec<Case> = vec![
         (
@@ -198,7 +215,10 @@ async fn every_outcome_and_refresh_is_counted_with_stable_labels() {
             403,
             vec![
                 (request("accepted", "oauth", "none"), 1.0),
-                (request("rejected", "oauth", "insufficient_scope"), 1.0),
+                (
+                    decided("route", "rejected", "oauth", "insufficient_scope"),
+                    1.0,
+                ),
             ],
         ),
         (
@@ -210,7 +230,10 @@ async fn every_outcome_and_refresh_is_counted_with_stable_labels() {
             403,
             vec![
                 (request("accepted", "static", "none"), 1.0),
-                (request("rejected", "static", "insufficient_scope"), 1.0),
+                (
+                    decided("route", "rejected", "static", "insufficient_scope"),
+                    1.0,
+                ),
             ],
         ),
         (
@@ -222,7 +245,27 @@ async fn every_outcome_and_refresh_is_counted_with_stable_labels() {
             403,
             vec![
                 (request("accepted", "oauth", "none"), 1.0),
-                (request("rejected", "oauth", "insufficient_scope"), 1.0),
+                (
+                    decided("route", "rejected", "oauth", "insufficient_scope"),
+                    1.0,
+                ),
+            ],
+        ),
+        (
+            // The layer accepts the static token; the handler's
+            // `AuthorizedToken` extractor refuses it.
+            "extractor refusal",
+            Method::GET,
+            "/who",
+            Some(STATIC_SECRET.into()),
+            "",
+            401,
+            vec![
+                (request("accepted", "static", "none"), 1.0),
+                (
+                    decided("handler", "rejected", "static", "oauth_token_required"),
+                    1.0,
+                ),
             ],
         ),
     ];
@@ -233,7 +276,7 @@ async fn every_outcome_and_refresh_is_counted_with_stable_labels() {
             "{name}"
         );
         assert_eq!(
-            counters(take(&snapshotter)),
+            counters(&take(&snapshotter)),
             BTreeMap::from_iter(want),
             "{name}"
         );
@@ -250,10 +293,12 @@ async fn every_outcome_and_refresh_is_counted_with_stable_labels() {
         }
         other => panic!("{other:?}"),
     }
+    let seen = take(&snapshotter);
     assert_eq!(
-        take(&snapshotter),
-        BTreeMap::from([(refresh("fetch"), 1.0), (keys(), 0.0)])
+        counters(&seen),
+        BTreeMap::from([(refresh(FIXTURE_ISSUER_HOST, "fetch"), 1.0)])
     );
+    assert_eq!(seen[&keys(FIXTURE_ISSUER_HOST)], 0.0);
 
     // A failed discovery: `discovery`.
     let idp = testing::spawn_http_server(Default::default(), None).await;
@@ -263,7 +308,21 @@ async fn every_outcome_and_refresh_is_counted_with_stable_labels() {
     let lost = OAuthValidator::new(&cfg).unwrap();
     assert!(lost.validate(&testing::valid_token()).await.is_err());
     assert_eq!(
-        take(&snapshotter),
-        BTreeMap::from([(refresh("discovery"), 1.0), (keys(), 0.0)])
+        counters(&take(&snapshotter)),
+        BTreeMap::from([(refresh(LOOPBACK, "discovery"), 1.0)])
     );
+
+    // Keys seeded with `initial_jwks` show in the gauge as soon as the
+    // validator is built, before any refresh.
+    let seeded = OAuthValidator::builder(&testing::resolved_config(&down.url))
+        .initial_jwks(&testing::jwks_body())
+        .build()
+        .unwrap();
+    let seen = take(&snapshotter);
+    assert!(counters(&seen).is_empty(), "{seen:?}");
+    assert_eq!(
+        seen[&keys(FIXTURE_ISSUER_HOST)],
+        seeded.key_set_status().keys as f64
+    );
+    assert!(seeded.key_set_status().keys > 0);
 }

@@ -29,7 +29,9 @@ name: CI
 # features together, the default feature set, and native-tls and
 # rustls-tls-native-roots each alone — those exist because `--all-features`
 # hides a `cfg` that only appears when `rustls-tls` is off, since the TLS
-# backends are additive, not mutually exclusive), tests, a `-D warnings` doc build (every public item
+# backends are additive, not mutually exclusive; and tower alone and
+# metrics+mcp without axum, because `--all-features` also hides an item
+# only the axum module reads), tests, a `-D warnings` doc build (every public item
 # needs a doc comment — see `#![warn(missing_docs)]` in `src/lib.rs`),
 # `cargo audit`, `cargo deny check` (advisories, licenses, bans and sources, per
 # `deny.toml`), and the packaging checks (`cargo package --list` and
@@ -158,6 +160,16 @@ jobs:
       - name: Clippy (rustls-tls-native-roots only)
         # The third TLS feature, alone, for the same reason.
         run: cargo clippy --all-targets --no-default-features --features rustls-tls-native-roots -- -D warnings
+
+      - name: Clippy (tower without axum)
+        # `--all-features` switches `axum` on, which hides an item only the
+        # axum module reads (a dead-code warning that once shipped) in a
+        # supported `tower`-only build.
+        run: cargo clippy --all-targets --no-default-features --features rustls-tls,tower -- -D warnings
+
+      - name: Clippy (metrics and mcp without axum)
+        # The same for `metrics`: its `cfg`s vary with `tower`, not `axum`.
+        run: cargo clippy --all-targets --no-default-features --features rustls-tls,metrics,mcp -- -D warnings
 
       - name: Tests (all features)
         run: cargo test --all-features

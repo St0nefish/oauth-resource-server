@@ -570,6 +570,11 @@ impl Tracked {
 /// fetch that fills it.
 pub(crate) struct JwksStore {
     issuer: String,
+    /// The issuer's host alone ([`jwks_host`]): the `issuer_host` label of
+    /// the `metrics` feature's key-set metrics and the discovery span field.
+    /// Fixed by configuration, so its cardinality is the number of
+    /// validators, never anything a request controls.
+    issuer_host: String,
     /// See [`crate::OAuthConfig::allow_insecure_http`]: whether a discovered
     /// `jwks_uri` may be plain http on a non-loopback host.
     allow_insecure_http: bool,
@@ -622,8 +627,11 @@ impl JwksStore {
         tracked.set_jwks_uri(config.jwks_uri.clone().filter(|uri| !uri.trim().is_empty()));
         tracked.public.keys = seed.len();
         warn_about_new_ambiguous_keys(&[], &seed, &config.key_naming);
+        let issuer_host = jwks_host(&config.issuer);
+        crate::observe::set_keys(&issuer_host, seed.len());
         Self {
             issuer: config.issuer.clone(),
+            issuer_host,
             allow_insecure_http: config.allow_insecure_http,
             algorithms: config.algorithms.clone(),
             naming: config.key_naming.clone(),
@@ -845,7 +853,7 @@ impl JwksStore {
         let held = self.status_fields().public.keys;
         record_field(&span, "result", label);
         record_field(&span, "keys", held);
-        crate::observe::count_refresh(label, held);
+        crate::observe::count_refresh(&self.issuer_host, label, held);
         result
     }
 
@@ -940,7 +948,7 @@ impl JwksStore {
             result = tracing::field::Empty,
         );
         if !span.is_disabled() {
-            record_field(&span, "issuer.host", jwks_host(&self.issuer).as_str());
+            record_field(&span, "issuer.host", self.issuer_host.as_str());
         }
         let result = self.discover_in().instrument(span.clone()).await;
         match &result {

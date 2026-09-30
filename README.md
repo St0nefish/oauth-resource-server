@@ -839,7 +839,7 @@ added in a minor release, so match with a wildcard arm); the detail text is
 not.
 
 With the `metrics` feature the crate counts every decision itself, with the
-same labels (`oauth_rs_requests_total{outcome, mechanism, reason}`), so a
+same labels (`oauth_rs_requests_total{stage, outcome, mechanism, reason}`), so a
 callback like this one is needed only for a metrics library the facade does
 not reach; see [Observability](#observability).
 
@@ -1064,6 +1064,12 @@ No field, span or label ever carries a token, a secret, a claim value, a URL
 query or a request body: every value comes from a closed set, except the
 bounded ones called out below.
 
+The log fields and `oauth_rs_requests_total` come from the layers,
+`RequireScopes`, `McpToolScopes` and the axum extractors. An application
+that calls the framework-free `authenticate()` or `OAuthValidator::validate`
+itself gets the spans and the key-set metrics, but no `auth.*` fields and no
+request counts: it logs and counts its own decisions.
+
 ### Log fields
 
 Each auth-outcome event of both layers, `RequireScopes`, `McpToolScopes`
@@ -1121,7 +1127,13 @@ WARN oauth_resource_server::axum: OAuth bearer auth rejected path=/v1/things rea
 attacker-chosen: they are cut to 128 characters and every character outside
 printable ASCII is escaped (`\u{1b}`), so no control character, ANSI escape
 or bidi override reaches a terminal or a log store raw, whatever the
-subscriber. The hosts are the host alone, never a scheme, port, path,
+subscriber. They are recorded only for a credential under the 16 KiB cap
+that has three segments. `alg` is the crate's own label (`RS256`, `EdDSA`,
+...) when it names an algorithm this crate knows; otherwise, and whenever
+the header cannot be parsed at all (`alg: none`, `HS256`, an unknown name),
+both are the raw strings from the header's JSON, bounded and escaped the
+same way — absent only when the header is not base64url JSON or the member
+is not a string. The hosts are the host alone, never a scheme, port, path,
 credential or query. A refresh a request triggers is a child of that
 request's `oauth_rs.validate` span, so a trace shows a request waiting on a
 slow authorization server. When a span's level is disabled nothing is
@@ -1137,17 +1149,26 @@ feature there is no `metrics` dependency and nothing is recorded.
 
 | Metric | Type | Labels |
 |---|---|---|
-| `oauth_rs_requests_total` | counter | `outcome`, `mechanism`, `reason` — the log fields' values; `reason` is `none` for `accepted` and `passed_through` |
-| `oauth_rs_jwks_refresh_total` | counter | `result`: `success`, `discovery`, `fetch`, `parse`, `no_usable_keys` |
-| `oauth_rs_jwks_keys` | gauge | none: the usable keys held after the latest refresh |
+| `oauth_rs_requests_total` | counter | `stage` (`layer`, `route`, `handler`), and `outcome`, `mechanism`, `reason` with the log fields' values; `reason` is `none` for `accepted` and `passed_through` |
+| `oauth_rs_jwks_refresh_total` | counter | `issuer_host`, and `result`: `success`, `discovery`, `fetch`, `parse`, `no_usable_keys` |
+| `oauth_rs_jwks_keys` | gauge | `issuer_host`: the usable keys that validator holds, set when it is built (so keys seeded with `initial_jwks` show at once) and after every refresh |
 
-`oauth_rs_requests_total` counts decisions, not requests: a request a layer
-accepts and a route then refuses (`RequireScopes`, `McpToolScopes`, an
-extractor) counts once as `accepted` and once as `rejected`. With several
-validators in one process, `oauth_rs_jwks_keys` is the most recent refresh's
-count; `OAuthValidator::key_set_status()` is per validator. The names are
-also constants in the `observability` module, whose `describe_metrics()`
-registers HELP text with the installed recorder. The `oauth_rs_` prefix is
+**`oauth_rs_requests_total` counts decisions, not requests.** `stage` says
+which check decided: `layer` is either authentication layer's admission
+(`AuthLayer`, `HttpAuthLayer`, an `allow_unauthenticated` one included),
+exactly one per request per layer, so `stage="layer"` is the request count;
+`route` is a refusal by `RequireScopes` or `McpToolScopes`; `handler` is a
+refusal by an axum extractor (`AuthorizedToken`, `Credential`,
+`StaticTokenMatch`, `Scoped`). A request a layer accepts and a route then
+refuses counts once under `layer` (`accepted`) and once under `route`
+(`rejected`). Route and handler checks count only refusals.
+
+`issuer_host` is the configured issuer's host alone (no scheme, port, path,
+credential or query): one value per validator, bounded by your
+configuration, never by traffic. Two validators for the same host share a
+series. The names are also constants in the `observability` module, whose
+`describe_metrics()` registers HELP text and units with the installed
+recorder. The `oauth_rs_` prefix is
 fixed rather than configurable: a stable name is what dashboards and alerts
 key on, and an exporter or Prometheus' `metric_relabel_configs` can still
 rename it.
@@ -1155,15 +1176,17 @@ rename it.
 Some queries (Prometheus):
 
 ```text
-# Refusals per second by reason, leaving out first-contact 401s.
-sum by (reason) (rate(oauth_rs_requests_total{outcome="rejected", reason!="missing"}[5m]))
+# Refusals per second by stage and reason, leaving out first-contact 401s.
+sum by (stage, reason) (rate(oauth_rs_requests_total{outcome="rejected", reason!="missing"}[5m]))
 
-# Share of requests refused because the signing keys could not be loaded.
-sum(rate(oauth_rs_requests_total{reason="key_set_unavailable"}[5m]))
-  / sum(rate(oauth_rs_requests_total[5m]))
+# Share of requests the layer refused because the signing keys could not be
+# loaded. Both sides are `stage="layer"`: counts are per decision, and only
+# the layer stage sees every request exactly once.
+sum(rate(oauth_rs_requests_total{stage="layer", reason="key_set_unavailable"}[5m]))
+  / sum(rate(oauth_rs_requests_total{stage="layer"}[5m]))
 
-# Alert: a key refresh failing, or no signing key held at all.
-increase(oauth_rs_jwks_refresh_total{result!="success"}[1h]) > 0
+# Alert: a key refresh failing, or no signing key held at all, per issuer.
+sum by (issuer_host) (increase(oauth_rs_jwks_refresh_total{result!="success"}[1h])) > 0
 oauth_rs_jwks_keys == 0
 ```
 

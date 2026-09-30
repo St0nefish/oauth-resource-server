@@ -12,6 +12,8 @@ mod support;
 use std::collections::BTreeMap;
 use std::sync::{Arc, Mutex};
 
+use base64::Engine;
+use base64::engine::general_purpose::URL_SAFE_NO_PAD;
 use http::Method;
 use tracing::field::{Field, Visit};
 use tracing::span::{Attributes, Id, Record};
@@ -395,6 +397,40 @@ async fn auth_outcomes_carry_stable_fields_and_spans_bound_the_header() {
             "{shown}"
         );
         assert_eq!(span.fields["alg"], "RS256");
+    }
+
+    // 11. The `alg` field is the crate's own label, and a header jsonwebtoken
+    //     cannot read still shows its raw (bounded, escaped) `alg` and `kid`:
+    //     `none` (no parse at all) and `HS256` (parsed, but no `Algorithm`).
+    for (header, alg, kid) in [
+        (
+            serde_json::json!({"alg": "none", "kid": "k\u{1b}1"}),
+            "none",
+            Some("k\\u{1b}1"),
+        ),
+        (
+            serde_json::json!({"alg": "HS256", "typ": "at+jwt"}),
+            "HS256",
+            None,
+        ),
+    ] {
+        let unsigned = format!(
+            "{}.{}.c2ln",
+            URL_SAFE_NO_PAD.encode(header.to_string()),
+            URL_SAFE_NO_PAD.encode(r#"{"sub":"x"}"#),
+        );
+        presented.push(unsigned.clone());
+        assert_eq!(
+            send(app, Method::GET, "/any", Some(&unsigned), "").await,
+            401
+        );
+        capture.take_events();
+        let spans = capture.take_spans();
+        assert_eq!(spans.len(), 1, "refused from the header alone: {spans:#?}");
+        assert_eq!(spans[0].name, "oauth_rs.validate_cached");
+        assert_eq!(spans[0].fields["alg"], alg, "{spans:#?}");
+        assert_eq!(spans[0].fields.get("kid").map(String::as_str), kid);
+        assert_eq!(spans[0].fields["auth.outcome"], "rejected");
     }
 
     // Nothing secret anywhere: not in a field, not in the rendered output.

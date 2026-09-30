@@ -209,7 +209,9 @@ pub use crate::http_layer::{
     AuthLayerError, CredentialSource, InvalidScope, RejectContext, RequireScopes,
     RequireScopesService,
 };
-use crate::observe::{self, Mechanism, Outcome, REASON_MISCONFIGURED, REASON_NONE, count_request};
+use crate::observe::{
+    self, Mechanism, Outcome, REASON_MISCONFIGURED, REASON_NONE, Stage, count_request,
+};
 pub use crate::refusal::DEFAULT_STATIC_CHALLENGE;
 // What the test module (`use super::*`) used from here before these moved to
 // `crate::http_layer`.
@@ -861,7 +863,12 @@ impl Enforce {
         let rejection = TokenRejection::InsufficientScope;
         let mechanism = Mechanism::of_request(request.extensions.get::<Credential>(), &rejection);
         if self.gate.oauth.is_none() {
-            count_request(Outcome::Rejected, mechanism, REASON_MISCONFIGURED);
+            count_request(
+                Stage::Handler,
+                Outcome::Rejected,
+                mechanism,
+                REASON_MISCONFIGURED,
+            );
             error!(
                 path = %path,
                 required = ?required,
@@ -873,7 +880,12 @@ impl Enforce {
                  OAuth validator, so no credential can carry them; refusing the request"
             );
         } else {
-            count_request(Outcome::Rejected, mechanism, "insufficient_scope");
+            count_request(
+                Stage::Handler,
+                Outcome::Rejected,
+                mechanism,
+                observe::reason(&rejection),
+            );
             let present = match request.extensions.get::<Credential>() {
                 Some(Credential::OAuth(token)) => token.scopes.clone(),
                 _ => Vec::new(),
@@ -884,7 +896,7 @@ impl Enforce {
                 present = ?present,
                 auth.outcome = Outcome::Rejected.as_str(),
                 auth.mechanism = mechanism.as_str(),
-                auth.reason = "insufficient_scope",
+                auth.reason = observe::reason(&rejection),
                 auth.status = 403u16,
                 "The credential lacks the scopes this handler requires"
             );
@@ -903,11 +915,12 @@ impl Enforce {
         rejection: &TokenRejection,
         request: &Parts,
         mechanism: Mechanism,
+        stage: Stage,
     ) -> Response {
         // Every OAuth client's first request carries no credential (401 →
         // read `resource_metadata` → authorize), so it is logged at `debug`,
         // not as a warning.
-        log_layer_refusal!(&self.gate, request, rejection, mechanism);
+        log_layer_refusal!(&self.gate, request, rejection, mechanism, stage);
         self.reject(rejection, request)
     }
 }
@@ -965,7 +978,12 @@ impl AuthLayer {
     async fn check(&self, mut request: Request) -> Result<Request, Response> {
         let enforce = match &*self.inner {
             Mode::AllowUnauthenticated => {
-                count_request(Outcome::PassedThrough, Mechanism::None, REASON_NONE);
+                count_request(
+                    Stage::Layer,
+                    Outcome::PassedThrough,
+                    Mechanism::None,
+                    REASON_NONE,
+                );
                 request.extensions_mut().insert(LayerRan(self.clone()));
                 self.mark(request.extensions_mut());
                 return Ok(request);
@@ -984,7 +1002,7 @@ impl AuthLayer {
             Admission::OAuth(token) => log_oauth_accepted!(&parts, &token),
             Admission::PassedThrough => log_passed_through!(&parts),
             Admission::Refused(rejection, mechanism) => {
-                return Err(enforce.refuse(&rejection, &parts, mechanism));
+                return Err(enforce.refuse(&rejection, &parts, mechanism, Stage::Layer));
             }
         }
         parts.extensions.insert(LayerRan(self.clone()));
@@ -1010,7 +1028,14 @@ impl AuthLayer {
         wants: Wants,
     ) -> Response {
         let mechanism = Mechanism::of_request(parts.extensions.get::<Credential>(), rejection);
-        let misconfigured = || count_request(Outcome::Rejected, mechanism, REASON_MISCONFIGURED);
+        let misconfigured = || {
+            count_request(
+                Stage::Handler,
+                Outcome::Rejected,
+                mechanism,
+                REASON_MISCONFIGURED,
+            )
+        };
         match &*self.inner {
             Mode::Enforce(enforce)
                 if wants == Wants::OAuthToken && enforce.gate.oauth.is_none() =>
@@ -1042,7 +1067,7 @@ impl AuthLayer {
                 );
                 enforce.reject(rejection, parts)
             }
-            Mode::Enforce(enforce) => enforce.refuse(rejection, parts, mechanism),
+            Mode::Enforce(enforce) => enforce.refuse(rejection, parts, mechanism, Stage::Handler),
             // No challenge of its own to send: the default one, as a
             // static-only layer would (RFC 9110 §15.5.2).
             Mode::AllowUnauthenticated => {
@@ -1104,7 +1129,12 @@ fn find<T: Clone + Send + Sync + 'static>(parts: &Parts) -> Found<T> {
 /// The response for an extractor on a route no [`AuthLayer`] covers: 500, and
 /// an `error` log naming the mistake. Never access, never "anonymous".
 fn no_layer(parts: &Parts, extractor: &'static str) -> Response {
-    count_request(Outcome::Rejected, Mechanism::None, REASON_MISCONFIGURED);
+    count_request(
+        Stage::Handler,
+        Outcome::Rejected,
+        Mechanism::None,
+        REASON_MISCONFIGURED,
+    );
     error!(
         path = %parts.uri.path(),
         extractor,
@@ -1440,7 +1470,12 @@ impl<S: ScopeSet, St: Send + Sync> FromRequestParts<St> for Scoped<S> {
         // Unreachable after the check above; kept so the extractor never
         // proceeds on an unchecked set even if the check were removed.
         let Ok(required) = crate::http_layer::checked_scopes(S::SCOPES.iter().copied()) else {
-            count_request(Outcome::Rejected, Mechanism::None, REASON_MISCONFIGURED);
+            count_request(
+                Stage::Handler,
+                Outcome::Rejected,
+                Mechanism::None,
+                REASON_MISCONFIGURED,
+            );
             error!(
                 path = %parts.uri.path(),
                 extractor = std::any::type_name::<S>(),
