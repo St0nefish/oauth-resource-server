@@ -85,6 +85,7 @@ oauth-resource-server = { version = "0.2", features = ["axum", "serde"] }
 | `tower` | no | The `http_layer` module: `HttpAuthLayer`, an authentication layer for any `tower` service over `http::Request<B>` (hyper, tonic, ...), whatever its body types. See [Using with other frameworks](#using-with-other-frameworks). |
 | `axum` | no | The `axum` module: the `AuthLayer` middleware, `metadata_router`, axum extractors for `Credential` and `AuthorizedToken`, and per-route scopes (`RequireScopes`, the `Scoped<S>` extractor). Implies `tower`. |
 | `mcp` | no | The `mcp` module, an integration helper for [Model Context Protocol](https://modelcontextprotocol.io) servers: `McpToolScopes`, a tower layer that requires scopes per tool by reading the JSON-RPC `tools/call` in the request body. `serde_json` only, no MCP SDK. Implies `tower`. See [Per-tool scopes](#per-tool-scopes-mcptoolscopes). |
+| `metrics` | no | Counters and a gauge for authentication decisions and JWKS refreshes, through the [`metrics`](https://docs.rs/metrics) facade, and the `observability` module naming them. See [Observability](#observability). Off, it adds no dependency and records nothing. |
 | `testing` | no | A fake authorization server (`TestAuthority`), a fluent token builder, and the throwaway signing keys behind them, for **your tests only**. Never enable it in a production build. It follows semver like the rest of the crate. |
 
 The core (config, validator, `authenticate`, `refusal`, `static_token_policy`)
@@ -837,6 +838,11 @@ kind a given refusal carries, are stable across releases (a new kind may be
 added in a minor release, so match with a wildcard arm); the detail text is
 not.
 
+With the `metrics` feature the crate counts every decision itself, with the
+same labels (`oauth_rs_requests_total{outcome, mechanism, reason}`), so a
+callback like this one is needed only for a metrics library the facade does
+not reach; see [Observability](#observability).
+
 **Without OAuth**, a 401 carries `WWW-Authenticate: Bearer error="invalid_token"`
 (`axum::DEFAULT_STATIC_CHALLENGE`), because RFC 9110 §15.5.2 requires every 401
 to carry a challenge. `AuthLayerBuilder::static_challenge` sets another value,
@@ -1042,6 +1048,124 @@ fn probes(oauth: Arc<OAuthValidator>) -> Router {
   repeats upstream error text: fine for logs and an internal status page. On
   a public endpoint, report `RefreshError::kind()` (`discovery`, `fetch`,
   `parse`, `no_usable_keys`) instead.
+
+## Observability
+
+Every authentication decision is logged with a fixed set of structured
+fields, validation and key refreshes run in tracing spans, and the optional
+`metrics` feature counts both. The field names, span names, metric names and
+every value listed below are **stable: covered by semver** like the public
+API. Renaming one, or moving an outcome from one value to another, is a
+breaking change; adding a value (a new `InvalidTokenKind` label, say) is not.
+Message text stays unstable (see [MSRV and semver policy](#msrv-and-semver-policy)),
+so build dashboards and alerts on these fields, never on the sentence.
+
+No field, span or label ever carries a token, a secret, a claim value, a URL
+query or a request body: every value comes from a closed set, except the
+bounded ones called out below.
+
+### Log fields
+
+Each auth-outcome event of both layers, `RequireScopes`, `McpToolScopes`
+and the axum extractors (`AuthorizedToken`, `Credential`,
+`StaticTokenMatch`, `Scoped`) carries these fields next to its existing ones
+(`path`, `reason`, `required`, ...), which are unchanged:
+
+| Field | Values | Present on |
+|---|---|---|
+| `auth.outcome` | `accepted`, `rejected`, `passed_through` | every auth-outcome event |
+| `auth.mechanism` | `static`, `oauth`, `none` | every auth-outcome event |
+| `auth.reason` | an `InvalidTokenKind::as_str()` label (`too_large`, `not_jwt`, `malformed_header`, `critical_header`, `algorithm_not_allowed`, `type_not_allowed`, `key_not_found`, `key_set_unavailable`, `malformed_token`, `bad_signature`, `expired`, `not_yet_valid`, `wrong_issuer`, `wrong_audience`, `missing_claim`, `malformed_claim`, `sender_constrained`, `client_not_allowed`, `token_too_old`, `claim_mismatch`, `static_token_mismatch`, `no_mechanism`, `oauth_token_required`, `static_token_required`, `other`), `missing`, `insufficient_scope`, or `misconfigured` | `rejected` only |
+| `auth.status` | `401`, `403`, `500` (an integer) | `rejected` only |
+| `auth.static_label` | the matched static token's label (1–64 visible ASCII characters, validated by `StaticTokens::with`) | an accepted static token with a label |
+
+`auth.mechanism` names the credential that was judged: `static` for a static
+token (accepted, refused by a scope requirement, or not matching on a
+static-only layer), `oauth` for an OAuth access token (including a
+credential that was neither, when OAuth is configured: the refusal comes from
+the validator), and `none` when no credential was presented or none could be
+checked. `misconfigured` marks the `error`-level "Server misconfiguration"
+events (a route no layer covers, a required extractor or scope behind
+`allow_unauthenticated`, scopes behind a layer with no validator).
+
+The events, at the levels the module docs list (targets
+`oauth_resource_server::axum` and `oauth_resource_server::http_layer`):
+
+| Message | Level | `auth.outcome` |
+|---|---|---|
+| `OAuth bearer auth accepted` | `debug` | `accepted` |
+| `Static bearer auth accepted` | `debug` | `accepted` |
+| `No credential presented; optional auth passes the request through` | `debug` | `passed_through` |
+| `No bearer credential presented` | `debug` | `rejected` (`missing`, with OAuth configured) |
+| `OAuth bearer auth rejected` / `Bearer auth rejected` | `warn` | `rejected` |
+| `The credential lacks the scopes this route requires` / `… this handler requires` | `info` | `rejected` (`insufficient_scope`, 403) |
+| `Server misconfiguration: …` | `error` | `rejected` (`misconfigured`) |
+
+An `allow_unauthenticated` layer logs nothing per request (the `metrics`
+feature counts it as `passed_through`). A refusal now reads:
+
+```text
+WARN oauth_resource_server::axum: OAuth bearer auth rejected path=/v1/things reason=Invalid(InvalidToken { kind: Expired, detail: "token rejected: ExpiredSignature" }) auth.outcome="rejected" auth.mechanism="oauth" auth.reason="expired" auth.status=401
+```
+
+### Spans
+
+| Span | Level, target | Fields |
+|---|---|---|
+| `oauth_rs.validate` | `debug`, `oauth_resource_server::validator` | `kid`, `alg`, `auth.outcome` (`accepted`, `rejected`), `auth.reason` |
+| `oauth_rs.validate_cached` | `debug`, `oauth_resource_server::validator` | as above; `auth.outcome` is also `needs_key_fetch` (the cache-only first pass found no key, and `oauth_rs.validate` follows) |
+| `oauth_rs.jwks_refresh` | `info`, `oauth_resource_server::jwks` | `jwks.host`, `result` (`success`, `discovery`, `fetch`, `parse`, `no_usable_keys`), `keys` (held afterwards) |
+| `oauth_rs.jwks_discovery` | `info`, `oauth_resource_server::jwks` | `issuer.host`, `jwks.host`, `result` (`success`, `discovery`) |
+
+`kid` and `alg` come from the token's **unverified** header, so they are
+attacker-chosen: they are cut to 128 characters and every character outside
+printable ASCII is escaped (`\u{1b}`), so no control character, ANSI escape
+or bidi override reaches a terminal or a log store raw, whatever the
+subscriber. The hosts are the host alone, never a scheme, port, path,
+credential or query. A refresh a request triggers is a child of that
+request's `oauth_rs.validate` span, so a trace shows a request waiting on a
+slow authorization server. When a span's level is disabled nothing is
+formatted or allocated for it: the validation path makes the same
+allocations as without the spans.
+
+### Metrics (feature `metrics`)
+
+With the `metrics` feature, this crate reports through the
+[`metrics`](https://docs.rs/metrics) facade; install any recorder or exporter
+(`metrics-exporter-prometheus`, say) in your application. Without the
+feature there is no `metrics` dependency and nothing is recorded.
+
+| Metric | Type | Labels |
+|---|---|---|
+| `oauth_rs_requests_total` | counter | `outcome`, `mechanism`, `reason` — the log fields' values; `reason` is `none` for `accepted` and `passed_through` |
+| `oauth_rs_jwks_refresh_total` | counter | `result`: `success`, `discovery`, `fetch`, `parse`, `no_usable_keys` |
+| `oauth_rs_jwks_keys` | gauge | none: the usable keys held after the latest refresh |
+
+`oauth_rs_requests_total` counts decisions, not requests: a request a layer
+accepts and a route then refuses (`RequireScopes`, `McpToolScopes`, an
+extractor) counts once as `accepted` and once as `rejected`. With several
+validators in one process, `oauth_rs_jwks_keys` is the most recent refresh's
+count; `OAuthValidator::key_set_status()` is per validator. The names are
+also constants in the `observability` module, whose `describe_metrics()`
+registers HELP text with the installed recorder. The `oauth_rs_` prefix is
+fixed rather than configurable: a stable name is what dashboards and alerts
+key on, and an exporter or Prometheus' `metric_relabel_configs` can still
+rename it.
+
+Some queries (Prometheus):
+
+```text
+# Refusals per second by reason, leaving out first-contact 401s.
+sum by (reason) (rate(oauth_rs_requests_total{outcome="rejected", reason!="missing"}[5m]))
+
+# Share of requests refused because the signing keys could not be loaded.
+sum(rate(oauth_rs_requests_total{reason="key_set_unavailable"}[5m]))
+  / sum(rate(oauth_rs_requests_total[5m]))
+
+# Alert: a key refresh failing, or no signing key held at all.
+increase(oauth_rs_jwks_refresh_total{result!="success"}[1h]) > 0
+oauth_rs_jwks_keys == 0
+```
 
 ## Configuration reference
 
@@ -1435,7 +1559,9 @@ an `InvalidToken`'s `kind()` names the check that failed).
   values, and the layer marks the configured credential headers sensitive on
   the request, so a tracing layer or a handler's `Debug` of the headers shows
   `Sensitive` instead of the token. The token-derived `kid`, `typ`, subject and
-  principal are truncated to 128 characters when logged; scope values are
+  principal are truncated to 128 characters when logged, and the `kid` and
+  `alg` span fields (from the unverified header) additionally have every
+  character outside printable ASCII escaped; scope values are
   logged in full (on an insufficient-scope refusal at `info`, and on an
   accepted token at `debug`), bounded only by the 16 KiB credential cap.
   Rejection reasons go to the log, never to the client. A credential in the
@@ -2005,13 +2131,16 @@ rotation at the authorization server needs no restart.
 The layer logs refusals under the target `oauth_resource_server::axum`: `warn`
 for a refused credential, and `debug` for an accepted OAuth token and, when
 OAuth is configured, for a request with no credential at all (every OAuth
-client's first request looks like that). An accepted static token is not
-logged, and with only a static token configured a request with no credential
-is logged at `warn` like any other refusal. Enable `debug` for that target while setting up. A refusal looks like
+client's first request looks like that). An accepted static token is logged
+at `debug` too (`Static bearer auth accepted`, with its label), and with only
+a static token configured a request with no credential is logged at `warn`
+like any other refusal. Every one of these lines also carries the stable
+`auth.*` fields described under [Observability](#observability); filter on
+those rather than on the message. Enable `debug` for that target while setting up. A refusal looks like
 this:
 
 ```text
-WARN oauth_resource_server::axum: OAuth bearer auth rejected path=/v1/things reason=Invalid(InvalidToken { kind: WrongAudience, detail: "token rejected: InvalidAudience" })
+WARN oauth_resource_server::axum: OAuth bearer auth rejected path=/v1/things reason=Invalid(InvalidToken { kind: WrongAudience, detail: "token rejected: InvalidAudience" }) auth.outcome="rejected" auth.mechanism="oauth" auth.reason="wrong_audience" auth.status=401
 ```
 
 With only a static token configured, the line is `Bearer auth rejected`, with
@@ -2191,6 +2320,12 @@ A new minor release is required for:
 - A new configuration field. Types that may grow are `#[non_exhaustive]`, but
   `OAuthConfig` deliberately is not, so it can be built with struct-literal
   syntax.
+
+**Log field, span and metric names are a stable API.** The `auth.*` log
+fields, the `oauth_rs.*` span names and fields, the `oauth_rs_*` metric
+names and labels, and every value [Observability](#observability) lists are
+covered by semver: renaming one, or moving an outcome to another value, is a
+breaking change; adding a value is not.
 
 **Message text is not a stable API.** The wording of `ConfigError::problems`
 (and the `Display` built from it), of rejection reasons, and of log lines may

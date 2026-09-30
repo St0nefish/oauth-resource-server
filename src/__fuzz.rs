@@ -48,7 +48,10 @@ fn validators() -> &'static [OAuthValidator; 2] {
 /// three-segment token whose raw header has no `crit` member.
 pub fn check_header(token: &str, require_at_jwt: bool) {
     let validator = &validators()[usize::from(require_at_jwt)];
-    if validator.check_header(token).is_ok() {
+    if validator
+        .check_header(token, &tracing::Span::none())
+        .is_ok()
+    {
         assert!(token.len() <= MAX_TOKEN_BYTES);
         assert_eq!(token.split('.').count(), 3);
         let segment = token.split('.').next().unwrap();

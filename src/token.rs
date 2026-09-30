@@ -1036,6 +1036,27 @@ pub(crate) fn for_log(s: &str) -> String {
     out
 }
 
+/// A token-derived string for a tracing span field (the unverified header's
+/// `kid` and `alg`): [`for_log`]'s truncation, then every character outside
+/// printable ASCII escaped as `\u{..}`. A field is written verbatim by some
+/// subscribers (a JSON formatter, an OpenTelemetry exporter) rather than
+/// through `Debug`, so the escaping is done here: no control character, ANSI
+/// escape or bidi override from an attacker's header reaches a terminal or a
+/// log store raw. At most `MAX_LOGGED_CHARS` input characters, each at most
+/// ten output bytes, plus the ellipsis.
+pub(crate) fn for_log_field(s: &str) -> String {
+    let bounded = for_log(s);
+    let mut out = String::with_capacity(bounded.len());
+    for c in bounded.chars() {
+        if c.is_ascii_graphic() || c == ' ' || c == '…' {
+            out.push(c);
+        } else {
+            out.extend(c.escape_unicode());
+        }
+    }
+    out
+}
+
 /// A `kid` for a log line or rejection reason: quoted and truncated, or `(none)`.
 pub(crate) fn describe_kid(kid: Option<&str>) -> String {
     match kid {
@@ -1217,6 +1238,19 @@ mod tests {
         let long = "x".repeat(MAX_LOGGED_CHARS * 3);
         assert_eq!(for_log(&long).chars().count(), MAX_LOGGED_CHARS + 1);
         assert_eq!(for_log("short"), "short");
+    }
+
+    #[test]
+    fn span_field_values_are_truncated_and_escaped() {
+        assert_eq!(for_log_field("kid-1 A"), "kid-1 A");
+        assert_eq!(
+            for_log_field("\u{1b}[31mx\u{7}\r\n\u{202e}é"),
+            "\\u{1b}[31mx\\u{7}\\u{d}\\u{a}\\u{202e}\\u{e9}"
+        );
+        let hostile = "\u{1b}".repeat(5 * 1024);
+        let shown = for_log_field(&hostile);
+        assert_eq!(shown, format!("{}…", "\\u{1b}".repeat(MAX_LOGGED_CHARS)));
+        assert!(for_log_field(&"\u{10ffff}".repeat(1000)).len() <= MAX_LOGGED_CHARS * 10 + 3);
     }
 
     #[test]

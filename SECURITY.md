@@ -154,7 +154,15 @@ the ones a report is most likely to concern:
   early exit once one matches and no branch on which entry matched. A
   secret's length is not hidden. No static token reaches a `Debug` impl or a
   log line; a set prints its count and labels, and labels are restricted to
-  1 to 64 visible ASCII characters so they are always log-safe.
+  1 to 64 visible ASCII characters so they are always log-safe;
+- the structured observability output (the `auth.*` log fields, the
+  `oauth_rs.*` spans and, with the `metrics` feature, the metric labels)
+  carries only values from fixed sets, a static token's log-safe label, and
+  hosts without scheme, path, credential or query — never a token, secret,
+  claim value, URL query or request body. The span fields taken from a
+  token's unverified header (`kid`, `alg`) are cut to 128 characters and
+  every character outside printable ASCII is escaped, so a hostile header
+  cannot inject control characters or terminal escapes into a log.
 
 See `CLAUDE.md` for the full list and the module each one lives in.
 

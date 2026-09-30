@@ -68,11 +68,24 @@
 //!
 //! The same outcomes at the same levels as the axum layer, with target
 //! `oauth_resource_server::http_layer`: an accepted OAuth token at `debug`
-//! (principal, subject, scopes — never the token); a request with no credential
+//! (principal, subject, scopes — never the token); an accepted static token
+//! at `debug` (its label, never the token); a request with no credential
 //! at `debug` when OAuth is configured; a request with no credential passed
 //! through by an [`optional`](HttpAuthLayerBuilder::optional) layer at `debug`;
 //! any other refusal at `warn`, with the reason when OAuth is configured. The
-//! reason goes to the log only, never to the caller.
+//! reason goes to the log only, never to the caller. A route-level scope
+//! refusal ([`RequireScopes`], `McpToolScopes`) is logged at `info` with the
+//! required and present scopes; a wiring no request can satisfy at `error`.
+//!
+//! Every one of these events (the route-level refusals included) also
+//! carries the stable, low-cardinality fields `auth.outcome` (`accepted`,
+//! `rejected`, `passed_through`), `auth.mechanism` (`static`, `oauth`,
+//! `none`) and, on a refusal, `auth.reason` (an `InvalidTokenKind` label,
+//! `missing`, `insufficient_scope` or `misconfigured`) and `auth.status`
+//! (401, 403 or 500); an accepted labeled static token adds
+//! `auth.static_label`. Unlike the message text, their names and values are
+//! covered by semver — the README's "Observability" section lists them all,
+//! with the spans and the `metrics` feature's counters.
 //!
 //! # Naming
 //!
@@ -101,9 +114,10 @@ use crate::authenticate::{
     Credential, StaticTokenMatch, StaticTokens, authenticate_with_static_tokens,
 };
 use crate::config::is_scope_token;
+use crate::observe::{self, Mechanism, Outcome, REASON_MISCONFIGURED, REASON_NONE, count_request};
 use crate::policy::StaticTokenDecision;
 use crate::refusal::{BARE_INSUFFICIENT_SCOPE_CHALLENGE, DEFAULT_STATIC_CHALLENGE, select};
-use crate::token::{AuthorizedToken, TokenRejection, for_log, missing_scopes};
+use crate::token::{AuthorizedToken, TokenRejection, missing_scopes};
 use crate::validator::OAuthValidator;
 
 /// Where a request may carry a credential. Each configured source contributes
@@ -404,9 +418,137 @@ pub(crate) enum Admission {
     OAuth(AuthorizedToken),
     /// `optional()`: no credential was presented; nothing was inserted.
     PassedThrough,
-    /// Refused.
-    Refused(TokenRejection),
+    /// Refused, by the mechanism named (the `auth.mechanism` log field).
+    Refused(TokenRejection, Mechanism),
 }
+
+/// The `debug` line (and `metrics` count) for an accepted static token,
+/// with the matched entry's log-safe label as `auth.static_label` (absent
+/// for an unlabeled entry). Logged under the calling layer's module target.
+macro_rules! log_static_accepted {
+    ($parts:expr) => {{
+        let parts: &http::request::Parts = $parts;
+        crate::observe::count_request(
+            crate::observe::Outcome::Accepted,
+            crate::observe::Mechanism::Static,
+            crate::observe::REASON_NONE,
+        );
+        match parts
+            .extensions
+            .get::<crate::authenticate::StaticTokenMatch>()
+            .and_then(crate::authenticate::StaticTokenMatch::label)
+        {
+            Some(label) => tracing::debug!(
+                path = %parts.uri.path(),
+                auth.outcome = "accepted",
+                auth.mechanism = "static",
+                auth.static_label = label,
+                "Static bearer auth accepted"
+            ),
+            None => tracing::debug!(
+                path = %parts.uri.path(),
+                auth.outcome = "accepted",
+                auth.mechanism = "static",
+                "Static bearer auth accepted"
+            ),
+        }
+    }};
+}
+pub(crate) use log_static_accepted;
+
+/// The `debug` line (and `metrics` count) for an accepted OAuth token:
+/// principal, subject (both through `for_log`) and scopes — never the token.
+macro_rules! log_oauth_accepted {
+    ($parts:expr, $token:expr) => {{
+        let parts: &http::request::Parts = $parts;
+        let token: &crate::token::AuthorizedToken = $token;
+        crate::observe::count_request(
+            crate::observe::Outcome::Accepted,
+            crate::observe::Mechanism::OAuth,
+            crate::observe::REASON_NONE,
+        );
+        tracing::debug!(
+            path = %parts.uri.path(),
+            principal = ?token.principal.as_deref().map(crate::token::for_log),
+            subject = ?token.subject.as_deref().map(crate::token::for_log),
+            scopes = ?token.scopes,
+            auth.outcome = "accepted",
+            auth.mechanism = "oauth",
+            "OAuth bearer auth accepted"
+        );
+    }};
+}
+pub(crate) use log_oauth_accepted;
+
+/// The `debug` line (and `metrics` count) for an `optional()` layer's
+/// pass-through of a request with no credential.
+macro_rules! log_passed_through {
+    ($parts:expr) => {{
+        let parts: &http::request::Parts = $parts;
+        crate::observe::count_request(
+            crate::observe::Outcome::PassedThrough,
+            crate::observe::Mechanism::None,
+            crate::observe::REASON_NONE,
+        );
+        tracing::debug!(
+            path = %parts.uri.path(),
+            auth.outcome = "passed_through",
+            auth.mechanism = "none",
+            "No credential presented; optional auth passes the request through"
+        );
+    }};
+}
+pub(crate) use log_passed_through;
+
+/// A layer's own refusal, logged at the level the module docs give (and
+/// counted with `metrics`): `debug` for no credential when OAuth is
+/// configured — every OAuth client's first request (401 → read
+/// `resource_metadata` → authorize) looks like that —, `warn` otherwise.
+/// A macro so the event's target stays the calling layer's module.
+macro_rules! log_layer_refusal {
+    ($gate:expr, $parts:expr, $rejection:expr, $mechanism:expr) => {{
+        let gate: &crate::http_layer::Gate = $gate;
+        let parts: &http::request::Parts = $parts;
+        let rejection: &crate::token::TokenRejection = $rejection;
+        let mechanism: crate::observe::Mechanism = $mechanism;
+        let path = parts.uri.path();
+        let reason = crate::observe::reason(rejection);
+        let status = crate::observe::status(rejection);
+        crate::observe::count_request(crate::observe::Outcome::Rejected, mechanism, reason);
+        match (&gate.oauth, rejection) {
+            (None, _) => tracing::warn!(
+                path = %path,
+                auth.outcome = "rejected",
+                auth.mechanism = mechanism.as_str(),
+                auth.reason = reason,
+                auth.status = status,
+                "Bearer auth rejected"
+            ),
+            (Some(_), crate::token::TokenRejection::Missing) => {
+                tracing::debug!(
+                    path = %path,
+                    auth.outcome = "rejected",
+                    auth.mechanism = mechanism.as_str(),
+                    auth.reason = reason,
+                    auth.status = status,
+                    "No bearer credential presented"
+                );
+            }
+            (Some(_), _) => {
+                tracing::warn!(
+                    path = %path,
+                    reason = ?rejection,
+                    auth.outcome = "rejected",
+                    auth.mechanism = mechanism.as_str(),
+                    auth.reason = reason,
+                    auth.status = status,
+                    "OAuth bearer auth rejected"
+                );
+            }
+        }
+    }};
+}
+pub(crate) use log_layer_refusal;
 
 impl Gate {
     /// The fail-closed build both layers' builders end in.
@@ -573,7 +715,7 @@ impl Gate {
             Ok((Credential::StaticToken, _))
                 if !self.required_scopes.is_empty() && !self.static_bypasses_scopes =>
             {
-                Admission::Refused(TokenRejection::InsufficientScope)
+                Admission::Refused(TokenRejection::InsufficientScope, Mechanism::Static)
             }
             Ok((Credential::OAuth(token), _))
                 if !missing_scopes(
@@ -582,7 +724,7 @@ impl Gate {
                 )
                 .is_empty() =>
             {
-                Admission::Refused(TokenRejection::InsufficientScope)
+                Admission::Refused(TokenRejection::InsufficientScope, Mechanism::OAuth)
             }
             Ok((Credential::StaticToken, matched)) => {
                 parts.extensions.insert(Credential::StaticToken);
@@ -616,7 +758,10 @@ impl Gate {
             {
                 Admission::PassedThrough
             }
-            Err(rejection) => Admission::Refused(rejection),
+            Err(rejection) => {
+                let mechanism = Mechanism::of_rejection(&rejection);
+                Admission::Refused(rejection, mechanism)
+            }
         }
     }
 
@@ -929,13 +1074,19 @@ pub(crate) fn scope_refusal<B: Default + 'static>(
     what: &'static str,
 ) -> Response<B> {
     let path = parts.uri.path();
+    let mechanism = Mechanism::of_request(parts.extensions.get::<Credential>(), rejection);
     let Some(GateRan(gate)) = parts.extensions.get::<GateRan>() else {
         error!(
             path = %path,
             what,
+            auth.outcome = Outcome::Rejected.as_str(),
+            auth.mechanism = mechanism.as_str(),
+            auth.reason = REASON_MISCONFIGURED,
+            auth.status = 500u16,
             "Server misconfiguration: a scope requirement ran on a route no authentication \
              layer covers; refusing the request"
         );
+        count_request(Outcome::Rejected, mechanism, REASON_MISCONFIGURED);
         let mut response = Response::new(B::default());
         *response.status_mut() = StatusCode::INTERNAL_SERVER_ERROR;
         return response;
@@ -944,9 +1095,14 @@ pub(crate) fn scope_refusal<B: Default + 'static>(
         error!(
             path = %path,
             what,
+            auth.outcome = Outcome::Rejected.as_str(),
+            auth.mechanism = mechanism.as_str(),
+            auth.reason = REASON_MISCONFIGURED,
+            auth.status = 401u16,
             "Server misconfiguration: a scope requirement needs a credential, but its \
              authentication layer allows unauthenticated requests; refusing the request"
         );
+        count_request(Outcome::Rejected, mechanism, REASON_MISCONFIGURED);
         let mut response = Response::new(B::default());
         *response.status_mut() = StatusCode::UNAUTHORIZED;
         response.headers_mut().insert(
@@ -955,11 +1111,21 @@ pub(crate) fn scope_refusal<B: Default + 'static>(
         );
         return response;
     };
+    let status = observe::status(rejection);
+    let reason = match (rejection, &gate.oauth) {
+        (TokenRejection::InsufficientScope, None) => REASON_MISCONFIGURED,
+        _ => observe::reason(rejection),
+    };
+    count_request(Outcome::Rejected, mechanism, reason);
     match (rejection, &gate.oauth) {
         (TokenRejection::InsufficientScope, None) => error!(
             path = %path,
             what,
             required = ?required,
+            auth.outcome = Outcome::Rejected.as_str(),
+            auth.mechanism = mechanism.as_str(),
+            auth.reason = reason,
+            auth.status = status,
             "Server misconfiguration: the route requires scopes, but its authentication layer \
              has no OAuth validator, so no credential can carry them; refusing the request"
         ),
@@ -976,13 +1142,34 @@ pub(crate) fn scope_refusal<B: Default + 'static>(
                 required = ?required,
                 present = ?present,
                 static_token = matches!(parts.extensions.get::<Credential>(), Some(Credential::StaticToken)),
+                auth.outcome = Outcome::Rejected.as_str(),
+                auth.mechanism = mechanism.as_str(),
+                auth.reason = reason,
+                auth.status = status,
                 "The credential lacks the scopes this route requires"
             );
         }
         (TokenRejection::Missing, Some(_)) => {
-            debug!(path = %path, what, "No bearer credential presented");
+            debug!(
+                path = %path,
+                what,
+                auth.outcome = Outcome::Rejected.as_str(),
+                auth.mechanism = mechanism.as_str(),
+                auth.reason = reason,
+                auth.status = status,
+                "No bearer credential presented"
+            );
         }
-        _ => warn!(path = %path, what, reason = ?rejection, "Bearer auth rejected"),
+        _ => warn!(
+            path = %path,
+            what,
+            reason = ?rejection,
+            auth.outcome = Outcome::Rejected.as_str(),
+            auth.mechanism = mechanism.as_str(),
+            auth.reason = reason,
+            auth.status = status,
+            "Bearer auth rejected"
+        ),
     }
     let insufficient = match rejection {
         TokenRejection::InsufficientScope => gate.scope_challenge(required),
@@ -1345,6 +1532,7 @@ impl<R> HttpAuthLayer<R> {
     {
         let gate = match &*self.mode {
             HttpMode::AllowUnauthenticated => {
+                count_request(Outcome::PassedThrough, Mechanism::None, REASON_NONE);
                 let mut request = request;
                 self.mark::<ResBody>(request.extensions_mut(), None);
                 return Ok(request);
@@ -1353,32 +1541,11 @@ impl<R> HttpAuthLayer<R> {
         };
         let (mut parts, body) = request.into_parts();
         match gate.admit(&mut parts).await {
-            Admission::Static => {}
-            Admission::OAuth(token) => debug!(
-                path = %parts.uri.path(),
-                principal = ?token.principal.as_deref().map(for_log),
-                subject = ?token.subject.as_deref().map(for_log),
-                scopes = ?token.scopes,
-                "OAuth bearer auth accepted"
-            ),
-            Admission::PassedThrough => debug!(
-                path = %parts.uri.path(),
-                "No credential presented; optional auth passes the request through"
-            ),
-            Admission::Refused(rejection) => {
-                let path = parts.uri.path();
-                match (&gate.oauth, &rejection) {
-                    (None, _) => warn!(path = %path, "Bearer auth rejected"),
-                    // Every OAuth client's first request carries no credential
-                    // (401 → read `resource_metadata` → authorize), so it is
-                    // not worth a warning.
-                    (Some(_), TokenRejection::Missing) => {
-                        debug!(path = %path, "No bearer credential presented");
-                    }
-                    (Some(_), _) => {
-                        warn!(path = %path, reason = ?rejection, "OAuth bearer auth rejected");
-                    }
-                }
+            Admission::Static => log_static_accepted!(&parts),
+            Admission::OAuth(token) => log_oauth_accepted!(&parts, &token),
+            Admission::PassedThrough => log_passed_through!(&parts),
+            Admission::Refused(rejection, mechanism) => {
+                log_layer_refusal!(gate, &parts, &rejection, mechanism);
                 let (status, _) = gate.status_and_challenge(&rejection);
                 let response = self.on_reject.refusal_response(RejectContext {
                     rejection: &rejection,

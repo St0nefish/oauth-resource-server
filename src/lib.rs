@@ -44,6 +44,24 @@
     ),
     doc = "| `mcp::McpToolScopes` | Per-tool scopes for an MCP server's JSON-RPC endpoint (feature `mcp`, not enabled in this build). |"
 )]
+#![cfg_attr(
+    all(
+        feature = "serde",
+        feature = "env",
+        feature = "axum",
+        feature = "metrics"
+    ),
+    doc = "| [`observability`] | The metric names the `metrics` feature reports through the `metrics` facade, and their descriptions (feature `metrics`). |"
+)]
+#![cfg_attr(
+    all(
+        feature = "serde",
+        feature = "env",
+        feature = "axum",
+        not(feature = "metrics")
+    ),
+    doc = "| `observability` | The metric names the `metrics` feature reports through the `metrics` facade (feature `metrics`, not enabled in this build). |"
+)]
 // The last row links the `testing` module, which exists only with that feature;
 // without it the row is rendered with no link, so a `serde,env,axum` doc build
 // has no unresolved intra-doc link.
@@ -103,6 +121,7 @@ mod token;
 mod validator;
 
 mod authenticate;
+mod observe;
 mod policy;
 mod refusal;
 
@@ -121,6 +140,10 @@ pub mod axum;
 #[cfg(feature = "mcp")]
 #[cfg_attr(docsrs, doc(cfg(feature = "mcp")))]
 pub mod mcp;
+
+#[cfg(feature = "metrics")]
+#[cfg_attr(docsrs, doc(cfg(feature = "metrics")))]
+pub mod observability;
 
 // Entry points for the `fuzz/` cargo-fuzz crate into internals that are not
 // public API. cargo-fuzz sets `--cfg fuzzing`; no ordinary build (including

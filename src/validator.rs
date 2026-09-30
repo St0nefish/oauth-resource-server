@@ -9,7 +9,7 @@ use base64::Engine;
 use base64::engine::general_purpose::URL_SAFE_NO_PAD;
 use jsonwebtoken::{DecodingKey, Validation, decode, decode_header};
 use serde_json::{Map, Value};
-use tracing::{debug, error, info, warn};
+use tracing::{Instrument, Span, debug, error, info, warn};
 
 use crate::algorithms::Algorithm;
 use crate::builder::OAuthValidatorBuilder;
@@ -19,10 +19,43 @@ use crate::jwks::{
     JWKS_BACKGROUND_REFRESH_INTERVAL, JwksStore, KeySetStatus, RefreshError,
     background_retry_delay, http_clients, keyless_retry_delay, redact_url,
 };
+use crate::observe::record_field;
 use crate::token::{
     AuthorizedToken, InvalidTokenKind, MAX_TOKEN_BYTES, TokenRejection, check_typ, client_id_of,
-    extract_principal, extract_scopes, for_log, missing_scopes, numeric_date_secs,
+    extract_principal, extract_scopes, for_log, for_log_field, missing_scopes, numeric_date_secs,
 };
+
+/// The span around one validation (`oauth_rs.validate`, or
+/// `oauth_rs.validate_cached` for the cache-only first pass): `debug`, target
+/// `oauth_resource_server::validator`. `kid`/`alg` come from the unverified
+/// header (bounded and escaped); `auth.outcome` is `accepted`, `rejected` or,
+/// for `validate_cached`, `needs_key_fetch`; `auth.reason` is the refusal's
+/// label. Field names are stable (the README's "Observability" section).
+macro_rules! validation_span {
+    ($name:literal) => {
+        tracing::debug_span!(
+            $name,
+            kid = tracing::field::Empty,
+            alg = tracing::field::Empty,
+            auth.outcome = tracing::field::Empty,
+            auth.reason = tracing::field::Empty,
+        )
+    };
+}
+
+/// Record a finished validation's outcome on its span: `refusal` is `None`
+/// for an accepted token.
+fn record_validation(span: &Span, refusal: Option<&TokenRejection>) {
+    match refusal {
+        None => {
+            record_field(span, "auth.outcome", "accepted");
+        }
+        Some(rejection) => {
+            record_field(span, "auth.outcome", "rejected");
+            record_field(span, "auth.reason", crate::observe::reason(rejection));
+        }
+    }
+}
 
 /// Why an [`OAuthValidator`] could not be built.
 #[derive(Debug, thiserror::Error)]
@@ -762,6 +795,12 @@ impl OAuthValidator {
     /// a 10-second timeout. The fetch runs in a task of its own, so dropping
     /// this future does not cancel it. Logs an insufficient scope at `info` and
     /// a failed key refresh at `warn`; logging the outcome is the caller's job.
+    /// Runs in a `debug` span `oauth_rs.validate` recording the unverified
+    /// header's `kid` and `alg` (cut to 128 characters, anything outside
+    /// printable ASCII escaped) and the outcome (`auth.outcome`,
+    /// `auth.reason`); a key fetch it triggers runs in an `info` span
+    /// `oauth_rs.jwks_refresh` below it. See the README's "Observability"
+    /// section.
     ///
     /// # Errors
     ///
@@ -817,7 +856,29 @@ impl OAuthValidator {
     /// }
     /// ```
     pub async fn validate(&self, token: &str) -> Result<AuthorizedToken, TokenRejection> {
-        let header = self.check_header(token)?;
+        // A span of its own (see `validation_span`), entered only when a
+        // subscriber wants it: disabled, it is `Span::none()` and the future
+        // runs unwrapped, exactly as without tracing.
+        let span = validation_span!("oauth_rs.validate");
+        if span.is_disabled() {
+            return self.validate_in(token, &span).await;
+        }
+        let result = self
+            .validate_in(token, &span)
+            .instrument(span.clone())
+            .await;
+        record_validation(&span, result.as_ref().err());
+        result
+    }
+
+    /// The body of [`OAuthValidator::validate`], recording the unverified
+    /// header's `kid`/`alg` on `span`.
+    async fn validate_in(
+        &self,
+        token: &str,
+        span: &Span,
+    ) -> Result<AuthorizedToken, TokenRejection> {
+        let header = self.check_header(token, span)?;
         let key = self
             .keys
             .decoding_key(header.kid.as_deref(), header.alg)
@@ -834,7 +895,26 @@ impl OAuthValidator {
     /// candidate whose key is cached is decided before any other candidate's
     /// unknown `kid` can queue the request behind a JWKS refetch.
     pub(crate) async fn validate_cached(&self, token: &str) -> CachedAttempt {
-        let header = match self.check_header(token) {
+        let span = validation_span!("oauth_rs.validate_cached");
+        if span.is_disabled() {
+            return self.validate_cached_in(token, &span).await;
+        }
+        let attempt = self
+            .validate_cached_in(token, &span)
+            .instrument(span.clone())
+            .await;
+        match &attempt {
+            CachedAttempt::Decided(result) => record_validation(&span, result.as_ref().err()),
+            CachedAttempt::NeedsKeyFetch => {
+                record_field(&span, "auth.outcome", "needs_key_fetch");
+            }
+        }
+        attempt
+    }
+
+    /// The body of [`OAuthValidator::validate_cached`].
+    async fn validate_cached_in(&self, token: &str, span: &Span) -> CachedAttempt {
+        let header = match self.check_header(token, span) {
             Ok(header) => header,
             Err(rejection) => return CachedAttempt::Decided(Err(rejection)),
         };
@@ -850,7 +930,17 @@ impl OAuthValidator {
 
     /// Everything that can be refused from the unverified header alone (size,
     /// shape, `crit`, `alg` allowlist, `typ`), before any key is looked up.
-    pub(crate) fn check_header(&self, token: &str) -> Result<CheckedHeader, TokenRejection> {
+    ///
+    /// Records the header's `kid` and `alg` on `span` (the validation's own,
+    /// or `Span::none()`), bounded and escaped by [`for_log_field`] — the
+    /// header is unverified, attacker-chosen data — as soon as it parses, so
+    /// a refusal for the `alg` itself still shows it. Nothing is formatted
+    /// when `span` is disabled.
+    pub(crate) fn check_header(
+        &self,
+        token: &str,
+        span: &Span,
+    ) -> Result<CheckedHeader, TokenRejection> {
         if token.is_empty() {
             return Err(TokenRejection::Missing);
         }
@@ -890,6 +980,16 @@ impl OAuthValidator {
                 format!("malformed token header: {}", for_log(&e.to_string())),
             )
         })?;
+        if !span.is_disabled() {
+            if let Some(kid) = header.kid.as_deref() {
+                record_field(span, "kid", for_log_field(kid).as_str());
+            }
+            record_field(
+                span,
+                "alg",
+                for_log_field(&format!("{:?}", header.alg)).as_str(),
+            );
+        }
         check_crit(token)?;
         let alg = Algorithm::from_jwt(header.alg)
             .filter(|_| self.jwt_algorithms.contains(&header.alg))
