@@ -76,6 +76,9 @@ Note here specifically:
 - which claim (if any) carries a human-readable username, if `sub` is an
   opaque ID
 - whether `aud` is the client ID, a resource URL, or something else
+- which claim (if any) names the calling client (`client_id`, `azp`, `cid`,
+  `appid`, something else), especially when the audience is shared by
+  several clients
 
 ## JWKS shape (redacted), if relevant
 

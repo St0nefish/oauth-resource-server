@@ -159,12 +159,16 @@
 //! [`optional`](AuthLayerBuilder::optional) layer at `debug`; any other refusal
 //! at `warn`, with the reason when OAuth is configured. The reason goes to the
 //! log only, never to the caller. The extractors log their refusals the same
-//! way, and a [`Scoped`] extractor's insufficient scope at `info`. Three
-//! wiring mistakes are logged at `error`: an extractor on a route no
-//! [`AuthLayer`] covers (500), a required extractor behind an
-//! [`allow_unauthenticated`](AuthLayer::allow_unauthenticated) layer, and an
-//! [`AuthorizedToken`] extractor behind a layer with no OAuth validator (both
-//! a 401 no credential can ever satisfy).
+//! way, and a [`Scoped`] extractor's insufficient scope at `info`. Wiring
+//! mistakes no request can satisfy are logged at `error`: an extractor on a
+//! route no [`AuthLayer`] covers (500); a required extractor behind an
+//! [`allow_unauthenticated`](AuthLayer::allow_unauthenticated) layer with no
+//! enforcing layer around it, an [`AuthorizedToken`] extractor behind a layer
+//! with no OAuth validator, and a [`StaticTokenMatch`] extractor behind a
+//! layer with no static token (each a 401 no credential can ever satisfy); a
+//! [`Scoped`] extractor behind a layer with no OAuth validator (a 403); and a
+//! [`ScopeSet`] holding an entry that is not a scope-token (500 — unreachable
+//! in practice, since such a set does not compile).
 //!
 //! Every one of these events (the extractors' included) also
 //! carries the stable, low-cardinality fields `auth.outcome` (`accepted`,
@@ -1027,11 +1031,15 @@ impl AuthLayer {
     /// the extractor needs.
     ///
     /// Three wirings give a 401 no credential can ever satisfy — a required
-    /// extractor behind [`AuthLayer::allow_unauthenticated`], an
-    /// [`AuthorizedToken`] extractor behind a layer with no OAuth validator,
-    /// and a [`StaticTokenMatch`] extractor behind a layer with no static
-    /// token — so, like the no-layer 500, they are logged at `error` rather
-    /// than as an ordinary refusal.
+    /// extractor behind [`AuthLayer::allow_unauthenticated`] with no
+    /// enforcing layer around it, an [`AuthorizedToken`] extractor behind a
+    /// layer with no OAuth validator, and a [`StaticTokenMatch`] extractor
+    /// behind a layer with no static token — so, like the no-layer 500, they
+    /// are logged at `error` rather than as an ordinary refusal. Behind an
+    /// `allow_unauthenticated` layer INSIDE an enforcing `HttpAuthLayer` (a
+    /// `GateRan` holding a gate, with no `LayerRan` of an enforcing axum
+    /// layer), the refusal is that layer's, through
+    /// `http_layer::scope_refusal`: its 401 and challenge.
     fn refuse_extraction(
         &self,
         rejection: &TokenRejection,

@@ -177,9 +177,12 @@ impl OAuthValidatorBuilder {
     /// Either way, a fetch of a loopback URL (`localhost`, `*.localhost`,
     /// `127.0.0.0/8`, `::1`) uses a separate client with no proxy at all: a
     /// loopback URL names this host, which through a proxy it would not, and
-    /// a plain-http loopback fetch would cross the network in cleartext.
-    /// (A redirect from a non-loopback URL to a loopback one stays in the
-    /// client the fetch started with; see the README's security model.)
+    /// a plain-http loopback fetch would cross the network in cleartext. That
+    /// client resolves every name to `::1`/`127.0.0.1` itself, never through
+    /// DNS, and a fetch it starts may not be redirected off loopback, so
+    /// this proxy is never skipped for a non-loopback host. (A redirect from
+    /// a non-loopback URL to a loopback one stays in the client the fetch
+    /// started with; see the README's security model.)
     ///
     /// # Security
     ///

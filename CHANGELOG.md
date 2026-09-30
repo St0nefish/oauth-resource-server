@@ -43,19 +43,25 @@ response body are byte-for-byte what 0.1 sent.
   `Deref<Target = str>`, an inherent `as_str()`, `From<String>` and
   `From<&str>` (kind `Other`), `From<InvalidToken> for String`,
   `std::error::Error`, `PartialEq` with `str`, `&str` and `String` in both
-  directions, and, with the `serde` feature, `Serialize` as the detail
-  string. Equality, between two `InvalidToken`s too, compares the detail
+  directions, and, with the `serde` feature, `Serialize` — as its kind's
+  `as_str()` label (`"expired"`), **not** the detail: a derived response
+  type or `json!` holding the reason must never carry the log-only text into
+  a body. Equality, between two `InvalidToken`s too, compares the detail
   only, so `assert_eq!(r, TokenRejection::Invalid("..".into()))` against a
   refusal the crate made keeps passing; assert `kind()` when the kind
   matters. So logging a reason, `reason.contains(..)`, `reason.as_str()`,
   `reason == "..."`/`"..." == reason`, comparing with a `String`,
   `let s: String = reason.into()`, `Box<dyn Error>` from it,
   `json!({"reason": reason})` (with `serde`), `Invalid("..".into())`,
-  `Invalid(s.into())` and `Invalid(_)` patterns keep compiling. What still
-  fails to compile, each with its fix:
-  - a `String`-typed parameter or binding given the reason
-    (`log(reason)` with `fn log(_: String)`, `let s: String = reason`): pass
-    `reason.into()` or `reason.to_string()`;
+  `Invalid(s.into())` and `Invalid(_)` patterns keep compiling.
+  `json!({"reason": reason})` (or a `#[derive(Serialize)]` field holding
+  it) now produces the kind label, `{"reason": "expired"}`, where 0.1's
+  `String` produced the reason text; serialize `reason.detail()` where a
+  log record wants the text. What still fails to compile, each with its fix:
+  - a `String`-typed parameter, binding or struct field given the reason
+    (`log(reason)` with `fn log(_: String)`, `let s: String = reason`,
+    `Event { reason }` with `reason: String`): pass `reason.into()` or
+    `reason.to_string()`;
   - `reason.clone()` or `reason.to_owned()` stored into a `String` (they
     now give an `InvalidToken`): use `reason.to_string()`;
   - building the variant from a `String` expression —
@@ -121,6 +127,9 @@ response body are byte-for-byte what 0.1 sent.
 
 ### Added
 
+- `env::MAX_SECRET_FILE_BYTES` (64 KiB) and two `EnvError` variants,
+  `NotAFile` and `FileTooLarge`, for the `_FILE` hardening under Security
+  below (`EnvError` is `#[non_exhaustive]`, so they are additive).
 - Observability (oauth-resource-server#11), all additive: no message text,
   log level, response or public signature changes.
   - Every auth-outcome log event of both layers, `RequireScopes`,
@@ -369,8 +378,6 @@ response body are byte-for-byte what 0.1 sent.
   pass-through always extracts as `None`; strict layers are unchanged (their
   extensions accumulate, now documented under "Nested layers"). `build()`
   still refuses a layer with no static token and no validator.
-- A typed per-handler scope extractor is not included; it waits on
-  per-request 403 challenges (oauth-resource-server#4).
 - `OAuthValidator::key_set_status()` returns a `KeySetStatus`
   (`#[non_exhaustive]`): the number of usable signing keys held, the JWKS URL
   in use (configured or discovered), when a refresh was last attempted and
@@ -417,7 +424,7 @@ response body are byte-for-byte what 0.1 sent.
 - `examples/hyper.rs`: a plain hyper 1.x server built on `authenticate()` and
   `refusal()`. The README's new "Using with other frameworks" section covers
   the tower layer, any other stack, and an actix-web middleware sketch.
-  Closes #14.
+  Closes oauth-resource-server#14.
 - `OAuthValidator::invalid_token_challenge()` and
   `insufficient_scope_challenge()` (and so `refusal()`) always return a
   valid header value. A hand-edited `ResolvedOAuthConfig` whose challenge
@@ -447,6 +454,41 @@ response body are byte-for-byte what 0.1 sent.
   `EnvError` variants were already `#[non_exhaustive]`.
 
 ### Security
+
+- A key fetch that starts on a loopback URL (`localhost`, `*.localhost`,
+  `127.0.0.0/8`, `::1`) may no longer be redirected off loopback. Such a
+  fetch runs on the proxy-free loopback client, so a redirect to
+  `https://idp.example/jwks` went out directly, skipping the explicit
+  `OAuthValidatorBuilder::proxy` and any environment proxy the operator set
+  for every non-loopback fetch. It is now refused whatever its scheme and
+  whatever `allow_insecure_http` says. This narrows accepted input (a
+  loopback JWKS or issuer that redirects elsewhere now fails to refresh);
+  point the configuration at the final URL instead.
+- The loopback client resolves every host name itself, to `::1` and
+  `127.0.0.1` (the URL's port kept), never through DNS. `localhost` and
+  `*.localhost` are exempted from `allow_insecure_http` and from every proxy
+  **by name**, but only some resolvers answer `*.localhost` with loopback
+  (RFC 6761 §6.3 says SHOULD): musl, glibc without nss-myhostname and some
+  container DNS servers send it upstream, where whoever controls that DNS
+  could receive a cleartext, proxy-free key fetch. The name now always means
+  this host.
+- A `<VAR>_FILE` is read only when it names a regular file, and only up to
+  64 KiB (`env::MAX_SECRET_FILE_BYTES`): a directory, FIFO or device is
+  `EnvError::NotAFile` before it is opened, and a bigger file
+  `EnvError::FileTooLarge` after reading one byte past the limit. Before,
+  `X_FILE=/dev/zero` grew memory until allocation failed and a FIFO nobody
+  wrote to blocked startup forever. Operator-controlled paths, startup only;
+  both are `ProblemKind::EnvLoad` from the config loader.
+- An `allow_unauthenticated` layer (axum and `tower`) now marks every
+  `Authorization` header value sensitive, as an enforcing layer marks its
+  sources, so a credential a client sends anyway is not printed by a
+  downstream `Debug` of the request.
+- A non-scalar `required_claims` value is named by its JSON type in the
+  problem text (`requires an object`), no longer echoed: it could hold
+  anything, and the text reaches the startup log.
+- The scope lists in the `OAuth bearer auth accepted` (`scopes`) and
+  insufficient-scope (`present`) log fields go through the same 128-character
+  per-value cut as every other token-derived log field.
 
 - A loopback JWKS or discovery fetch (`http://localhost:…`, `127.0.0.0/8`,
   `::1`, allowed over plain http without `allow_insecure_http`) no longer
@@ -520,6 +562,57 @@ response body are byte-for-byte what 0.1 sent.
   `resource_metadata` URLs built from such a value now stay on the host the
   parser reads in it: before, `https:///host/app` made the RFC 8414 discovery
   URL, and the `resource_metadata` URL, point at the host `.well-known`.
+
+### Fixed
+
+- A discovered `jwks_uri` whose fetch fails is dropped, so the next refresh
+  reads the issuer's metadata again: an authorization server that moves its
+  key set (metadata updated, old path gone) is followed without a restart.
+  Before, the first discovered URI was kept for the life of the process and
+  every refresh failed once it moved. A configured `jwks_uri` is unchanged.
+  `KeySetStatus::jwks_uri` keeps showing the failed URI until the next
+  discovery replaces it.
+- An RSA JWK that could never verify a signature — a modulus that is not
+  2048 to 8192 bits, not odd or not minimally encoded, or an exponent that
+  is not an odd 3 to 2^33 - 1 — is skipped like an unparseable entry. It used
+  to count as a held key (`KeySetStatus::keys`, `is_ready()`) while `ring`
+  refused it at every verification, so a key set of only such keys read as
+  healthy. The 64-key cap still counts every entry considered.
+- A metadata or JWKS response is read only when its status is `2xx`. A `3xx`
+  reqwest could not follow (no `Location`) used to be parsed as the document.
+- A token header with `"kid": null` is refused as `MalformedHeader`.
+  jsonwebtoken read it as no `kid` at all, which sent the token down the
+  single-key fallback meant for a header without one.
+- A signed payload whose `exp`/`nbf`/`iss`/`aud` jsonwebtoken cannot read
+  (`"nbf": [1]`) is `InvalidTokenKind::MalformedClaim`, not `MalformedToken`;
+  a payload that is not a JSON object at all stays `MalformedToken`. Still
+  refused either way, after the signature.
+- A required axum extractor (`AuthorizedToken`, `Credential`,
+  `StaticTokenMatch`) behind an axum `allow_unauthenticated` layer nested
+  inside an enforcing `HttpAuthLayer` now refuses with that outer layer's 401
+  and challenge (`resource_metadata` included), as `RequireScopes` and
+  `Scoped` already did on the same stack, instead of the open layer's bare
+  `DEFAULT_STATIC_CHALLENGE`.
+- `Scoped<S>` refuses through the innermost layer that ran (the one whose
+  credential it judged), exactly as `RequireScopes` does, so the two send the
+  same bytes on any stack. Behind an axum layer outside an `HttpAuthLayer`
+  it used the outer axum layer's challenge and `on_reject`.
+- A whitespace-only static token counts as none (fail closed, and loudly): a
+  layer built with only one is `AuthLayerError::NoCredential` instead of a
+  layer that silently admits nobody (blank candidates never match), and
+  `static_token_policy` never treats one as "nothing configured" — with no
+  OAuth it is `NoAuthConfigured` even under `allow_unauthenticated`, so it
+  cannot open the routes; with OAuth it is `OAuthOnly`. An empty string is
+  still plain "unset".
+- `REQUIRED_CLAIMS` naming one claim twice (`{"tid": "a", "tid": "b"}`) is
+  `ProblemKind::InvalidRequiredClaim` from the env loader, and a config file
+  doing the same fails to deserialize, instead of silently keeping the last
+  value.
+- A whitespace-only `<PREFIX>REQUIRED_SCOPE` is `BlankRequiredScope`, as a
+  blank `required_scope` in a config file always was, instead of reading as
+  unset (which, with `ALLOW_UNSCOPED_TOKENS=true`, meant no scope check).
+- The two startup warnings for a `required_claims` entry naming a scope
+  claim or `azp`/`client_id` no longer carry a run of spaces mid-sentence.
 
 ### Changed
 

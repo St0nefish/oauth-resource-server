@@ -4,7 +4,9 @@ Thanks for considering a contribution. This crate sits in front of real
 authentication decisions, so the bar for changes to the validation logic is
 higher than for most libraries — see the security invariants in
 [`CLAUDE.md`](CLAUDE.md) before touching `src/validator.rs`, `src/jwks.rs`,
-`src/algorithms.rs`, `src/token.rs`, `src/authenticate.rs`, or `src/axum.rs`.
+`src/builder.rs`, `src/algorithms.rs`, `src/token.rs`, `src/config.rs`,
+`src/authenticate.rs`, `src/refusal.rs`, `src/http_layer.rs`, `src/axum.rs`,
+`src/mcp.rs` or `src/env.rs`.
 
 ## Before you open a PR
 
@@ -124,10 +126,13 @@ The targets reach internals through `src/__fuzz.rs`, which exists only under
   needs an `# Errors` section, and anything with a non-obvious security
   implication gets a `# Security` note.
 - **Every README code block that looks like Rust must actually compile.**
-  Check the top of `src/lib.rs` for whether the crate-level rustdoc includes
-  `README.md` verbatim (`#![doc = include_str!("../README.md")]`) — if it
-  does, every fenced ` ```rust ` block in `README.md` is a doctest CI runs
-  directly. Either way, treat every such block as if it were: it must
+  The crate-level rustdoc is `README.md` itself, included verbatim by
+  `#![cfg_attr(all(feature = "serde", feature = "env", feature = "axum"),
+  doc = include_str!("../README.md"))]` at the top of `src/lib.rs` — so every
+  fenced ` ```rust ` block in it is a doctest whenever those three features
+  are on: `cargo test --all-features` (as CI runs it) tests them, while a
+  plain `cargo test` (default features) does not, and a narrower build gets
+  a short pointer doc instead. Treat every such block as a doctest: it must
   compile against the crate's current public API. Mark a block that is
   deliberately not standalone Rust (a config snippet, a shell command, a
   fragment) ` ```toml `, ` ```yaml `, ` ```text `, or similar instead of

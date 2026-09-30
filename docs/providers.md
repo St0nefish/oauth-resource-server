@@ -40,7 +40,8 @@ security-relevant behavior moved over unchanged.
 Each recipe is the `OAuthConfig` block as YAML, for the `serde` feature. The
 same keys work in any serde format, and with the `env` feature each one is an
 environment variable (`issuer` becomes `<PREFIX>ISSUER`; lists are
-space-separated). Placeholders throughout: `auth.example.com` and
+whitespace-separated, and `required_claims` is one JSON object,
+`<PREFIX>REQUIRED_CLAIMS='{"cid": "<client id>"}'`). Placeholders throughout: `auth.example.com` and
 `idm.example.com` for the authorization server, `api.example.com` for the
 protected API, and `api:read`/`api:write` as scope names. Use the scopes your
 application actually checks.
