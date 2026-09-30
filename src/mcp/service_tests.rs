@@ -277,41 +277,60 @@ impl http_body::Body for Chunks {
 }
 
 #[tokio::test]
-async fn non_post_requests_need_the_default_and_keep_their_body() {
+async fn every_method_with_a_body_is_classified_and_a_bodiless_one_needs_the_default() {
     let (_jwks, v) = validator().await;
     let app = app(strict(&v), tool_scopes());
+    let reader = token("mcp:read");
+    let writer = token("mcp:read mcp:write");
+    let body = call("write_document");
+    let methods = [
+        http::Method::POST,
+        http::Method::GET,
+        http::Method::PUT,
+        http::Method::PATCH,
+        http::Method::DELETE,
+        http::Method::OPTIONS,
+        // A lowercase `post` is an extension method, not `POST`.
+        http::Method::from_bytes(b"post").unwrap(),
+    ];
+    for method in methods {
+        // A body carrying a `tools/call`: that tool's scopes, any method.
+        assert_eq!(
+            send(
+                &app,
+                method.clone(),
+                Some(&reader),
+                Body::from(body.clone())
+            )
+            .await,
+            (403, Some(challenge_for("mcp:read mcp:write")), Vec::new()),
+            "{method}"
+        );
+        assert_eq!(
+            send(
+                &app,
+                method.clone(),
+                Some(&writer),
+                Body::from(body.clone())
+            )
+            .await,
+            served(&body),
+            "{method}"
+        );
+        // No body: the default.
+        assert_eq!(
+            send(&app, method.clone(), Some(&reader), Body::empty()).await,
+            (200, None, b"served:".to_vec()),
+            "{method}"
+        );
+    }
+    // A body with no announced size (a stream) is a body too.
+    let streamed = Body::new(Chunks(vec![Ok(Bytes::from(body.clone()))].into()));
     assert_eq!(
-        send(
-            &app,
-            http::Method::GET,
-            Some(&token("mcp:read")),
-            Body::empty()
-        )
-        .await,
-        (200, None, b"served:".to_vec())
-    );
-    // A GET's body, whatever it holds, is not read as JSON-RPC.
-    let get_body = call("purge");
-    assert_eq!(
-        send(
-            &app,
-            http::Method::GET,
-            Some(&token("mcp:read")),
-            Body::from(get_body.clone())
-        )
-        .await,
-        served(&get_body)
-    );
-    assert_eq!(
-        send(
-            &app,
-            http::Method::DELETE,
-            Some(&token("openid mcp:read")),
-            Body::empty()
-        )
-        .await
-        .0,
-        200
+        send(&app, http::Method::GET, Some(&reader), streamed)
+            .await
+            .0,
+        403
     );
 }
 
@@ -344,17 +363,34 @@ async fn no_credential_is_the_layers_401_and_no_layer_is_a_500() {
         post(&app, None, &call("write_document")).await,
         (401, Some(v.invalid_token_challenge()), Vec::new())
     );
-    // Nothing required for this request: served anonymously, as the
-    // optional layer intends.
-    let anonymous = McpToolScopes::new().tool("write_document", ["mcp:write"]);
-    let optional = AuthLayer::builder()
-        .oauth(Arc::clone(&v))
-        .optional()
-        .build()
-        .unwrap();
-    let app2 = self::app(optional, anonymous);
+    // Refused before the body is read whenever any tool needs a scope: the
+    // stream fails if it is polled at all.
+    let optional = || {
+        AuthLayer::builder()
+            .oauth(Arc::clone(&v))
+            .optional()
+            .build()
+            .unwrap()
+    };
+    let unread = || Body::new(Chunks(vec![Err(std::io::Error::other("read"))].into()));
+    let app2 = self::app(
+        optional(),
+        McpToolScopes::new().tool("write_document", ["mcp:write"]),
+    );
+    assert_eq!(
+        send(&app2, http::Method::POST, None, unread()).await,
+        (401, Some(v.invalid_token_challenge()), Vec::new())
+    );
+    // A bodiless request with no default requirement is still served
+    // anonymously, as the optional layer intends.
+    assert_eq!(
+        send(&app2, http::Method::GET, None, Body::empty()).await,
+        (200, None, b"served:".to_vec())
+    );
+    // Nothing required anywhere: served anonymously, body and all.
+    let app3 = self::app(optional(), McpToolScopes::new());
     let list = r#"{"method":"tools/list"}"#;
-    assert_eq!(post(&app2, None, list).await, served(list));
+    assert_eq!(post(&app3, None, list).await, served(list));
     // No authentication layer at all: 500, and the body is never read.
     let bare = Router::new()
         .route("/mcp", any(|| async { "served" }))

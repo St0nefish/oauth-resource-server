@@ -150,20 +150,32 @@ response body are byte-for-byte what 0.1 sent.
   - `AuthLayerBuilder::require_scopes` / `HttpAuthLayerBuilder::require_scopes`
     and `static_token_bypasses_scopes` on both. `build` refuses an entry that
     is not a scope-token (`AuthLayerError::InvalidScope`) and scopes with no
-    OAuth validator and no bypass (`AuthLayerError::ScopesNeedOAuth`); both
-    variants are new (the enum is `#[non_exhaustive]`).
+    OAuth validator and no bypass (`AuthLayerError::ScopesNeedOAuth`), and
+    `build_with_decision` refuses an `Unauthenticated` decision on a builder
+    with scopes (`AuthLayerError::ScopesWithoutAuthentication`) rather than
+    drop them; all three variants are new (the enum is
+    `#[non_exhaustive]`).
   - `http_layer::RequireScopes` (also `axum::RequireScopes`) and
     `RequireScopesService`: a route layer behind either authentication layer.
+    `new` panics on a scope that is not a scope-token (for literals);
+    `try_new` returns `http_layer::InvalidScope` (`#[non_exhaustive]`,
+    naming the scope; also `axum::InvalidScope`) for configured scopes.
     Both layers now insert a private marker into every request they pass, so
     it refuses with the layer's own status, challenge and `on_reject` body; a
     request with no credential behind an `optional()` layer gets the layer's
     401, one behind `allow_unauthenticated()` a 401 with
     `DEFAULT_STATIC_CHALLENGE`, and a route no layer covers a 500 (logged at
-    `error`).
+    `error`). Behind a strict layer wrapping an inner `allow_unauthenticated`
+    one, it judges the outer credential and answers with the outer layer's
+    403 step-up; behind a static-only layer its 403 carries the bare
+    `Bearer error="insufficient_scope"` (as does `refusal_for_scopes`
+    without a validator).
   - `axum::Scoped<S>` and `axum::ScopeSet`: an extractor for an OAuth token
     carrying every scope of a type-level set, refusing through the layer's
-    own refusal path (a static token gets the 403 too; a set holding an
-    invalid scope, 500).
+    own refusal path (a static token gets the 403 too; behind an
+    `optional()` `HttpAuthLayer`, no credential gets that layer's 401). A
+    `ScopeSet` holding an invalid scope is a compile error (a `const`
+    assertion).
   - **Static tokens and scopes.** A static token has no scopes, so every new
     requirement refuses it with 403 unless `static_token_bypasses_scopes()`
     opts in (on the layer builders, `RequireScopes` and `McpToolScopes`).
@@ -173,15 +185,23 @@ response body are byte-for-byte what 0.1 sent.
   - The `mcp` feature (implies `tower`; adds `http-body` and `bytes`, both
     already in every build, and no MCP SDK): `mcp::McpToolScopes`, a tower
     layer requiring scopes per MCP tool (`new().default([..]).tool(name,
-    [..])`) by reading the JSON-RPC `tools/call` in a `POST` body. The body is
+    [..])`, or `try_default`/`try_tool`/`try_body_limit` returning
+    `McpScopesError` for configured values) by reading the JSON-RPC
+    `tools/call` in a request body, under any method. The body is
     read under a limit enforced while streaming (`body_limit`,
     `DEFAULT_BODY_LIMIT` 1 MiB, `MIN_BODY_LIMIT` 4 KiB to `MAX_BODY_LIMIT`
     64 MiB; larger is 413, unread past the limit) and passed on
     byte-identical. A batch needs every scope any of its messages needs; a
     body it cannot classify with certainty (not JSON, a `tools/call` with no
     readable string `params.name`, a repeated `method`/`params`/`name`)
-    needs every configured scope; non-`POST` requests and other methods need
-    the default. It never logs body content.
+    needs every configured scope; bodiless requests and other methods need
+    the default; with no credential, a request with a body is refused before
+    it is read whenever a scope could be needed. It parses in one streaming
+    pass that builds no document (about the body's size in memory, whatever
+    the batch length). Tool names are matched exactly, byte for byte after
+    JSON decoding — the MCP server's dispatcher must be exact too. Body reads
+    have no timeout of their own; set one on the server. It never logs body
+    content.
 - Several static tokens at once, for rotating a static API key with no
   downtime or for one key per client, with the matched key reported. All
   additive: every existing signature (`authenticate`, `static_token_policy`,

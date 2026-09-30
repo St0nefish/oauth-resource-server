@@ -326,6 +326,13 @@ jobs:
       - name: Tests (default features)
         run: cargo test
 
+      - name: Doctests (tower and mcp without axum)
+        # `--all-features` compiles every doc example with `axum` on, so an
+        # example in the `tower` or `mcp` docs that reaches for
+        # `oauth_resource_server::axum` passes there and fails for a consumer
+        # who enabled only `mcp`. This is that subset, doctests only.
+        run: cargo test --doc --no-default-features --features rustls-tls,mcp
+
       - name: Build examples (all features)
         run: cargo build --examples --all-features
 

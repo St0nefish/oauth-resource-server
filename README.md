@@ -370,10 +370,20 @@ credential. Where the static key is meant to be a full-access key, say so
 with `static_token_bypasses_scopes()` (on the layer builders,
 `RequireScopes` and `McpToolScopes`). A layer with required scopes, no OAuth
 validator and no bypass refuses to build (`AuthLayerError::ScopesNeedOAuth`):
-nothing could ever pass it. `Scoped<S>` extracts an OAuth token, so it always
-refuses a static token. A request presenting both a static token and an
-OAuth token (in two sources) is judged by the static token, which the layer
-checks first.
+nothing could ever pass it; so does `build_with_decision` with an
+`Unauthenticated` decision and required scopes
+(`AuthLayerError::ScopesWithoutAuthentication`), rather than drop them. Behind
+a static-only layer a route check's 403 carries the bare
+`Bearer error="insufficient_scope"` challenge. `Scoped<S>` extracts an OAuth
+token, so it always refuses a static token. A request presenting both a
+static token and an OAuth token (in two sources) is judged by the static
+token, which the layer checks first.
+
+Scopes written in code go to `RequireScopes::new` (and `McpToolScopes`'
+`default`/`tool`), which panic on a value that is not a valid scope-token;
+scopes read from configuration go to `RequireScopes::try_new` (and
+`try_default`/`try_tool`/`try_body_limit`), which return an error naming
+the bad value. A `ScopeSet` with an invalid scope does not compile.
 
 A check of your own in the handler works too; decide it **fail-closed**:
 allow only a credential you positively recognize.
@@ -1340,11 +1350,15 @@ an `InvalidToken`'s `kind()` names the check that failed).
   none) the same way unless `static_token_bypasses_scopes()` says otherwise.
   `RequireScopes`, `Scoped` and `McpToolScopes` answer 500 (logged at
   `error`) on a route no authentication layer covers, even when they require
-  nothing. `McpToolScopes` reads at most its body limit (1 MiB by default)
-  and refuses a larger body with 413; a body it cannot classify with
-  certainty (not JSON, a `tools/call` with no readable tool name, a repeated
-  member) needs every scope any tool requires, never fewer; a JSON-RPC batch
-  needs every scope any of its calls needs; it never logs body content.
+  nothing. `McpToolScopes` classifies the body of a request under any
+  method, reads at most its body limit (1 MiB by default) and refuses a
+  larger body with 413; a body it cannot classify with certainty (not JSON,
+  a `tools/call` with no readable tool name, a repeated member) needs every
+  scope any tool requires, never fewer; a JSON-RPC batch needs every scope
+  any of its calls needs; it never logs body content. Its tool names are
+  matched **exactly** (see [Per-tool scopes](#per-tool-scopes-mcptoolscopes)):
+  an MCP server whose dispatcher normalizes names (case, whitespace) must not
+  be put behind it with scopes on some tools and not others.
 - **The extractors fail closed.** `Credential` and `AuthorizedToken` refuse a
   request the layer inserted nothing into with that layer's own 401 and
   challenge, built by the same code as its other refusals. On a route no
@@ -1881,8 +1895,8 @@ needs:
 
 | Request | Requires |
 |---|---|
-| not a `POST` (the event stream `GET`, `DELETE`) | the default |
-| `tools/call` for a listed tool | that tool's scopes |
+| no body (the event stream `GET`, `DELETE`) | the default |
+| a body, under **any** method, with a `tools/call` for a listed tool | that tool's scopes |
 | `tools/call` for another tool, or any other method | the default |
 | a JSON-RPC batch | every scope any of its messages needs |
 | a body that is not JSON, a `tools/call` with no readable `params.name`, or a message repeating `method`, `params` or `params.name` | every scope in the configuration (default and all tools) |
@@ -1895,7 +1909,29 @@ a malformed body itself. A static token is refused wherever scopes are
 required, unless `static_token_bypasses_scopes()`. A served request reaches
 the MCP server with its body byte-identical (trailers are not passed on). The
 body type must be buildable from bytes (`axum::body::Body`, `Full<Bytes>`);
-nothing from the body is ever logged.
+nothing from the body is ever logged. The body is parsed in one streaming
+pass that builds no document, so memory stays at about the body itself
+however many messages a batch holds. A request with no credential (behind
+an `optional()` layer) is refused before its body is read whenever any tool
+needs a scope.
+
+**Tool names are matched exactly** — byte for byte on the JSON-decoded
+`params.name`, with no case folding, trimming or normalization — and a name
+with no entry gets the default. Register every tool under exactly the name
+your MCP server dispatches on, and make sure its dispatcher is exact too: one
+that would also run `Write_Document` or `write_document ` as `write_document`
+lets a caller reach that tool under a spelling this layer treats as
+unconfigured, with only the default's scopes.
+
+**Set a read timeout on the server.** Reading the body has no timeout of its
+own, so a client that sends it slowly (slow-loris) holds the request open
+for as long as your server allows: configure a header/body read or request
+timeout (hyper's, a `tower_http::timeout` layer, or your proxy's), as for
+any endpoint that reads a body.
+
+Scopes and limits read from configuration go through `try_default`,
+`try_tool` and `try_body_limit`, which return an `McpScopesError` naming the
+bad value; the plain forms panic and are for literals in code.
 
 ### Reading the token inside a tool handler
 

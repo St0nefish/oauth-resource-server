@@ -272,14 +272,6 @@ fn a_layers_scopes_are_checked_when_it_is_built() {
             .build()
             .is_ok()
     );
-    // The explicit opt-out checks nothing, scopes included.
-    assert!(
-        AuthLayer::builder()
-            .require_scopes(["x"])
-            .build_with_decision(StaticTokenDecision::Unauthenticated)
-            .unwrap()
-            .allows_unauthenticated()
-    );
 }
 
 fn strict(v: &Arc<OAuthValidator>) -> AuthLayer {
@@ -522,11 +514,6 @@ impl ScopeSet for Write {
     const SCOPES: &'static [&'static str] = &["mcp:write"];
 }
 
-struct Broken;
-impl ScopeSet for Broken {
-    const SCOPES: &'static [&'static str] = &["two words"];
-}
-
 async fn write(token: Scoped<Write>) -> String {
     format!("written by {:?}", token.subject)
 }
@@ -570,23 +557,141 @@ async fn the_scoped_extractor_refuses_exactly_as_require_scopes() {
         seen_axum(&optional, Method::POST, None).await,
         (401, Some(v.invalid_token_challenge()), Vec::new())
     );
-    // No layer: 500.
+    // No layer: 500. (A scope set no token can carry does not compile: see
+    // `ScopeSet`'s `compile_fail` doctest.)
     let bare = Router::new().route("/test", post(write));
     assert_eq!(seen_axum(&bare, Method::POST, None).await.0, 500);
-    // A scope set no token can carry: a wiring mistake, 500.
-    let broken = Router::new()
-        .route("/test", post(|_: Scoped<Broken>| async { "never" }))
-        .route_layer(strict(&v));
+}
+
+/// Behind an `optional()` `HttpAuthLayer`, no credential: that layer's own
+/// 401 with `resource_metadata`, not the no-layer 500.
+#[tokio::test]
+async fn the_scoped_extractor_behind_an_optional_http_layer_answers_its_401() {
+    let (_jwks, v) = validator().await;
+    let app = Router::new().route("/test", post(write)).layer(
+        HttpAuthLayer::builder()
+            .oauth(Arc::clone(&v))
+            .optional()
+            .build()
+            .unwrap(),
+    );
+    let got = seen_axum(&app, Method::POST, None).await;
+    assert_eq!(got, (401, Some(v.invalid_token_challenge()), Vec::new()));
+    assert!(got.1.unwrap().contains("resource_metadata="));
+}
+
+/// A strict OAuth layer around an inner `allow_unauthenticated` one: a route
+/// check behind both judges the outer layer's credential and answers an
+/// under-scoped token with the outer layer's 403 step-up, not a 401.
+#[tokio::test]
+async fn a_route_check_behind_an_open_layer_inside_a_strict_one_answers_a_403() {
+    let (_jwks, v) = validator().await;
+    let app = ok_app(|r| {
+        r.route_layer(RequireScopes::new(["mcp:write"]))
+            .route_layer(AuthLayer::allow_unauthenticated())
+            .route_layer(strict(&v))
+    });
+    assert_eq!(
+        seen_axum(&app, Method::GET, Some(&bearer(&token("mcp:read")))).await,
+        refused_403()
+    );
     assert_eq!(
         seen_axum(
-            &broken,
-            Method::POST,
+            &app,
+            Method::GET,
             Some(&bearer(&token("mcp:read mcp:write")))
         )
         .await
         .0,
-        500
+        200
     );
+    // The same with the generic layers.
+    let http = tower::ServiceBuilder::new()
+        .layer(
+            HttpAuthLayer::builder()
+                .oauth(Arc::clone(&v))
+                .build()
+                .unwrap(),
+        )
+        .layer(HttpAuthLayer::allow_unauthenticated())
+        .layer(RequireScopes::new(["mcp:write"]));
+    assert_eq!(
+        seen_http(http, Some(&bearer(&token("mcp:read")))).await,
+        (403, Some(challenge_for("mcp:read mcp:write")), Vec::new())
+    );
+}
+
+/// Behind a static-only layer (no OAuth), a route check refusing a static
+/// token answers 403 with a bare `insufficient_scope` challenge (RFC 6750
+/// §3.1), never the static 401 challenge's `invalid_token`.
+#[tokio::test]
+async fn a_route_check_behind_a_static_only_layer_answers_a_bare_insufficient_scope() {
+    let static_only = || AuthLayer::builder().static_token(STATIC).build().unwrap();
+    let bare = Some("Bearer error=\"insufficient_scope\"".to_string());
+    let app = ok_app(|r| {
+        r.route_layer(RequireScopes::new(["mcp:write"]))
+            .route_layer(static_only())
+    });
+    assert_eq!(
+        seen_axum(&app, Method::GET, Some(&bearer(STATIC))).await,
+        (403, bare.clone(), Vec::new())
+    );
+    let scoped = Router::new()
+        .route("/test", post(write))
+        .route_layer(static_only());
+    assert_eq!(
+        seen_axum(&scoped, Method::POST, Some(&bearer(STATIC))).await,
+        (403, bare.clone(), Vec::new())
+    );
+    let http = tower::ServiceBuilder::new()
+        .layer(
+            HttpAuthLayer::builder()
+                .static_token(STATIC)
+                .build()
+                .unwrap(),
+        )
+        .layer(RequireScopes::new(["mcp:write"]));
+    assert_eq!(
+        seen_http(http, Some(&bearer(STATIC))).await,
+        (403, bare, Vec::new())
+    );
+}
+
+#[test]
+fn an_unauthenticated_decision_refuses_a_builder_with_scopes() {
+    assert_eq!(
+        AuthLayer::builder()
+            .require_scopes(["x"])
+            .build_with_decision(StaticTokenDecision::Unauthenticated)
+            .unwrap_err(),
+        AuthLayerError::ScopesWithoutAuthentication
+    );
+    assert_eq!(
+        HttpAuthLayer::builder()
+            .require_scopes(["x"])
+            .build_with_decision(StaticTokenDecision::Unauthenticated)
+            .unwrap_err(),
+        AuthLayerError::ScopesWithoutAuthentication
+    );
+    // Without scopes the explicit opt-out still builds.
+    assert!(
+        AuthLayer::builder()
+            .build_with_decision(StaticTokenDecision::Unauthenticated)
+            .unwrap()
+            .allows_unauthenticated()
+    );
+}
+
+#[test]
+fn require_scopes_try_new_names_the_bad_scope() {
+    assert_eq!(RequireScopes::try_new(["a", "a"]).unwrap().scopes(), ["a"]);
+    for bad in ["", "two words", "q\"uote", "caf\u{e9}"] {
+        assert_eq!(
+            RequireScopes::try_new(["ok", bad]).unwrap_err().scope(),
+            bad
+        );
+    }
+    assert!(std::panic::catch_unwind(|| RequireScopes::new(["two words"])).is_err());
 }
 
 #[tokio::test]

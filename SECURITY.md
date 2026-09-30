@@ -138,8 +138,17 @@ the ones a report is most likely to concern:
   read further), gives a body it cannot classify with certainty (not JSON, no
   readable tool name, a repeated member two parsers could read differently)
   the strictest scope set rather than the default, authorizes every message
-  of a JSON-RPC batch, passes a served body on byte-identical, and never logs
-  body content;
+  of a JSON-RPC batch, classifies a body under any method (not only
+  `POST`), refuses a request with no credential before reading its body,
+  parses in one streaming pass that builds no document (memory stays at
+  about the body itself), passes a served body on byte-identical, and never
+  logs body content. Its tool names are matched exactly — byte for byte on
+  the JSON-decoded name — so it relies on the MCP server dispatching tools
+  exactly as well: a dispatcher that normalizes names (case, whitespace)
+  would let a caller reach a scoped tool under a spelling treated as
+  unconfigured, with only the default scopes. That is a documented
+  deployment requirement, not something this crate can check; body reads
+  have no timeout of their own, so the server must set one;
 - static tokens are compared in constant time (`subtle`): with several
   (`StaticTokens`), every candidate is compared with every entry, with no
   early exit once one matches and no branch on which entry matched. A

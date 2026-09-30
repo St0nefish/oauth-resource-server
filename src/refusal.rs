@@ -25,6 +25,11 @@ use crate::validator::OAuthValidator;
 /// as well as a wrong one.
 pub const DEFAULT_STATIC_CHALLENGE: &str = "Bearer error=\"invalid_token\"";
 
+/// The 403 challenge a per-request scope refusal carries when no OAuth
+/// validator is configured (RFC 6750 §3.1's `insufficient_scope`, with no
+/// `resource_metadata` or `scope` to name).
+pub(crate) const BARE_INSUFFICIENT_SCOPE_CHALLENGE: &str = "Bearer error=\"insufficient_scope\"";
+
 /// The HTTP refusal a [`TokenRejection`] calls for; see [`refusal`].
 ///
 /// `#[non_exhaustive]`: read its fields; more may be added without a breaking
@@ -169,7 +174,9 @@ pub fn refusal_with_static_challenge(
 /// own required scopes — a per-route or per-operation requirement checked
 /// with [`crate::AuthorizedToken::require_scopes`]. Everything but the 403
 /// challenge is exactly [`refusal`]'s: the same status for every rejection,
-/// the same 401 challenge, [`DEFAULT_STATIC_CHALLENGE`] without OAuth.
+/// the same 401 challenge, [`DEFAULT_STATIC_CHALLENGE`] on a 401 without
+/// OAuth. Without OAuth a 403 carries `Bearer error="insufficient_scope"`
+/// (RFC 6750 §3.1) rather than the static 401 challenge [`refusal`] gives.
 ///
 /// With OAuth, [`TokenRejection::InsufficientScope`] carries
 /// [`OAuthValidator::insufficient_scope_challenge_for`] naming the
@@ -225,6 +232,12 @@ pub fn refusal_for_scopes(
             .map(|(i, s)| (i.as_str(), s.as_str())),
         Some(DEFAULT_STATIC_CHALLENGE),
     );
+    // Without OAuth a 403 still names its error (RFC 6750 §3.1), as the
+    // layers' route-level refusals do: the static 401 challenge would not.
+    let challenge = match (rejection, oauth) {
+        (TokenRejection::InsufficientScope, None) => Some(BARE_INSUFFICIENT_SCOPE_CHALLENGE),
+        _ => challenge,
+    };
     Refusal {
         status,
         www_authenticate: challenge.map(str::to_owned),
@@ -379,10 +392,13 @@ mod tests {
             refusal_for_scopes(&TokenRejection::InsufficientScope, Some(&v), &[], None),
             refusal(&TokenRejection::InsufficientScope, Some(&v))
         );
-        // Without OAuth there is no scope challenge to send.
+        // Without OAuth a 403 carries the bare `insufficient_scope`
+        // challenge, never the static 401 one.
+        let r = refusal_for_scopes(&TokenRejection::InsufficientScope, None, &["x"], None);
+        assert_eq!(r.status, 403);
         assert_eq!(
-            refusal_for_scopes(&TokenRejection::InsufficientScope, None, &["x"], None),
-            refusal(&TokenRejection::InsufficientScope, None)
+            r.www_authenticate.as_deref(),
+            Some("Bearer error=\"insufficient_scope\"")
         );
     }
 
