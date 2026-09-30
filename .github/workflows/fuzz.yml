@@ -1,8 +1,10 @@
 name: Fuzz
 
-# Runs each cargo-fuzz target in `fuzz/` for a bounded time. Nightly on
-# `master` and on demand; deliberately NOT a pull-request or push trigger, so
-# a fuzz run can never gate or slow a merge and a fork PR never reaches it.
+# Runs each cargo-fuzz target in `fuzz/` for a bounded time, after a merge to
+# `master` that touches the crate's source or the fuzz crate, and on demand.
+# Deliberately NOT a pull-request trigger and not a schedule: a fuzz run can
+# never gate or slow a merge, a fork PR never reaches it, and a project that
+# sits unchanged for months does not re-fuzz unchanged code every night.
 # A crash fails the run and uploads the offending input as an artifact; it is
 # reproduced locally with
 #   cargo +nightly fuzz run <target> fuzz/artifacts/<target>/<crash-file>
@@ -14,16 +16,22 @@ name: Fuzz
 # builders, the discovery-URL builder and the per-entry JWK parse.
 #
 # GitHub-hosted, not the self-hosted runner: nothing here gates a merge, a
-# long nightly job would tie the self-hosted runner up, and a scheduled run
-# executes only what is already on `master`. The job holds a read-only token.
+# long fuzz job would tie the self-hosted runner up, and a push run executes
+# only what is already on `master`. The job holds a read-only token.
 #
 # Every action is pinned to a full commit SHA, with the release it
 # corresponds to in a trailing comment (dtolnay/rust-toolchain publishes no
 # releases, so it is pinned to a commit of its `master` branch).
 
 on:
-  schedule:
-    - cron: "17 3 * * *"
+  push:
+    branches: [master]
+    paths:
+      - "src/**"
+      - "fuzz/**"
+      - "Cargo.toml"
+      - "Cargo.lock"
+      - ".github/workflows/fuzz.yml"
   workflow_dispatch:
     inputs:
       seconds:
@@ -34,7 +42,7 @@ on:
 permissions:
   contents: read
 
-# One fuzz run at a time; a new nightly never cancels one already running.
+# One fuzz run at a time; a new run never cancels one already running.
 concurrency:
   group: fuzz
   cancel-in-progress: false

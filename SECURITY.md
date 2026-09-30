@@ -231,7 +231,7 @@ before a release rather than reported after it:
   a known advisory or a yanked crate, on a dependency licence outside an
   explicit allowlist, and on any dependency source other than crates.io. Both
   ignore lists are empty.
-- **Fuzzing.** `cargo-fuzz` targets in `fuzz/` run nightly against the crate's
+- **Fuzzing.** `cargo-fuzz` targets in `fuzz/` run after every merge to `master` that touches the crate's source, against its
   own parsers: the `Bearer` header parser, the validator's pre-fetch header
   checks (`check_header`, `check_crit`, `check_typ`), scope and principal
   extraction, the RFC 9728 metadata URL and path builders, the discovery-URL
@@ -240,7 +240,7 @@ before a release rather than reported after it:
   `serde_json::Value` as an oracle). They assert invariants as well as
   looking for panics: for example, a token whose header carries `crit` is
   never accepted, and no parsed key ends up with an empty or out-of-allowlist
-  algorithm set. They run nightly rather than on every pull request.
+  algorithm set. They run after a merge, and on demand, rather than on every pull request or on a schedule.
 
 Fuzzing exercises the parsers, not the full validation path; it complements
 the test suite rather than replacing it.

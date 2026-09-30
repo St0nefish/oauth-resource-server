@@ -76,7 +76,7 @@ named lower bound in `Cargo.toml` to a release that builds and say in the
 comment above `[dependencies]` whether it is a compile floor or only what the
 resolver needs.
 
-Fuzz targets for the crate's own parsers live in `fuzz/` and run nightly in
+Fuzz targets for the crate's own parsers live in `fuzz/` and run after each merge to `master` (and on demand) in
 `fuzz.yml`, not on PRs. To run one locally
 (`cargo install --locked cargo-fuzz`, nightly toolchain):
 

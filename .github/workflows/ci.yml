@@ -56,7 +56,7 @@ name: CI
 #                       requirement allows, so a lower bound in Cargo.toml that
 #                       is too low fails CI. It rewrites Cargo.lock, which is
 #                       why it is not a step of `checks`.
-# Nightly fuzzing is not a PR job at all: see `fuzz.yml`.
+# Fuzzing runs after a merge to `master`, never as a PR job: see `fuzz.yml`.
 #
 # `msrv` is a separate job on a separate, explicitly-installed toolchain
 # (read from `Cargo.toml`'s `rust-version`, not from `rust-toolchain.toml` —
