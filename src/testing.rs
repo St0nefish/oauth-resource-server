@@ -380,6 +380,9 @@ pub fn resolved_config(jwks_uri: &str) -> ResolvedOAuthConfig {
         allow_unscoped_tokens: false,
         allow_insecure_http: false,
         accept_static_bearer: true,
+        allowed_client_ids: Vec::new(),
+        max_token_age_secs: None,
+        required_claims: std::collections::BTreeMap::new(),
         resource_name: None,
         key_naming: KeyNamingBuf::Dotted("mcp.oauth".to_string()),
     }

@@ -78,6 +78,13 @@ the ones a report is most likely to concern:
 - `iss` is re-checked as an exact single string after decode, a present
   `nbf` must be a NumericDate, and a sender-constrained (`cnf`) token is
   refused rather than accepted as a bearer token;
+- the optional claim policy (`allowed_client_ids`, `max_token_age_secs`,
+  `required_claims`) reads only claims the verified signature covers, runs
+  after those rechecks and before the scope check (so its refusals are 401,
+  never 403), and changes nothing when unset; with `max_token_age_secs` set,
+  a token without a readable `iat` is refused, never waved through, and with
+  `allowed_client_ids` set a `client_id` that is present but not a non-empty
+  string is refused rather than read past to `azp`;
 - every failure mode (fetch error, parse error, unknown key) fails closed —
   a failed refresh never discards keys already held, and the validator never
   falls back to accepting a token it cannot verify against the keys it has;
@@ -90,6 +97,10 @@ the ones a report is most likely to concern:
   whose configured challenge would not be one logs at `error` and uses a
   fallback without `resource_metadata`, and the layers refuse to build with
   it);
+- which check refused a token (`InvalidToken::kind()`) never changes the
+  response: every `TokenRejection::Invalid` is the same 401 with the same
+  challenge, and neither the kind nor the log-only detail reaches a response
+  the crate builds;
 - a configuration that would accept ID tokens as access tokens, or fetch keys
   from (or receive tokens at) a plain-`http` non-loopback URL — configured,
   discovered or reached by a redirect — is refused (at startup, or when the

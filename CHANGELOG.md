@@ -8,6 +8,117 @@ Before 1.0, a breaking change increments the minor version.
 
 ## [Unreleased]
 
+### Breaking changes (0.2.0)
+
+This is the 0.2.0 breaking batch. **Upgrading from 0.1.x:** change your
+requirement to `oauth-resource-server = "0.2"` (Cargo treats 0.1 → 0.2 as
+incompatible, so a `"0.1"` requirement never picks it up). No response
+changes: the 401/403 split, every `WWW-Authenticate` challenge and every
+response body are byte-for-byte what 0.1 sent.
+
+- **`TokenRejection::Invalid` holds an `InvalidToken` instead of a
+  `String`.** `InvalidToken` (`#[non_exhaustive]`, `Clone`, `Debug`,
+  `PartialEq`, `Eq`) has `kind()`, a stable `InvalidTokenKind`, and
+  `detail()`, the log-only reason text 0.1 carried. `InvalidTokenKind`
+  (`#[non_exhaustive]`, `Copy`, `Hash`) names which check refused the token —
+  `TooLarge`, `NotJwt`, `MalformedHeader`, `CriticalHeader`,
+  `AlgorithmNotAllowed`, `TypeNotAllowed`, `KeyNotFound`,
+  `KeySetUnavailable`, `MalformedToken`, `BadSignature`, `Expired`,
+  `NotYetValid`, `WrongIssuer`, `WrongAudience`, `MissingClaim`,
+  `MalformedClaim`, `SenderConstrained`, `StaticTokenMismatch`,
+  `NoMechanism`, `OAuthTokenRequired`, `StaticTokenRequired`, `Other` — and `as_str()` gives each a
+  stable `snake_case` label for metrics (`"expired"`, `"key_set_unavailable"`,
+  ...). Every refusal the crate makes carries its specific kind;
+  `KeySetUnavailable` separates an authorization-server outage from junk
+  traffic, including an unknown `kid` inside the 60 s refetch cooldown when
+  the last refresh failed or no key is held (a healthy key set gives
+  `KeyNotFound`), and a present-but-unreadable `exp`, `iss` or `aud` is
+  `MalformedClaim`, not `MissingClaim`. The kind a refusal carries and the labels are part of the semver
+  contract; the detail text is not. Closes oauth-resource-server#1 (narrowed:
+  `InsufficientScope` stays a unit variant, `Missing` is unchanged, and
+  `authenticate()`'s precedence is unchanged).
+
+  Migration. `InvalidToken` stands in for the old `String` wherever it can:
+  `Display` is the old reason text byte for byte; it implements
+  `Deref<Target = str>`, an inherent `as_str()`, `From<String>` and
+  `From<&str>` (kind `Other`), `From<InvalidToken> for String`,
+  `std::error::Error`, `PartialEq` with `str`, `&str` and `String` in both
+  directions, and, with the `serde` feature, `Serialize` as the detail
+  string. Equality, between two `InvalidToken`s too, compares the detail
+  only, so `assert_eq!(r, TokenRejection::Invalid("..".into()))` against a
+  refusal the crate made keeps passing; assert `kind()` when the kind
+  matters. So logging a reason, `reason.contains(..)`, `reason.as_str()`,
+  `reason == "..."`/`"..." == reason`, comparing with a `String`,
+  `let s: String = reason.into()`, `Box<dyn Error>` from it,
+  `json!({"reason": reason})` (with `serde`), `Invalid("..".into())`,
+  `Invalid(s.into())` and `Invalid(_)` patterns keep compiling. What still
+  fails to compile, each with its fix:
+  - a `String`-typed parameter or binding given the reason
+    (`log(reason)` with `fn log(_: String)`, `let s: String = reason`): pass
+    `reason.into()` or `reason.to_string()`;
+  - `reason.clone()` or `reason.to_owned()` stored into a `String` (they
+    now give an `InvalidToken`): use `reason.to_string()`;
+  - building the variant from a `String` expression —
+    `Invalid(String::new())`, `Invalid(string_var)`, `Invalid(format!(..))`:
+    add `.into()`;
+  - a `&String` or `Option<&String>` taken from the reason: take `&str`
+    (`reason.as_str()`) instead;
+  - `json!({"reason": reason})` without the `serde` feature: enable it, or
+    use `reason.as_str()`.
+
+  The `{:?}` form of `TokenRejection::Invalid` changes from
+  `Invalid("reason")` to
+  `Invalid(InvalidToken { kind: Expired, detail: "reason" })`, which the
+  layers' `OAuth bearer auth rejected` log line (`reason = ?rejection`)
+  shows: `Debug` is derived, so it now carries the kind too. Log text is not
+  a stable API; match `kind()`, and use `kind().as_str()` as a metrics
+  label, rather than parsing either form.
+- **`OAuthConfig` has three new fields, all default-off**, so a config that
+  sets none of them validates exactly as in 0.1. Breaking only for an
+  exhaustive `OAuthConfig { .. }` literal or pattern that names every field:
+  add `..OAuthConfig::default()` (functional-record update and serde/env
+  configs are unaffected). Each is also on `ResolvedOAuthConfig`, has an env
+  variable, and is checked in `OAuthValidator::verify` after the single
+  signature-and-claims `decode` and the existing `iss`/`nbf`/`cnf` rechecks,
+  before the scope check (so each refusal is a 401, never a 403). Closes
+  oauth-resource-server#7.
+  - `allowed_client_ids: Vec<String>` (`<PREFIX>ALLOWED_CLIENT_IDS`,
+    whitespace-split): the token's `client_id`, else `azp` (the same reading
+    as `AuthorizedToken::client_id`, now shared), must be listed; no client
+    or another one is `InvalidTokenKind::ClientNotAllowed`. Stricter than
+    that accessor in one way: a `client_id` that is present but empty or not
+    a string is refused, never read past to `azp`. For
+    authorization servers that stamp an audience shared by many clients.
+  - `max_token_age_secs: Option<u64>` (`<PREFIX>MAX_TOKEN_AGE_SECS`):
+    `now - iat` may not exceed it plus `leeway_secs` (`TokenTooOld`); with
+    it set, a missing `iat` is `MissingClaim`, a non-NumericDate one
+    `MalformedClaim`, and one more than the leeway in the future
+    `NotYetValid`. `resolve` refuses `0` and anything over the new
+    `MAX_TOKEN_AGE_SECS` (30 days) with `ProblemKind::TokenAgeOutOfRange`.
+  - `required_claims: BTreeMap<String, serde_json::Value>`
+    (`<PREFIX>REQUIRED_CLAIMS`, one JSON object): each claim must equal the
+    value (JSON equality) or, when the token's claim is an array, contain it.
+    Missing is `MissingClaim`, anything else (`null`, an object, an array
+    without it) `ClaimMismatch`. `resolve` refuses a blank name, one of
+    `iss`/`aud`/`exp`/`nbf`/`iat`/`cnf` (already checked by this crate), and
+    a value that is not a string, number or boolean
+    (`ProblemKind::InvalidRequiredClaim`); an array value may later mean "any
+    of these", additively. Naming a scope claim (`scope`, `scp`, a
+    `scope_claims` entry) or `azp`/`client_id` is logged as a startup `warn`,
+    not refused.
+  - New `InvalidTokenKind` variants `ClientNotAllowed`, `TokenTooOld`,
+    `ClaimMismatch`; new `ProblemKind` variants `TokenAgeOutOfRange`,
+    `InvalidRequiredClaim` (a blank `allowed_client_ids` entry is
+    `EmptyListEntry`); new constant `MAX_TOKEN_AGE_SECS`.
+- **Problem text can show a URL redacted.** A downstream test that pins
+  `ConfigError` message text may see a URL value that carried a credential
+  (userinfo, or a `jwks_uri` query) redacted and normalized, with
+  `(shown normalized, credential masked)` appended, instead of the raw
+  value it quoted before (oauth-resource-server#38, described under Security
+  below). Message text was never a stable API; match
+  `ConfigProblem::kind()` and `keys()` instead.
+- `Cargo.toml`'s version is `0.2.0`.
+
 ### Added
 
 - Several static tokens at once, for rotating a static API key with no

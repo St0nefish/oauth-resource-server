@@ -27,7 +27,7 @@ use tracing::{debug, info, warn};
 
 use crate::algorithms::{Algorithm, key_algorithms, signing_algorithm};
 use crate::config::{KeyNamingBuf, ResolvedOAuthConfig};
-use crate::token::{TokenRejection, describe_kid, for_log};
+use crate::token::{InvalidTokenKind, TokenRejection, describe_kid, for_log};
 use crate::validator::{
     is_canonical_url, parsed_plain_http_non_loopback, plain_http_non_loopback, url_is_loopback,
 };
@@ -745,11 +745,33 @@ impl JwksStore {
         {
             // See `JWKS_MIN_REFETCH_INTERVAL`: `kid` comes from an unverified token
             // header, so an unknown one must not be able to schedule IdP traffic.
-            return Err(TokenRejection::Invalid(format!(
-                "no {alg} key for kid {} and the JWKS was refetched less than {}s ago",
-                describe_kid(kid),
-                self.min_refetch_interval.as_secs()
-            )));
+            // When the last attempt failed, or no key is held at all, the key
+            // is missing because the authorization server is unreachable, not
+            // because the token names a key it never published: that is an
+            // outage (`KeySetUnavailable`), which an operator alerts on.
+            let (outage, detail_suffix) = {
+                let status = self.status_fields();
+                if status.public.last_error.is_some() {
+                    (true, " (the last JWKS refresh failed)")
+                } else if status.public.keys == 0 {
+                    (true, " (no signing key is held)")
+                } else {
+                    (false, "")
+                }
+            };
+            return Err(TokenRejection::invalid(
+                if outage {
+                    InvalidTokenKind::KeySetUnavailable
+                } else {
+                    InvalidTokenKind::KeyNotFound
+                },
+                format!(
+                    "no {alg} key for kid {} and the JWKS was refetched less than {}s \
+                     ago{detail_suffix}",
+                    describe_kid(kid),
+                    self.min_refetch_interval.as_secs()
+                ),
+            ));
         }
 
         if let Err(e) = self.refresh_detached(refreshing).await {
@@ -759,14 +781,20 @@ impl JwksStore {
                 "JWKS refresh failed — tokens signed by a key we do not already hold will \
                  be rejected until the next attempt"
             );
-            return Err(TokenRejection::Invalid(format!("JWKS refresh failed: {e}")));
+            return Err(TokenRejection::invalid(
+                InvalidTokenKind::KeySetUnavailable,
+                format!("JWKS refresh failed: {e}"),
+            ));
         }
 
         lookup(&self.jwks.read().await.keys, kid, alg).ok_or_else(|| {
-            TokenRejection::Invalid(format!(
-                "no {alg} key for kid {} in the fetched JWKS",
-                describe_kid(kid)
-            ))
+            TokenRejection::invalid(
+                InvalidTokenKind::KeyNotFound,
+                format!(
+                    "no {alg} key for kid {} in the fetched JWKS",
+                    describe_kid(kid)
+                ),
+            )
         })
     }
 

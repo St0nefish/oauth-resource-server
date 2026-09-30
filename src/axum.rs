@@ -172,7 +172,7 @@ use zeroize::Zeroizing;
 use crate::authenticate::{Credential, StaticTokenMatch, StaticTokens};
 use crate::challenge::PROTECTED_RESOURCE_METADATA_PREFIX;
 use crate::policy::StaticTokenDecision;
-use crate::token::{AuthorizedToken, TokenRejection, for_log};
+use crate::token::{AuthorizedToken, InvalidTokenKind, TokenRejection, for_log};
 use crate::validator::OAuthValidator;
 
 use crate::http_layer::{Admission, Gate};
@@ -905,11 +905,13 @@ fn no_layer(parts: &Parts, extractor: &'static str) -> Response {
 /// of the wrong kind, so it is `Invalid`, not `Missing`.
 fn refuse_absent(layer: &AuthLayer, parts: &Parts, wants: Wants) -> Response {
     let rejection = match (parts.extensions.get::<Credential>(), wants) {
-        (Some(_), Wants::StaticToken) => TokenRejection::Invalid(
-            "a credential was accepted, but the handler requires a static token".into(),
+        (Some(_), Wants::StaticToken) => TokenRejection::invalid(
+            InvalidTokenKind::StaticTokenRequired,
+            "a credential was accepted, but the handler requires a static token",
         ),
-        (Some(_), _) => TokenRejection::Invalid(
-            "a credential was accepted, but the handler requires an OAuth access token".into(),
+        (Some(_), _) => TokenRejection::invalid(
+            InvalidTokenKind::OAuthTokenRequired,
+            "a credential was accepted, but the handler requires an OAuth access token",
         ),
         (None, _) => TokenRejection::Missing,
     };
@@ -2594,6 +2596,56 @@ mod tests {
             .oneshot(req.body(Body::empty()).unwrap())
             .await
             .unwrap()
+    }
+
+    /// The kind an extractor's refusal carries reaches `on_reject`: a static
+    /// token where a handler needs an OAuth token is `OAuthTokenRequired`,
+    /// and the status stays 401.
+    #[tokio::test]
+    async fn an_oauth_extractor_refusing_a_static_token_names_its_kind() {
+        let jwks = testing::spawn_jwks_server("200 OK", testing::jwks_body()).await;
+        let v = validator(&jwks.url);
+        let layer = AuthLayer::builder()
+            .static_token(STATIC)
+            .oauth(Arc::clone(&v))
+            .on_reject(|cx: RejectContext<'_>| {
+                let label = match cx.rejection {
+                    TokenRejection::Invalid(invalid) => invalid.kind().as_str(),
+                    _ => "not invalid",
+                };
+                Response::new(Body::from(label))
+            })
+            .build()
+            .unwrap();
+        let app = Router::new()
+            .route("/test", get(|_: AuthorizedToken| async { "ok" }))
+            .route("/static", get(|_: StaticTokenMatch| async { "ok" }))
+            .route_layer(layer);
+        let resp = get_with_auth(&app, Some("Bearer secret")).await;
+        assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
+        assert_eq!(www_authenticate(&resp), v.invalid_token_challenge());
+        assert_eq!(body_bytes(resp).await, b"oauth_token_required");
+        let resp = get_with_auth(&app, Some("Bearer wrong")).await;
+        assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
+        assert_eq!(body_bytes(resp).await, b"not_jwt");
+        // An OAuth token where a handler needs the static token.
+        let resp = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/static")
+                    .header(
+                        "authorization",
+                        format!("Bearer {}", testing::valid_token()),
+                    )
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
+        assert_eq!(www_authenticate(&resp), v.invalid_token_challenge());
+        assert_eq!(body_bytes(resp).await, b"static_token_required");
     }
 
     #[tokio::test]

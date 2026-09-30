@@ -129,8 +129,8 @@ pub use builder::OAuthValidatorBuilder;
 pub use challenge::PROTECTED_RESOURCE_METADATA_PREFIX;
 pub use config::{
     ConfigError, ConfigProblem, DEFAULT_LEEWAY_SECS, DEFAULT_PRINCIPAL_CLAIMS,
-    DEFAULT_SCOPE_CLAIMS, KeyNaming, KeyNamingBuf, MAX_LEEWAY_SECS, OAuthConfig, ProblemKind,
-    ResolvedOAuthConfig,
+    DEFAULT_SCOPE_CLAIMS, KeyNaming, KeyNamingBuf, MAX_LEEWAY_SECS, MAX_TOKEN_AGE_SECS,
+    OAuthConfig, ProblemKind, ResolvedOAuthConfig,
 };
 pub use jwks::{
     DEFAULT_FETCH_TIMEOUT, KeySetStatus, MAX_FETCH_TIMEOUT, MIN_FETCH_TIMEOUT, RefreshError,
@@ -138,5 +138,5 @@ pub use jwks::{
 };
 pub use policy::{NoAuthConfigured, StaticTokenDecision, static_token_policy};
 pub use refusal::{DEFAULT_STATIC_CHALLENGE, Refusal, refusal, refusal_with_static_challenge};
-pub use token::{AuthorizedToken, TokenRejection};
+pub use token::{AuthorizedToken, InvalidToken, InvalidTokenKind, TokenRejection};
 pub use validator::{OAuthValidator, ValidatorError};

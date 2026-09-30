@@ -70,7 +70,7 @@ or in `Cargo.toml`:
 
 ```toml
 [dependencies]
-oauth-resource-server = { version = "0.1", features = ["axum", "serde"] }
+oauth-resource-server = { version = "0.2", features = ["axum", "serde"] }
 ```
 
 ### Features
@@ -155,10 +155,10 @@ crate over as well, so the binary carries one TLS stack instead of two:
 
 ```toml
 [dependencies]
-oauth-resource-server = { version = "0.1", default-features = false, features = ["native-tls", "axum", "serde"] }
+oauth-resource-server = { version = "0.2", default-features = false, features = ["native-tls", "axum", "serde"] }
 
 [dev-dependencies]
-oauth-resource-server = { version = "0.1", default-features = false, features = ["native-tls", "testing"] }
+oauth-resource-server = { version = "0.2", default-features = false, features = ["native-tls", "testing"] }
 ```
 
 Repeat `default-features = false` in `[dev-dependencies]`. Cargo merges a
@@ -703,12 +703,66 @@ returns, the crate sets the status (401 for a missing or invalid credential,
 the callback set: to the validator's challenge when OAuth is configured, and
 otherwise to the static challenge described below. `RejectContext` also
 carries the request's method, URI and headers, so the body can follow
-`Accept`. Never put the reason inside `TokenRejection::Invalid` in the body:
+`Accept`. Never put the detail inside `TokenRejection::Invalid` in the body:
 it says which check failed, which is an oracle for an attacker. The layer
-logs it instead. `RejectContext`'s `Debug` prints header names but no header
+logs it instead. (Its `kind()` is coarser, but this crate's own responses
+never carry it either; whether to expose it is your decision.)
+`RejectContext`'s `Debug` prints header names but no header
 values, and the URI's path with any query shown as `?***` (a client may put
 an `access_token` there), and the credential headers are marked sensitive, so
 `tracing::warn!(?cx)` in the callback does not log the token.
+
+### Metrics: counting refusals by kind
+
+`TokenRejection::Invalid` holds an `InvalidToken`, whose `kind()` is an
+`InvalidTokenKind`: which check refused the token (`Expired`, `BadSignature`,
+`WrongAudience`, `KeySetUnavailable`, ...). `kind().as_str()` is a stable,
+low-cardinality `snake_case` label, so it can go straight into a metrics
+label; the human-readable `detail()` cannot (it is unbounded, and for logs
+only). `on_reject` sees every refusal, so it is one place to count them:
+
+```rust
+use std::sync::Arc;
+
+use axum::response::IntoResponse;
+use oauth_resource_server::axum::{AuthLayer, AuthLayerError, RejectContext};
+use oauth_resource_server::{InvalidTokenKind, OAuthValidator, TokenRejection};
+
+/// Stand-in for your metrics library's counter.
+fn count_refusal(reason: &'static str) {
+    let _ = reason;
+}
+
+fn layer(oauth: Arc<OAuthValidator>) -> Result<AuthLayer, AuthLayerError> {
+    AuthLayer::builder()
+        .oauth(oauth)
+        .on_reject(|cx: RejectContext<'_>| {
+            let reason = match cx.rejection {
+                TokenRejection::Missing => "missing",
+                TokenRejection::InsufficientScope => "insufficient_scope",
+                TokenRejection::Invalid(invalid) => {
+                    if invalid.kind() == InvalidTokenKind::KeySetUnavailable {
+                        // The authorization server is unreachable: an outage to
+                        // alert on, not junk traffic.
+                        tracing::error!(detail = %invalid, "signing keys unavailable");
+                    }
+                    invalid.kind().as_str()
+                }
+                _ => "other",
+            };
+            count_refusal(reason);
+            cx.status.into_response()
+        })
+        .build()
+}
+```
+
+The same `TokenRejection` comes back from `authenticate` and
+`OAuthValidator::validate` on any other stack. Every kind is a 401
+`invalid_token`: the kind never changes the response. The labels, and which
+kind a given refusal carries, are stable across releases (a new kind may be
+added in a minor release, so match with a wildcard arm); the detail text is
+not.
 
 **Without OAuth**, a 401 carries `WWW-Authenticate: Bearer error="invalid_token"`
 (`axum::DEFAULT_STATIC_CHALLENGE`), because RFC 9110 §15.5.2 requires every 401
@@ -944,6 +998,9 @@ error messages spell them (`KeyNaming::Dotted("oauth")` gives `oauth.issuer`,
 | `allow_unscoped_tokens` | `bool` | `false` | Accept a config with no required scope and `require_at_jwt` off. Without it, `resolve` refuses that combination, because it would accept OIDC ID tokens as access tokens. |
 | `allow_insecure_http` | `bool` | `false` | Accept a plain-`http` `issuer`, `jwks_uri` or `resource` on a non-loopback host, for an in-cluster address on a trusted network. Also governs a `jwks_uri` discovered from a plain-`http` issuer and every redirect followed while fetching keys. Loopback hosts never need it. |
 | `accept_static_bearer` | `bool` | `true` | Whether a separately configured static token keeps working while OAuth is on. Read only by `static_token_policy`. |
+| `allowed_client_ids` | `Vec<String>` | `[]` (no check) | The OAuth clients whose tokens are accepted. A token's client is its `client_id` claim (RFC 9068 §2.2), else its `azp` (the first that is a non-empty string, as `AuthorizedToken::client_id` reads it), and it must equal an entry byte for byte; `client_id` wins, so a listed `azp` does not rescue an unlisted `client_id`, and a `client_id` that is present but empty or not a string is refused rather than read past. No client, or another one, is a 401 (`ClientNotAllowed`). Use it where the audience is shared by several clients (see [Client identity](#what-is-not-covered)). No blank entries. |
+| `max_token_age_secs` | `Option<u64>` | `None` (no check) | Refuse a token issued more than this many seconds ago (`now - iat`, plus `leeway_secs` of slack): `TokenTooOld`. With it set, `iat` is required (`MissingClaim`) and must be a NumericDate (`MalformedClaim`), and an `iat` more than `leeway_secs` in the future is `NotYetValid`. `1` to `MAX_TOKEN_AGE_SECS` (2 592 000, 30 days); `0`, or more than that, is an error. All 401. |
+| `required_claims` | map of claim name to value | `{}` (no check) | Claims every token must carry with a value: the token's claim must equal it (JSON equality, so `"1"` is not `1`), or be an array containing it (for `groups`, `roles` and the like). A missing claim is `MissingClaim`; any other value (including `null`, an object, or an array without it) is `ClaimMismatch`; both 401. Values must be a string, number or boolean (an array may later mean "any of", additively); naming a scope claim or `azp`/`client_id` logs a startup `warn`; top-level claims only (no paths into nested objects); names must not be blank nor one of `iss`, `aud`, `exp`, `nbf`, `iat` and `cnf`, which this crate already checks. |
 
 `resolve` is all-or-nothing. An enabled config either resolves completely or
 fails with a `ConfigError` listing **every** problem, each naming its setting:
@@ -1095,10 +1152,15 @@ ways:
   setting: neither defaults it to the required scopes "instead of" the
   other leaving it empty.
 - **Lists** (`AUDIENCES`, `REQUIRED_SCOPES`, `SCOPES_SUPPORTED`,
-  `SCOPE_CLAIMS`, `PRINCIPAL_CLAIMS`, `ALGORITHMS`) are split on whitespace.
+  `SCOPE_CLAIMS`, `PRINCIPAL_CLAIMS`, `ALGORITHMS`, `ALLOWED_CLIENT_IDS`) are
+  split on whitespace.
 - **Booleans** accept exactly `true` or `false`. Anything else is an error, so
   a typo cannot silently read as `false`.
-- **`LEEWAY_SECS`** is a decimal integer.
+- **`LEEWAY_SECS`** and **`MAX_TOKEN_AGE_SECS`** are decimal integers
+  (`MAX_TOKEN_AGE_SECS` unset means no age check).
+- **`REQUIRED_CLAIMS`** is one JSON object:
+  `MYAPP_OAUTH_REQUIRED_CLAIMS='{"tid": "<tenant id>", "groups": "api-users"}'`.
+  Anything but a JSON object is an `EnvParse` problem.
 - **Values are trimmed.** A variable that is empty after trimming counts as
   unset, but a `_FILE` whose contents are empty after trimming is an error.
   Setting both `VAR` and `VAR_FILE` is an error.
@@ -1156,12 +1218,21 @@ For each candidate credential, `OAuthValidator::validate`:
    confirmation claim is refused, since it is bound to a DPoP key (RFC 9449)
    or an mTLS certificate (RFC 8705) whose proof this crate cannot check, and
    those RFCs forbid accepting it as a plain bearer token.
-5. **Checks scopes.** The token must carry every required scope, or it is
-   refused with `InsufficientScope` (403), not 401.
+5. **Applies the optional claim policy**, each check off unless configured,
+   in this order: the client (`client_id`, else `azp`) must be in
+   `allowed_client_ids`; `iat` must be no older than `max_token_age_secs`
+   (and not in the future); every `required_claims` entry must match. These
+   read only claims the signature already covered, and each refusal is a 401
+   with its own kind (`ClientNotAllowed`, `TokenTooOld`, `NotYetValid`,
+   `MissingClaim`, `MalformedClaim`, `ClaimMismatch`).
+6. **Checks scopes.** The token must carry every required scope, or it is
+   refused with `InsufficientScope` (403), not 401. A token that fails step 5
+   is a 401 whatever its scopes.
 
 The result is an `AuthorizedToken` (`subject`, `principal`, `scopes`, plus the
 verified claims and token metadata) or a
-`TokenRejection` (`Missing`, `Invalid(reason)` or `InsufficientScope`).
+`TokenRejection` (`Missing`, `Invalid(InvalidToken)` or `InsufficientScope`;
+an `InvalidToken`'s `kind()` names the check that failed).
 
 ### Guarantees
 
@@ -1318,13 +1389,24 @@ verified claims and token metadata) or a
   (one carrying `cnf`) is refused, not downgraded to a bearer token. Tokens
   are accepted from headers only (`bearer_methods_supported` is
   `["header"]`), never from query strings or form bodies.
-- **Replay and token age.** There is no `jti` tracking and no maximum age from
-  `iat`.
-- **Client identity.** `azp` and `client_id` are not checked. Any client of the
-  authorization server whose tokens carry an accepted `aud` and the required
-  scopes is accepted, so choose `audience` accordingly (see
-  [Audience](#audience-which-value-to-configure) for what a client_id audience
-  means).
+- **Replay.** There is no `jti` tracking: a token is usable until `exp` by
+  whoever holds it. Token *age* can be bounded independently of `exp` with
+  `max_token_age_secs` (off by default), which limits how long a stolen token
+  stays useful when the authorization server issues long-lived ones.
+- **Client identity, unless you list the clients.** By default `azp` and
+  `client_id` are not checked: any client of the authorization server whose
+  tokens carry an accepted `aud` and the required scopes is accepted. That is
+  the whole story when the audience identifies this API alone, but not when
+  the authorization server stamps an audience shared by many clients (an
+  Auth0 API identifier, an Okta custom authorization server's audience, an
+  Entra ID app ID URI): then every client granted that API gets in. Set
+  `allowed_client_ids` to the clients you mean to serve (it reads
+  `client_id`, else `azp`; for a client named in another claim, such as
+  Okta's `cid`, require that claim with `required_claims`; see the [provider
+  guide](https://github.com/St0nefish/oauth-resource-server/blob/master/docs/providers.md#shared-audiences-restrict-the-clients)), and see
+  [Audience](#audience-which-value-to-configure) for what a client_id
+  audience means. Any further claim policy (a tenant, a group) can be
+  required with `required_claims`.
 - **Per-route or per-operation scopes, and scope hierarchies.** Each validator
   has one set of required scopes, matched exactly: there is no way to say
   "`api:write` implies `api:read`". Finer and hierarchy-aware checks are the
@@ -1549,7 +1631,8 @@ async fn check(
     authenticate(candidates, static_token, Some(oauth))
         .await
         .map_err(|rejection| {
-            // Log `rejection` (an `Invalid` carries its reason); never send it.
+            // Log `rejection` (an `Invalid` carries its kind and detail);
+            // never send it.
             let r = refusal(&rejection, Some(oauth));
             (r.status, r.www_authenticate)
         })
@@ -1570,7 +1653,8 @@ outside authentication, as in [Readiness and liveness
 probes](#readiness-and-liveness-probes) (never from `refresh_now()`, which
 fetches every time). `TokenRejection` is a `std::error::Error` whose `Display` is only its category
 (`invalid token`), so `?` and `{e}` never expose the reason; the reason is in
-the variant and in `Debug`, for your log.
+the variant (an `InvalidToken`: `kind()` for code and metrics, `detail()` for
+your log) and in `Debug`.
 [`examples/hyper.rs`](https://github.com/St0nefish/oauth-resource-server/blob/master/examples/hyper.rs)
 is a complete hyper 1.x server built this way, and
 [`examples/standalone_validator.rs`](https://github.com/St0nefish/oauth-resource-server/blob/master/examples/standalone_validator.rs)
@@ -1755,11 +1839,12 @@ is logged at `warn` like any other refusal. Enable `debug` for that target while
 this:
 
 ```text
-WARN oauth_resource_server::axum: OAuth bearer auth rejected path=/v1/things reason=Invalid("token rejected: InvalidAudience")
+WARN oauth_resource_server::axum: OAuth bearer auth rejected path=/v1/things reason=Invalid(InvalidToken { kind: WrongAudience, detail: "token rejected: InvalidAudience" })
 ```
 
 With only a static token configured, the line is `Bearer auth rejected`, with
-no reason. The validator and key-set messages come from the targets
+no reason. The table below is keyed on the detail text, which is for reading
+logs; in code, match `InvalidToken::kind()` instead. The validator and key-set messages come from the targets
 `oauth_resource_server::validator` and `oauth_resource_server::jwks`.
 
 | Reason or log line | Cause and fix |
@@ -1767,6 +1852,9 @@ no reason. The validator and key-set messages come from the targets
 | `token header lists critical extensions (crit), ...` | The authorization server marked the token with a JWS extension this crate cannot process (RFC 7515 §4.1.11). Configure it not to. |
 | `token nbf is not a NumericDate ...` | The token's `nbf` is a string or out-of-range number. The authorization server is emitting a malformed token. |
 | `token is sender-constrained (cnf); ...` | The token is DPoP- or mTLS-bound, which this crate cannot verify. Configure the client or server to issue plain bearer tokens for this API. |
+| `token client "..." is not in ...allowed_client_ids`, or `token names no client (client_id or azp) ...` | The token was issued to a client you did not list, or names its client in another claim (Okta: `cid`; require that with `required_claims` instead). |
+| `token was issued ...s ago, over ...max_token_age_secs`, or `token has no iat and ...max_token_age_secs is set` | The token is older than you allow, or carries no `iat`. Lower the authorization server's token lifetime, or unset `max_token_age_secs` if it cannot emit `iat`. |
+| `token has no "..." claim, which ...required_claims requires`, or `token claim "..." does not match ...required_claims` | A `required_claims` entry failed. Decode a real token and compare the claim's name, type and value (`"1"` is not `1`). |
 | `credential is not a JWT (...)` | The token is opaque, or it is a mistyped static token. Configure the authorization server to issue JWT access tokens (Authelia: `access_token_signed_response_alg`; Ory Hydra: `strategies.access_token: jwt`; Zitadel: the JWT token type). |
 | `token rejected: InvalidAudience` | `aud` contains none of the configured audiences. Decode a real token and copy its `aud` into `audience`; see [Audience](#audience-which-value-to-configure). |
 | `token rejected: InvalidIssuer`, or `token iss is not a single string equal to ...` | `issuer` differs from the token's `iss`, most often by a trailing slash. Copy it from the discovery document exactly. |
@@ -1797,7 +1885,7 @@ keys are public, so anything that trusts them trusts everyone):
 
 ```toml
 [dev-dependencies]
-oauth-resource-server = { version = "0.1", features = ["testing"] }
+oauth-resource-server = { version = "0.2", features = ["testing"] }
 ```
 
 `testing::TestAuthority` is a fake authorization server on a loopback port. It
@@ -1909,8 +1997,8 @@ a vulnerability, where a forged, expired, wrongly-audienced or otherwise
 out-of-policy token was being accepted, ships as a patch release even though
 it refuses tokens that were accepted before. It comes with a `CHANGELOG.md`
 entry and a security advisory. Holding such a fix for the next minor release
-would leave everyone on the usual `"0.1"` requirement unprotected. If you pin
-an exact version (`=0.1.x`), expect a patch to narrow what is accepted when it
+would leave everyone on the usual `"0.2"` requirement unprotected. If you pin
+an exact version (`=0.2.x`), expect a patch to narrow what is accepted when it
 fixes a vulnerability.
 
 A new minor release is required for:
@@ -1932,11 +2020,13 @@ A new minor release is required for:
 change in any release, a patch included. The troubleshooting table above is
 for reading logs; do not string-match these messages in code. Match on the
 types instead (`TokenRejection`, `ValidatorError`, `AuthLayerError`, and so
-on) and, for configuration problems, on `ConfigProblem::kind()`
-(`ProblemKind`) and `keys()`, which are the durable alternative to matching
-the sentence. The `ProblemKind` a given problem carries is part of the
-contract (reclassifying one is a breaking change; adding a variant is not),
-while its message text is not.
+on): for a refused token, on `InvalidToken::kind()` (`InvalidTokenKind`,
+with `as_str()` labels for metrics), and for configuration problems, on
+`ConfigProblem::kind()` (`ProblemKind`) and `keys()`. These are the durable
+alternative to matching the sentence. The kind a given refusal or problem
+carries, and each kind's `as_str()` label, are part of the contract
+(reclassifying one is a breaking change; adding a variant is not), while the
+message text (`InvalidToken::detail()`, `ConfigProblem::message()`) is not.
 
 ## License
 
