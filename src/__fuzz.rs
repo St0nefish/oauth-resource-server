@@ -155,7 +155,7 @@ pub fn scope_challenge(scopes: &[String], description: Option<&str>) {
 /// (`Ambiguous` — repeated members, no readable name — may be anything.)
 #[cfg(feature = "mcp")]
 pub fn mcp_tool_calls(body: &[u8]) {
-    use crate::mcp::{Classified, Message};
+    use crate::mcp::{Classified, NamedMessage as Message};
 
     let oracle = serde_json::from_slice::<Value>(body).ok();
     let elements: Option<Vec<&Value>> = match &oracle {

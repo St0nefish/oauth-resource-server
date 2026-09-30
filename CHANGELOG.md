@@ -194,9 +194,13 @@ response body are byte-for-byte what 0.1 sent.
     byte-identical. A batch needs every scope any of its messages needs; a
     body it cannot classify with certainty (not JSON, a `tools/call` with no
     readable string `params.name`, a repeated `method`/`params`/`name`)
-    needs every configured scope; bodiless requests and other methods need
-    the default; with no credential, a request with a body is refused before
-    it is read whenever a scope could be needed. It parses in one streaming
+    needs every configured scope; an empty body (`Content-Length: 0`, no
+    chunks, a `GET`) and other methods need the default. Every request's
+    body is read, whatever its method or size hint. With no credential, a
+    request gets the layer's 401 when what it needs is not empty (before its
+    body is read when every request needs a scope), and is served when it
+    needs nothing, such as an anonymous `initialize` behind an empty
+    default. It parses in one streaming
     pass that builds no document (about the body's size in memory, whatever
     the batch length). Tool names are matched exactly, byte for byte after
     JSON decoding — the MCP server's dispatcher must be exact too. Body reads

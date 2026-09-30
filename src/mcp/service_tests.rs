@@ -363,8 +363,8 @@ async fn no_credential_is_the_layers_401_and_no_layer_is_a_500() {
         post(&app, None, &call("write_document")).await,
         (401, Some(v.invalid_token_challenge()), Vec::new())
     );
-    // Refused before the body is read whenever any tool needs a scope: the
-    // stream fails if it is polled at all.
+    // Every request needs a scope (a default, no public tool): refused
+    // before the body is read — the stream fails if it is polled at all.
     let optional = || {
         AuthLayer::builder()
             .oauth(Arc::clone(&v))
@@ -373,12 +373,25 @@ async fn no_credential_is_the_layers_401_and_no_layer_is_a_500() {
             .unwrap()
     };
     let unread = || Body::new(Chunks(vec![Err(std::io::Error::other("read"))].into()));
+    assert_eq!(
+        send(&app, http::Method::POST, None, unread()).await,
+        (401, Some(v.invalid_token_challenge()), Vec::new())
+    );
+    // Public tools and methods (an empty default), scoped writes: the body
+    // is read and decides. An anonymous `initialize` is served, an
+    // anonymous write call gets the layer's 401.
     let app2 = self::app(
         optional(),
         McpToolScopes::new().tool("write_document", ["mcp:write"]),
     );
+    let initialize = r#"{"jsonrpc":"2.0","id":1,"method":"initialize","params":{}}"#;
+    assert_eq!(post(&app2, None, initialize).await, served(initialize));
     assert_eq!(
-        send(&app2, http::Method::POST, None, unread()).await,
+        post(&app2, None, &call("search")).await,
+        served(&call("search"))
+    );
+    assert_eq!(
+        post(&app2, None, &call("write_document")).await,
         (401, Some(v.invalid_token_challenge()), Vec::new())
     );
     // A bodiless request with no default requirement is still served
@@ -398,6 +411,100 @@ async fn no_credential_is_the_layers_401_and_no_layer_is_a_500() {
     assert_eq!(
         post(&bare, None, &call("search")).await,
         (500, None, Vec::new())
+    );
+}
+
+/// A body whose size hint claims it is exactly empty, but which yields data.
+struct LyingEmpty(Option<Bytes>);
+
+impl http_body::Body for LyingEmpty {
+    type Data = Bytes;
+    type Error = std::io::Error;
+
+    fn poll_frame(
+        mut self: Pin<&mut Self>,
+        _cx: &mut Context<'_>,
+    ) -> Poll<Option<Result<http_body::Frame<Bytes>, std::io::Error>>> {
+        Poll::Ready(self.0.take().map(|b| Ok(http_body::Frame::data(b))))
+    }
+
+    fn is_end_stream(&self) -> bool {
+        false
+    }
+
+    fn size_hint(&self) -> http_body::SizeHint {
+        http_body::SizeHint::with_exact(0)
+    }
+}
+
+#[tokio::test]
+async fn a_size_hint_of_zero_is_not_trusted() {
+    let (_jwks, v) = validator().await;
+    let app = app(strict(&v), tool_scopes());
+    let body = call("write_document");
+    for method in [http::Method::POST, http::Method::GET] {
+        let lying = Body::new(LyingEmpty(Some(Bytes::from(body.clone()))));
+        assert_eq!(
+            send(&app, method.clone(), Some(&token("mcp:read")), lying).await,
+            (403, Some(challenge_for("mcp:read mcp:write")), Vec::new()),
+            "{method}"
+        );
+    }
+}
+
+#[tokio::test]
+async fn an_empty_body_needs_the_default_and_whitespace_the_strictest_set() {
+    let (_jwks, v) = validator().await;
+    let app = app(strict(&v), tool_scopes());
+    let reader = token("mcp:read");
+    let status = |header: (http::HeaderName, &'static str), body: Body| {
+        let request = Request::builder()
+            .method(http::Method::POST)
+            .uri("/mcp")
+            .header("authorization", format!("Bearer {reader}"))
+            .header(header.0, header.1)
+            .body(body)
+            .unwrap();
+        let app = app.clone();
+        async move { app.oneshot(request).await.unwrap().status().as_u16() }
+    };
+    // Both empty forms read to nothing and need the default only
+    // (`mcp:read`, which the token has): `Content-Length: 0`, and a chunked
+    // body with no chunks.
+    assert_eq!(
+        status((http::header::CONTENT_LENGTH, "0"), Body::empty()).await,
+        200
+    );
+    assert_eq!(
+        status(
+            (http::header::TRANSFER_ENCODING, "chunked"),
+            Body::new(Chunks(std::collections::VecDeque::new()))
+        )
+        .await,
+        200
+    );
+    // Whitespace alone is not empty and not JSON: the strictest set.
+    assert_eq!(
+        status((http::header::CONTENT_LENGTH, "2"), Body::from("  ")).await,
+        403
+    );
+}
+
+#[tokio::test]
+async fn a_long_tool_name_is_matched_in_place() {
+    let (_jwks, v) = validator().await;
+    let long = "t".repeat(512 * 1024);
+    let app = app(strict(&v), tool_scopes().tool(long.clone(), ["mcp:admin"]));
+    let body = call(&long);
+    assert_eq!(
+        post(&app, Some(&token("mcp:read mcp:write")), &body)
+            .await
+            .0,
+        403
+    );
+    assert_eq!(
+        post(&app, Some(&token("mcp:read mcp:admin")), &body).await,
+        served(&body)
     );
 }
 

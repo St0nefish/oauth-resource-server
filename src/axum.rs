@@ -941,7 +941,14 @@ impl AuthLayer {
     async fn check(&self, mut request: Request) -> Result<Request, Response> {
         let enforce = match &*self.inner {
             Mode::AllowUnauthenticated => {
-                request.extensions_mut().insert(LayerRan(self.clone()));
+                // Inside another axum layer, leave its `LayerRan` in place,
+                // exactly as `mark` leaves its `GateRan`: the extractors and
+                // the route-level checks then refuse with the same (outer)
+                // layer's 401 and challenge (`resource_metadata` included),
+                // never this open layer's bare one.
+                if request.extensions().get::<LayerRan>().is_none() {
+                    request.extensions_mut().insert(LayerRan(self.clone()));
+                }
                 self.mark(request.extensions_mut());
                 return Ok(request);
             }

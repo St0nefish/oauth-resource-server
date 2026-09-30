@@ -139,7 +139,9 @@ the ones a report is most likely to concern:
   readable tool name, a repeated member two parsers could read differently)
   the strictest scope set rather than the default, authorizes every message
   of a JSON-RPC batch, classifies a body under any method (not only
-  `POST`), refuses a request with no credential before reading its body,
+  `POST`, and never trusting a size hint of zero), refuses a request with
+  no credential with the layer's 401 whenever what it needs is not empty
+  (before reading its body when every request needs a scope),
   parses in one streaming pass that builds no document (memory stays at
   about the body itself), passes a served body on byte-identical, and never
   logs body content. Its tool names are matched exactly — byte for byte on

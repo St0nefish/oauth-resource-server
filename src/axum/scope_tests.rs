@@ -705,3 +705,40 @@ async fn the_scoped_extractor_behind_the_http_layer_uses_its_refusal() {
         (403, Some(challenge_for("mcp:read mcp:write")), Vec::new())
     );
 }
+
+/// An `optional()` outer layer around an `allow_unauthenticated` inner one,
+/// anonymous: `Scoped`, `AuthorizedToken` and `RequireScopes` all refuse
+/// with the OUTER layer's 401 and challenge (with `resource_metadata`),
+/// never the open layer's bare one.
+#[tokio::test]
+async fn extractors_and_route_checks_agree_behind_an_open_layer_inside_an_optional_one() {
+    let (_jwks, v) = validator().await;
+    let outer = || {
+        AuthLayer::builder()
+            .oauth(Arc::clone(&v))
+            .optional()
+            .build()
+            .unwrap()
+    };
+    let scoped = Router::new()
+        .route("/test", post(write))
+        .route_layer(AuthLayer::allow_unauthenticated())
+        .route_layer(outer());
+    let token_route = Router::new()
+        .route(
+            "/test",
+            post(|t: AuthorizedToken| async move { format!("{:?}", t.subject) }),
+        )
+        .route_layer(AuthLayer::allow_unauthenticated())
+        .route_layer(outer());
+    let layered = ok_app(|r| {
+        r.route_layer(RequireScopes::new(["mcp:write"]))
+            .route_layer(AuthLayer::allow_unauthenticated())
+            .route_layer(outer())
+    });
+    let want = (401, Some(v.invalid_token_challenge()), Vec::new());
+    assert!(want.1.as_deref().unwrap().contains("resource_metadata="));
+    assert_eq!(seen_axum(&scoped, Method::POST, None).await, want);
+    assert_eq!(seen_axum(&token_route, Method::POST, None).await, want);
+    assert_eq!(seen_axum(&layered, Method::POST, None).await, want);
+}
