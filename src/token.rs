@@ -575,8 +575,9 @@ impl TokenRejection {
 /// with a `str` or `String` — so a 0.1-style
 /// `assert_eq!(r, TokenRejection::Invalid("..".into()))` keeps passing
 /// against a refusal the crate made. Assert [`kind`](Self::kind) separately
-/// when the kind matters. With the `serde` feature it serializes as the detail
-/// string, as the `String` did.
+/// when the kind matters. With the `serde` feature it serializes as its
+/// kind's [`as_str`](InvalidTokenKind::as_str) label (`"expired"`), never
+/// the detail, so a serialized refusal cannot leak the log-only text.
 ///
 /// # Security
 ///
@@ -678,14 +679,16 @@ impl Eq for InvalidToken {}
 /// the detail itself.
 impl std::error::Error for InvalidToken {}
 
-/// Serializes as the [`detail`](InvalidToken::detail) string, so
-/// `json!({"reason": reason})` keeps producing what the 0.1 `String` did. That
-/// value is for logs only — never a response body.
+/// Serializes as the kind's [`as_str`](InvalidTokenKind::as_str) label — a
+/// string such as `"expired"` — never the [`detail`](InvalidToken::detail):
+/// a `#[derive(Serialize)]` response type or `json!({"reason": reason})`
+/// would otherwise carry the log-only text into a body. Serialize
+/// `reason.detail()` explicitly where the detail is wanted, in a log record.
 #[cfg(feature = "serde")]
 #[cfg_attr(docsrs, doc(cfg(feature = "serde")))]
 impl serde::Serialize for InvalidToken {
     fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
-        serializer.serialize_str(&self.detail)
+        serializer.serialize_str(self.kind.as_str())
     }
 }
 
@@ -1034,6 +1037,13 @@ pub(crate) fn for_log(s: &str) -> String {
         out.push('…');
     }
     out
+}
+
+/// A token's scopes for a log field, each through [`for_log`]: they come
+/// from the (signed) token, but a scope may still be any length up to the
+/// credential cap.
+pub(crate) fn scopes_for_log(scopes: &[String]) -> Vec<String> {
+    scopes.iter().map(|s| for_log(s)).collect()
 }
 
 /// A token-derived string for a tracing span field (the unverified header's
@@ -1394,14 +1404,19 @@ mod tests {
 
     #[cfg(feature = "serde")]
     #[test]
-    fn invalid_token_serializes_as_its_detail() {
+    fn invalid_token_serializes_as_its_kind_label_never_the_detail() {
         let reason = InvalidToken::new(
-            InvalidTokenKind::Expired,
-            "token rejected: ExpiredSignature",
+            InvalidTokenKind::ClientNotAllowed,
+            "token client \"secret-client\" is not in oauth.allowed_client_ids",
         );
+        let body = serde_json::json!({ "reason": reason });
+        assert_eq!(body, serde_json::json!({ "reason": "client_not_allowed" }));
+        assert!(!body.to_string().contains("secret-client"), "{body}");
+        let expired = InvalidToken::new(InvalidTokenKind::Expired, "token rejected: expired");
         assert_eq!(
-            serde_json::json!({ "reason": reason }),
-            serde_json::json!({ "reason": "token rejected: ExpiredSignature" })
+            serde_json::to_string(&expired).unwrap(),
+            "\"expired\"",
+            "a derived response type gets the label too"
         );
     }
 }

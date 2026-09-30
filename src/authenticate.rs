@@ -277,16 +277,18 @@ impl StaticTokens {
     /// `set` plus `token` (a single `static_token` setting), as one set.
     /// `token` is added as an unlabeled entry unless it is empty (not
     /// configured) or an entry already holds it, in which case that entry
-    /// (and its label) stands for both. Unlike [`StaticTokens::with`], a
-    /// whitespace-only `token` is kept, exactly as the single-token API always
-    /// has: configured, and never matched (blank candidates are discarded
-    /// before any comparison). `None` when the result is empty.
+    /// (and its label) stands for both. A whitespace-only `token` counts as
+    /// empty, as [`StaticTokens::with`] refuses one: it could never be
+    /// matched (blank candidates are discarded before any comparison), so
+    /// keeping it would build a layer that silently admits nobody. Dropped,
+    /// a layer with nothing else to check is `AuthLayerError::NoCredential`
+    /// at build — fail closed, and loudly. `None` when the result is empty.
     #[cfg(feature = "tower")]
     pub(crate) fn merged(set: Option<Self>, token: Option<Zeroizing<String>>) -> Option<Self> {
         let mut merged = set.unwrap_or_default();
         // A `token` that is empty or already in the set is dropped here,
         // wiped by its `Zeroizing`.
-        if let Some(token) = token.filter(|t| !t.is_empty())
+        if let Some(token) = token.filter(|t| !t.trim().is_empty())
             && merged.position_of(&token).is_none()
         {
             merged.entries.push(StaticEntry {

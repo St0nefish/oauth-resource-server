@@ -164,8 +164,8 @@ pub enum ProblemKind {
     MultiWordScope,
     /// A required or advertised scope is not an RFC 6749 §3.3 scope-token.
     InvalidScopeToken,
-    /// A list setting (`audiences`, `scopes_supported`, `principal_claims`) has
-    /// a blank entry.
+    /// A list setting (`audiences`, `scopes_supported`, `principal_claims`,
+    /// `allowed_client_ids`) has a blank entry.
     EmptyListEntry,
     /// No required scope is configured, `require_at_jwt` is off and
     /// `allow_unscoped_tokens` is not set.
@@ -182,13 +182,16 @@ pub enum ProblemKind {
     TokenAgeOutOfRange,
     /// A `required_claims` entry has a blank name, names a claim this crate
     /// already checks (`iss`, `aud`, `exp`, `nbf`, `iat`, `cnf`), or requires
-    /// a value other than a string, number or boolean.
+    /// a value other than a string, number or boolean — or, from the env
+    /// loader, the `REQUIRED_CLAIMS` JSON names one claim twice.
     InvalidRequiredClaim,
     /// The env loader could not read a variable or its `_FILE` (both set, an
-    /// unreadable or empty file).
+    /// unreadable, empty, oversized or not-a-regular file).
     EnvLoad,
     /// The env loader read a value it could not parse (a bool other than
-    /// `"true"`/`"false"`, a non-integer `leeway_secs`).
+    /// `"true"`/`"false"`, a non-integer `leeway_secs` or
+    /// `max_token_age_secs`, a `REQUIRED_CLAIMS` that is not valid JSON or not
+    /// a JSON object).
     EnvParse,
     /// Anything else, including every problem converted from a `String`.
     Other,
@@ -843,8 +846,52 @@ pub struct OAuthConfig {
     /// .unwrap_err();
     /// assert_eq!(err.problems.len(), 2);
     /// ```
-    #[cfg_attr(feature = "serde", serde(default))]
+    ///
+    /// A config file naming one claim twice is refused when it is
+    /// deserialized (a serde error naming the claim), never read as
+    /// "the last one wins".
+    #[cfg_attr(
+        feature = "serde",
+        serde(default, deserialize_with = "required_claims_without_duplicates")
+    )]
     pub required_claims: BTreeMap<String, Value>,
+}
+
+/// Deserialize [`OAuthConfig::required_claims`] from a map, refusing a
+/// claim named twice (JSON allows duplicate keys, and a map type silently
+/// keeps the last): `{"tid": "good", "tid": "evil"}` is a configuration
+/// mistake or an injection, and either way not a value to pick one side of.
+#[cfg(feature = "serde")]
+fn required_claims_without_duplicates<'de, D>(
+    deserializer: D,
+) -> Result<BTreeMap<String, Value>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    struct Claims;
+    impl<'de> serde::de::Visitor<'de> for Claims {
+        type Value = BTreeMap<String, Value>;
+        fn expecting(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+            f.write_str("a map of claim names to required values")
+        }
+        fn visit_map<A: serde::de::MapAccess<'de>>(
+            self,
+            mut map: A,
+        ) -> Result<Self::Value, A::Error> {
+            let mut claims = BTreeMap::new();
+            while let Some((name, value)) = map.next_entry::<String, Value>()? {
+                if claims.contains_key(&name) {
+                    return Err(serde::de::Error::custom(format!(
+                        "required_claims names {:?} more than once",
+                        crate::token::for_log(&name)
+                    )));
+                }
+                claims.insert(name, value);
+            }
+            Ok(claims)
+        }
+    }
+    deserializer.deserialize_map(Claims)
 }
 
 /// Hand-written so a credential in a URL setting never reaches a log line
@@ -1305,9 +1352,18 @@ impl OAuthConfig {
                      cnf) — use issuer/audience, leeway_secs or max_token_age_secs instead"
                 ))
             } else if !matches!(value, Value::String(_) | Value::Number(_) | Value::Bool(_)) {
+                // Named by its JSON type, never echoed: an object or array
+                // could hold anything, a secret included, and this text
+                // reaches the startup log.
+                let json_type = match value {
+                    Value::Null => "null",
+                    Value::Array(_) => "an array",
+                    _ => "an object",
+                };
                 Some(format!(
-                    "entry {name:?} requires {value}, but a required value must be a string, \
-                     number or boolean (a token's array claim passes when it contains it)"
+                    "entry {name:?} requires {json_type}, but a required value must be a \
+                     string, number or boolean (a token's array claim passes when it contains \
+                     it)"
                 ))
             } else {
                 None
@@ -2851,6 +2907,53 @@ resource: \"https://kb.example.test/mcp\"
         }
         let labels: std::collections::HashSet<_> = all.iter().map(|(_, l)| *l).collect();
         assert_eq!(labels.len(), all.len());
+    }
+
+    /// A non-scalar `required_claims` value is named by its JSON type in the
+    /// problem text, never echoed: it could hold anything, a secret included,
+    /// and the text reaches the startup log.
+    #[test]
+    fn a_non_scalar_required_claim_is_described_never_echoed() {
+        for (value, shown) in [
+            (serde_json::json!({"nested": "s3cret-object"}), "an object"),
+            (serde_json::json!(["s3cret-array"]), "an array"),
+            (Value::Null, "null"),
+        ] {
+            let mut cfg = OAuthConfig {
+                enabled: true,
+                issuer: "https://idp.example.test/".into(),
+                audience: "client-a".into(),
+                resource: "https://kb.example.test/".into(),
+                required_scope: Some("api:read".into()),
+                ..OAuthConfig::default()
+            };
+            cfg.required_claims.insert("tid".into(), value.clone());
+            let err = cfg.resolve(KeyNaming::Dotted("oauth")).unwrap_err();
+            assert_eq!(
+                err.problem_details()[0].kind(),
+                ProblemKind::InvalidRequiredClaim
+            );
+            let text = err.to_string();
+            assert!(text.contains(&format!("requires {shown}")), "{text}");
+            assert!(!text.contains("s3cret"), "{value}: {text}");
+        }
+    }
+
+    /// A config file naming one required claim twice is refused while it is
+    /// deserialized, never read as the last value.
+    #[cfg(feature = "serde")]
+    #[test]
+    fn a_config_file_naming_a_required_claim_twice_is_refused() {
+        let err = serde_json::from_str::<OAuthConfig>(
+            r#"{"required_claims": {"tid": "good", "tid": "evil"}}"#,
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(err.contains("\"tid\" more than once"), "{err}");
+        assert!(!err.contains("evil"), "{err}");
+        let ok: OAuthConfig =
+            serde_json::from_str(r#"{"required_claims": {"tid": "good", "level": 2}}"#).unwrap();
+        assert_eq!(ok.required_claims.len(), 2);
     }
 
     #[cfg(feature = "serde")]

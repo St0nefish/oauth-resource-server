@@ -742,3 +742,139 @@ async fn extractors_and_route_checks_agree_behind_an_open_layer_inside_an_option
     assert_eq!(seen_axum(&token_route, Method::POST, None).await, want);
     assert_eq!(seen_axum(&layered, Method::POST, None).await, want);
 }
+
+/// One request to `app` with the given headers: status, challenge, body.
+async fn seen_with(app: &Router, method: Method, headers: &[(&str, &str)]) -> Seen {
+    let mut request = Request::builder().method(method).uri("/test");
+    for (name, value) in headers {
+        request = request.header(*name, *value);
+    }
+    let response = app
+        .clone()
+        .oneshot(request.body(Body::empty()).unwrap())
+        .await
+        .unwrap();
+    let status = response.status().as_u16();
+    let challenge = response
+        .headers()
+        .get(WWW_AUTHENTICATE)
+        .map(|v| v.to_str().unwrap().to_string());
+    let body = response
+        .into_body()
+        .collect()
+        .await
+        .unwrap()
+        .to_bytes()
+        .to_vec();
+    (status, challenge, body)
+}
+
+/// An axum `allow_unauthenticated` layer nested INSIDE an enforcing
+/// `HttpAuthLayer`: a required extractor refuses with the outer layer's 401
+/// and challenge (`resource_metadata` included), exactly as `RequireScopes`
+/// and `Scoped` do on the same stack — never the open layer's bare
+/// `DEFAULT_STATIC_CHALLENGE`.
+#[tokio::test]
+async fn a_required_extractor_behind_an_open_layer_inside_an_http_layer_sends_its_challenge() {
+    let (_jwks, v) = validator().await;
+    let want = (401, Some(v.invalid_token_challenge()), Vec::new());
+    assert!(want.1.as_deref().unwrap().contains("resource_metadata="));
+    let optional_outer = || {
+        HttpAuthLayer::builder()
+            .oauth(Arc::clone(&v))
+            .optional()
+            .build()
+            .unwrap()
+    };
+    let token_route = Router::new()
+        .route(
+            "/test",
+            post(|t: AuthorizedToken| async move { format!("{:?}", t.subject) }),
+        )
+        .route_layer(AuthLayer::allow_unauthenticated())
+        .route_layer(optional_outer());
+    let credential_route = Router::new()
+        .route(
+            "/test",
+            post(|c: Credential| async move { format!("{c:?}") }),
+        )
+        .route_layer(AuthLayer::allow_unauthenticated())
+        .route_layer(optional_outer());
+    let scoped = Router::new()
+        .route("/test", post(write))
+        .route_layer(AuthLayer::allow_unauthenticated())
+        .route_layer(optional_outer());
+    let layered = ok_app(|r| {
+        r.route_layer(RequireScopes::new(["mcp:write"]))
+            .route_layer(AuthLayer::allow_unauthenticated())
+            .route_layer(optional_outer())
+    });
+    for app in [&token_route, &credential_route, &scoped, &layered] {
+        assert_eq!(seen_axum(app, Method::POST, None).await, want);
+    }
+
+    // A strict outer layer that accepted a static token: the handler wants an
+    // OAuth token, so the outer layer's 401 `invalid_token`, with its
+    // challenge.
+    let token_route = Router::new()
+        .route(
+            "/test",
+            post(|t: AuthorizedToken| async move { format!("{:?}", t.subject) }),
+        )
+        .route_layer(AuthLayer::allow_unauthenticated())
+        .route_layer(
+            HttpAuthLayer::builder()
+                .oauth(Arc::clone(&v))
+                .static_token(STATIC)
+                .build()
+                .unwrap(),
+        );
+    assert_eq!(
+        seen_axum(&token_route, Method::POST, Some(&bearer(STATIC))).await,
+        want
+    );
+}
+
+/// An axum OAuth layer OUTSIDE an `HttpAuthLayer` holding only a static
+/// token, a request presenting both: the innermost credential is the
+/// static token, and `Scoped` answers from the innermost layer (its gate)
+/// exactly as `RequireScopes` does — the same bytes on the same stack.
+#[tokio::test]
+async fn the_scoped_extractor_answers_from_the_innermost_layer_like_require_scopes() {
+    let (_jwks, v) = validator().await;
+    let outer = || {
+        AuthLayer::builder()
+            .oauth(Arc::clone(&v))
+            .on_reject(json_reject)
+            .build()
+            .unwrap()
+    };
+    let inner = || {
+        HttpAuthLayer::builder()
+            .static_token(STATIC)
+            .sources([CredentialSource::Raw(http::HeaderName::from_static(
+                "x-api-key",
+            ))])
+            .build()
+            .unwrap()
+    };
+    let scoped = Router::new()
+        .route("/test", post(write))
+        .route_layer(inner())
+        .route_layer(outer());
+    let layered = ok_app(|r| {
+        r.route_layer(RequireScopes::new(["mcp:write"]))
+            .route_layer(inner())
+            .route_layer(outer())
+    });
+    let full = bearer(&token("mcp:read mcp:write"));
+    let headers = [("authorization", full.as_str()), ("x-api-key", STATIC)];
+    let from_scoped = seen_with(&scoped, Method::POST, &headers).await;
+    let from_layer = seen_with(&layered, Method::POST, &headers).await;
+    assert_eq!(from_scoped, from_layer);
+    assert_eq!(from_scoped.0, 403);
+    assert_eq!(
+        from_scoped.1.as_deref(),
+        Some(crate::refusal::BARE_INSUFFICIENT_SCOPE_CHALLENGE)
+    );
+}

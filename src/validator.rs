@@ -1011,6 +1011,15 @@ impl OAuthValidator {
             }
         }
         check_crit(token)?;
+        // jsonwebtoken reads `"kid": null` as no `kid` at all, which would
+        // send the token down the kid-less single-key fallback. A `kid` that
+        // is present is a string or the header is malformed.
+        if header.kid.is_none() && raw_header_has_member(token, "kid") {
+            return Err(TokenRejection::invalid(
+                InvalidTokenKind::MalformedHeader,
+                "malformed token header: kid is present but not a string",
+            ));
+        }
         let alg = Algorithm::from_jwt(header.alg)
             .filter(|_| self.jwt_algorithms.contains(&header.alg))
             .ok_or_else(|| {
@@ -1128,7 +1137,7 @@ impl OAuthValidator {
             info!(
                 principal = ?principal.as_deref().map(for_log),
                 required = %self.required_scopes,
-                present = ?scopes,
+                present = ?crate::token::scopes_for_log(&scopes),
                 scope_claims = ?self.config.scope_claims,
                 "OAuth token is valid but lacks the required scope"
             );
@@ -1487,6 +1496,18 @@ fn raw_header_fields(token: &str) -> (Option<String>, Option<String>) {
     (field("kid"), field("alg"))
 }
 
+/// Whether the unverified header's raw JSON has a member `name`, whatever its
+/// value (`null` included). Called after `decode_header` succeeded, so the
+/// segment is base64url JSON of at most the 16 KiB credential cap.
+fn raw_header_has_member(token: &str, name: &str) -> bool {
+    let segment = token.split('.').next().unwrap_or_default();
+    URL_SAFE_NO_PAD
+        .decode(segment)
+        .ok()
+        .and_then(|bytes| serde_json::from_slice::<Map<String, Value>>(&bytes).ok())
+        .is_some_and(|header| header.contains_key(name))
+}
+
 /// RFC 7515 §4.1.11: a recipient that does not understand every extension a
 /// JWS lists in `crit` MUST treat it as invalid. This crate understands none,
 /// so any `crit` — including an empty or malformed one — is refused.
@@ -1524,20 +1545,31 @@ pub(crate) fn check_crit(token: &str) -> Result<(), TokenRejection> {
 /// absent one. It checks claims only after the signature verified, so the
 /// payload is signed by then; it is re-read here only to tell the two apart
 /// (`MalformedClaim` when the claim is there), never to trust anything in it.
+///
+/// For the same reason a JSON error on a payload that DOES decode as a JSON
+/// object is `MalformedClaim`: jsonwebtoken reads `exp`/`nbf`/`iss`/`aud`
+/// through a typed struct of its own, so `"nbf": [1]` fails there with a
+/// JSON error although the payload itself is fine JSON. A payload that is
+/// not a JSON object at all stays `MalformedToken`.
 fn decode_error_kind(kind: &jsonwebtoken::errors::ErrorKind, token: &str) -> InvalidTokenKind {
     use jsonwebtoken::errors::ErrorKind as E;
-    if let E::MissingRequiredClaim(name) = kind {
-        let present = token
+    let payload_claims = || {
+        token
             .split('.')
             .nth(1)
             .and_then(|payload| URL_SAFE_NO_PAD.decode(payload).ok())
             .and_then(|raw| serde_json::from_slice::<Map<String, Value>>(&raw).ok())
-            .is_some_and(|claims| claims.contains_key(name));
+    };
+    if let E::MissingRequiredClaim(name) = kind {
+        let present = payload_claims().is_some_and(|claims| claims.contains_key(name));
         return if present {
             InvalidTokenKind::MalformedClaim
         } else {
             InvalidTokenKind::MissingClaim
         };
+    }
+    if matches!(kind, E::Json(_)) && payload_claims().is_some() {
+        return InvalidTokenKind::MalformedClaim;
     }
     match kind {
         E::InvalidSignature
@@ -1658,9 +1690,12 @@ fn required_claim_footguns(config: &ResolvedOAuthConfig) -> Vec<(&str, &'static 
                 || name == "scp"
                 || config.scope_claims.iter().any(|c| c == name)
             {
-                "a scope claim is compared as one whole value (a space-delimited string                  matches only when it holds exactly that value); require scopes with                  required_scopes instead"
+                "a scope claim is compared as one whole value (a space-delimited string \
+                 matches only when it holds exactly that value); require scopes with \
+                 required_scopes instead"
             } else if name == "azp" || name == "client_id" {
-                "requiring one client claim bypasses allowed_client_ids' client_id-then-azp                  precedence; restrict clients with allowed_client_ids instead"
+                "requiring one client claim bypasses allowed_client_ids' client_id-then-azp \
+                 precedence; restrict clients with allowed_client_ids instead"
             } else {
                 return None;
             };
@@ -1753,7 +1788,7 @@ pub(crate) fn url_is_loopback(url: &str) -> bool {
 }
 
 /// Whether the parsed `url`'s host is a loopback address or `localhost`.
-fn is_loopback_url(parsed: &reqwest::Url) -> bool {
+pub(crate) fn is_loopback_url(parsed: &reqwest::Url) -> bool {
     let Some(host) = parsed.host_str() else {
         return false;
     };
@@ -2926,6 +2961,65 @@ mod tests {
         assert!(v.validate(&token).await.is_ok());
     }
 
+    /// jsonwebtoken reads `"kid": null` as no `kid`, which would send the
+    /// token down the kid-less single-key fallback; a present `kid` must be a
+    /// string, so the header is malformed — refused before any key fetch.
+    #[tokio::test]
+    async fn a_null_kid_is_a_malformed_header_not_an_absent_one() {
+        let jwks = spawn_jwks_server("200 OK", jwks_body()).await;
+        let v = validator(&jwks.url);
+        let c = claims(serde_json::json!({"scope": "mcp:read"}));
+        let token = mint_raw_header(serde_json::json!({"alg": "RS256", "kid": null}), c.clone());
+        crate::token::assert_invalid(
+            v.validate(&token).await,
+            InvalidTokenKind::MalformedHeader,
+            "malformed token header: kid is present but not a string",
+            "kid null",
+        );
+        assert_eq!(jwks.hits.load(Ordering::SeqCst), 0);
+        // With no `kid` member at all, the single-key fallback still applies.
+        let token = mint_raw_header(serde_json::json!({"alg": "RS256"}), c);
+        assert!(v.validate(&token).await.is_ok());
+    }
+
+    /// A signed payload that is a JSON object but whose `exp`/`nbf` is a
+    /// shape jsonwebtoken's own typed claim struct cannot read (an array)
+    /// fails inside `decode` with a JSON error: that is a malformed claim,
+    /// not a malformed token. A payload that is no JSON object at all is.
+    #[tokio::test]
+    async fn an_unreadable_registered_claim_is_malformed_claim_not_malformed_token() {
+        let jwks = spawn_jwks_server("200 OK", jwks_body()).await;
+        let v = validator(&jwks.url);
+        let later = now() + 3600;
+        for extra in [
+            serde_json::json!({"nbf": [later]}),
+            serde_json::json!({"exp": [later]}),
+            serde_json::json!({"nbf": {"at": later}}),
+        ] {
+            let mut body = claims(serde_json::json!({"scope": "mcp:read"}));
+            for (k, val) in extra.as_object().unwrap() {
+                body[k] = val.clone();
+            }
+            let result = v.validate(&mint(KEY_A_PEM, KID_A, &body)).await;
+            match result {
+                Err(TokenRejection::Invalid(invalid)) => {
+                    assert_eq!(invalid.kind(), InvalidTokenKind::MalformedClaim, "{extra}")
+                }
+                other => panic!("{extra}: {other:?}"),
+            }
+        }
+        let token = mint_raw_header(
+            serde_json::json!({"alg": "RS256", "kid": KID_A}),
+            serde_json::json!([1, 2]),
+        );
+        match v.validate(&token).await {
+            Err(TokenRejection::Invalid(invalid)) => {
+                assert_eq!(invalid.kind(), InvalidTokenKind::MalformedToken)
+            }
+            other => panic!("{other:?}"),
+        }
+    }
+
     /// RFC 7519 §4.1.5: `nbf` is a NumericDate. jsonwebtoken silently skips one
     /// it cannot read as a number, which would make a not-yet-valid token valid.
     #[tokio::test]
@@ -3726,29 +3820,150 @@ mod tests {
         assert!(err.contains("mcp.oauth.allow_insecure_http"), "{err}");
     }
 
+    /// The loopback client resolves every name itself: a `*.localhost` name
+    /// reaches this host even where the system resolver would send it to
+    /// DNS (musl, some container resolvers), and the URL's port is kept.
     #[tokio::test]
-    async fn a_redirect_to_cleartext_on_a_non_loopback_host_is_refused() {
-        // The status line carries a Location header: the fake server writes it
-        // verbatim after `HTTP/1.1 `.
-        let server = spawn_http_server(
-            HashMap::from([(
-                "/jwks".to_string(),
-                (
-                    "302 Found\r\nLocation: http://idp.example.invalid/keys",
-                    String::new(),
-                ),
-            )]),
-            None,
-        )
-        .await;
-        let v = validator(&server.url);
-        let err = v.refresh_now().await.unwrap_err().to_string();
-        assert!(
-            err.contains("redirect to plain http on a non-loopback host"),
-            "{err}"
+    async fn a_localhost_name_is_fetched_from_this_host_whatever_dns_says() {
+        let jwks = spawn_jwks_server("200 OK", jwks_body()).await;
+        for host in ["nonexistent-name.localhost", "localhost", "a.b.localhost"] {
+            let url = jwks.url.replace("127.0.0.1", host);
+            let v = validator_no_cooldown(&url);
+            assert_eq!(v.refresh_now().await.unwrap(), 1, "{url}");
+        }
+        assert_eq!(jwks.hits.load(Ordering::SeqCst), 3);
+    }
+
+    /// A discovered `jwks_uri` that stops working is dropped, so the next
+    /// refresh re-reads the metadata and follows an authorization server that
+    /// moved its JWKS — without a restart. A configured one is never
+    /// replaced.
+    #[tokio::test]
+    async fn a_discovered_jwks_uri_that_fails_is_rediscovered() {
+        let server = spawn_http_server(HashMap::new(), None).await;
+        let issuer = format!("{}/app/", server.base);
+        let doc = |path: &str| {
+            serde_json::json!({"issuer": issuer, "jwks_uri": format!("{}{path}", server.base)})
+                .to_string()
+        };
+        let set = |path: &str, status: &'static str, body: String| {
+            server
+                .routes
+                .lock()
+                .unwrap()
+                .insert(path.to_string(), (status, body));
+        };
+        let hits = |path: &str| *server.path_hits.lock().unwrap().get(path).unwrap_or(&0);
+        const METADATA: &str = "/app/.well-known/openid-configuration";
+        set(METADATA, "200 OK", doc("/keys"));
+        set("/keys", "200 OK", jwks_body());
+        let mut cfg = oauth_config("");
+        cfg.issuer = issuer.clone();
+        let v = OAuthValidator::build(&cfg, Duration::ZERO).unwrap();
+        assert_eq!(v.refresh_now().await.unwrap(), 1);
+        assert_eq!(hits(METADATA), 1);
+
+        // The authorization server moves its JWKS and says so in its metadata.
+        set(METADATA, "200 OK", doc("/keys2"));
+        set("/keys2", "200 OK", jwks_of(&[jwk_ec()]));
+        set("/keys", "404 Not Found", "{}".into());
+        let err = v.refresh_now().await.unwrap_err();
+        assert_eq!(err.kind(), RefreshErrorKind::Fetch);
+        // The failed URI stays visible until the next discovery replaces it.
+        assert_eq!(
+            v.key_set_status().jwks_uri.as_deref(),
+            Some(format!("{}/keys", server.base).as_str())
         );
-        assert!(err.contains("mcp.oauth.allow_insecure_http"), "{err}");
-        assert_eq!(server.hits.load(Ordering::SeqCst), 1);
+        assert_eq!(v.key_set_status().keys, 1, "held keys are kept");
+        assert_eq!(v.refresh_now().await.unwrap(), 1);
+        assert_eq!(hits(METADATA), 2, "the metadata was read again");
+        assert_eq!(hits("/keys2"), 1);
+        assert_eq!(
+            v.key_set_status().jwks_uri.as_deref(),
+            Some(format!("{}/keys2", server.base).as_str())
+        );
+
+        // A configured jwks_uri is never swapped for a discovered one.
+        let v = validator_no_cooldown(&format!("{}/keys", server.base));
+        assert!(v.refresh_now().await.is_err());
+        assert!(v.refresh_now().await.is_err());
+        assert_eq!(hits(METADATA), 2);
+    }
+
+    /// Only a 2xx answer is a key set: a 302 with no `Location` (which
+    /// reqwest cannot follow) and a JWKS body is refused, not parsed.
+    #[tokio::test]
+    async fn a_non_success_status_is_refused_even_with_a_jwks_body() {
+        for status in [
+            "302 Found",
+            "304 Not Modified",
+            "404 Not Found",
+            "500 Internal Server Error",
+        ] {
+            let server = spawn_jwks_server(status, jwks_body()).await;
+            let v = validator_no_cooldown(&server.url);
+            let err = v.refresh_now().await.unwrap_err();
+            assert_eq!(err.kind(), RefreshErrorKind::Fetch, "{status}");
+            assert!(
+                err.to_string().contains("non-success status"),
+                "{status}: {err}"
+            );
+            assert!(!v.is_ready(), "{status}");
+        }
+    }
+
+    /// An RSA JWK that parses but could never verify a signature (an empty
+    /// exponent, a modulus under 2048 bits) is skipped like an unparseable
+    /// entry, so a key set of only such keys is no usable keys — not a
+    /// "ready" validator that refuses every token.
+    #[tokio::test]
+    async fn an_rsa_key_that_cannot_verify_is_not_counted_as_held() {
+        let mut empty_e = jwk_rsa_a();
+        empty_e["e"] = serde_json::json!("");
+        let mut short_n = jwk_rsa_a();
+        short_n["n"] = serde_json::json!(b64url(&[0xc5; 255]));
+        let server = spawn_jwks_server("200 OK", jwks_of(&[empty_e.clone(), short_n])).await;
+        let v = validator_no_cooldown(&server.url);
+        let err = v.refresh_now().await.unwrap_err();
+        assert_eq!(err.kind(), RefreshErrorKind::NoUsableKeys);
+        assert_eq!(v.key_set_status().keys, 0);
+        assert!(!v.is_ready());
+        // Next to a good key, only the good one counts.
+        let server = spawn_jwks_server("200 OK", jwks_of(&[empty_e, jwk_rsa_a()])).await;
+        let v = validator_no_cooldown(&server.url);
+        assert_eq!(v.refresh_now().await.unwrap(), 1);
+        assert!(v.validate(&valid_token()).await.is_ok());
+    }
+
+    #[tokio::test]
+    async fn a_redirect_from_loopback_to_a_non_loopback_host_is_refused() {
+        // The status line carries a Location header: the fake server writes it
+        // verbatim after `HTTP/1.1 `. Neither scheme and no opt-in lets a fetch
+        // that started on loopback (on the proxy-free loopback client) leave it.
+        for (target, allow_insecure_http) in [
+            ("http://idp.example.invalid/keys", false),
+            ("http://idp.example.invalid/keys", true),
+            ("https://idp.example.invalid/keys", false),
+        ] {
+            let status: &'static str =
+                Box::leak(format!("302 Found\r\nLocation: {target}").into_boxed_str());
+            let server = spawn_http_server(
+                HashMap::from([("/jwks".to_string(), (status, String::new()))]),
+                None,
+            )
+            .await;
+            let mut cfg = oauth_config(&server.url);
+            cfg.allow_insecure_http = allow_insecure_http;
+            let v = validator_with(cfg);
+            let err = v.refresh_now().await.unwrap_err();
+            assert_eq!(err.kind(), RefreshErrorKind::Fetch, "{target}");
+            let err = err.to_string();
+            assert!(
+                err.contains("redirect from a loopback URL to a non-loopback host"),
+                "{target}: {err}"
+            );
+            assert_eq!(server.hits.load(Ordering::SeqCst), 1, "{target}");
+        }
     }
 
     #[test]

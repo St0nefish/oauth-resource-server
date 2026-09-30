@@ -166,32 +166,28 @@ async fn a_credential_in_a_url_never_reaches_a_log_line() {
     assert!(text.contains("does not match"), "{text}");
     assert!(text.contains("refused (RFC 8414"), "{text}");
 
-    // 5. A JWKS endpoint redirecting to a plain-http, non-loopback URL: the
-    //    refusal without the opt-in, then the `following a redirect` warning
-    //    with it.
+    // 5. A loopback JWKS endpoint redirecting to a plain-http, non-loopback
+    //    URL: refused, with or without the opt-in (a fetch that starts on
+    //    loopback never leaves it), the target shown redacted.
     let status: &'static str =
         Box::leak(format!("302 Found\r\nLocation: {INSECURE_JWKS}").into_boxed_str());
     let hop = testing::spawn_jwks_server(status, "{}".into()).await;
-    let (_v, task) = start(&testing::resolved_config(&hop.url));
-    failures += 1;
-    logs.wait_for(FAILED, failures).await;
-    task.abort();
-    assert!(
-        logs.text()
-            .contains("redirect to plain http on a non-loopback host"),
-        "{}",
-        logs.text()
-    );
-    let mut cfg = testing::resolved_config(&hop.url);
-    cfg.allow_insecure_http = true;
-    let (_v, task) = start(&cfg);
-    failures += 1;
-    logs.wait_for(FAILED, failures).await;
-    task.abort();
-    assert!(
-        logs.text().contains("following a redirect to plain http"),
-        "{}",
-        logs.text()
+    for allow_insecure_http in [false, true] {
+        let mut cfg = testing::resolved_config(&hop.url);
+        cfg.allow_insecure_http = allow_insecure_http;
+        let (_v, task) = start(&cfg);
+        failures += 1;
+        logs.wait_for(FAILED, failures).await;
+        task.abort();
+    }
+    let text = logs.text();
+    assert_eq!(
+        text.matches(
+            "redirect from a loopback URL to a non-loopback host (http://***@0.0.0.0:1/keys?***)"
+        )
+        .count(),
+        2,
+        "{text}"
     );
 
     // 6. The validator's startup warnings for a plain-http, non-loopback

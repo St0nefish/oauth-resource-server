@@ -339,6 +339,9 @@ impl AuthLayer {
     ///
     /// Every request reaches the protected routes. Use it only where something
     /// else (a trusted network, a proxy that authenticates) stands in front.
+    /// It still marks every `Authorization` header value sensitive
+    /// (`http::HeaderValue::set_sensitive`), so a credential a client sends
+    /// anyway is not printed by a `Debug` of the request downstream.
     pub fn allow_unauthenticated() -> Self {
         Self {
             inner: Arc::new(Mode::AllowUnauthenticated),
@@ -775,7 +778,7 @@ impl AuthLayerBuilder {
     ///
     /// # Errors
     ///
-    /// [`AuthLayerError::NoCredential`] with neither a non-empty static token
+    /// [`AuthLayerError::NoCredential`] with neither a non-blank static token
     /// (from [`static_token`](Self::static_token) or a non-empty
     /// [`static_tokens`](Self::static_tokens) set) nor an OAuth validator;
     /// [`AuthLayerError::NoSources`] with an empty
@@ -893,7 +896,7 @@ impl Enforce {
             info!(
                 path = %path,
                 required = ?required,
-                present = ?present,
+                present = ?crate::token::scopes_for_log(&present),
                 auth.outcome = Outcome::Rejected.as_str(),
                 auth.mechanism = mechanism.as_str(),
                 auth.reason = observe::reason(&rejection),
@@ -992,6 +995,7 @@ impl AuthLayer {
                 if request.extensions().get::<LayerRan>().is_none() {
                     request.extensions_mut().insert(LayerRan(self.clone()));
                 }
+                crate::http_layer::mark_authorization_sensitive(request.headers_mut());
                 self.mark(request.extensions_mut());
                 return Ok(request);
             }
@@ -1075,6 +1079,18 @@ impl AuthLayer {
                 enforce.reject(rejection, parts)
             }
             Mode::Enforce(enforce) => enforce.refuse(rejection, parts, mechanism, Stage::Handler),
+            // Inside an enforcing `HttpAuthLayer` (an `optional()` one that
+            // passed a request with no credential, or one that accepted a
+            // credential of the wrong kind): that layer's refusal — its 401,
+            // its challenge with `resource_metadata` — through the shared gate
+            // marker, exactly as `RequireScopes` and `Scoped` answer on the
+            // same stack. (Inside an enforcing axum layer, `LayerRan` already
+            // names that layer, so this arm is not reached.)
+            Mode::AllowUnauthenticated
+                if matches!(parts.extensions.get::<GateRan>(), Some(GateRan(Some(_)))) =>
+            {
+                crate::http_layer::scope_refusal::<Body>(parts, rejection, &[], wants.extractor())
+            }
             // No challenge of its own to send: the default one, as a
             // static-only layer would (RFC 9110 §15.5.2).
             Mode::AllowUnauthenticated => {
@@ -1110,6 +1126,17 @@ enum Wants {
     OAuthToken,
     /// A static token ([`StaticTokenMatch`]).
     StaticToken,
+}
+
+impl Wants {
+    /// The extractor's name, as the refusal logs give it.
+    fn extractor(self) -> &'static str {
+        match self {
+            Self::AnyCredential => "Credential",
+            Self::OAuthToken => "AuthorizedToken",
+            Self::StaticToken => "StaticTokenMatch",
+        }
+    }
 }
 
 /// What the extractors find on a request.
@@ -1504,20 +1531,34 @@ impl<S: ScopeSet, St: Send + Sync> FromRequestParts<St> for Scoped<S> {
             }
             // Valid, but insufficient: a token missing a scope, or a static
             // token, which has none.
-            Found::Present(_) => Err(
-                match parts.extensions.get::<LayerRan>().map(|l| &*l.0.inner) {
-                    Some(Mode::Enforce(enforce)) => enforce.refuse_scoped(parts, &required),
-                    // Accepted by the `tower` feature's layer, or by an outer
-                    // layer around an `allow_unauthenticated` one: the same
-                    // shared refusal path, through the gate marker.
+            // The innermost layer's gate (`GateRan`) decides, as it does for
+            // `RequireScopes`, so the two send the same bytes on any stack;
+            // the axum layer's own path when that gate is the axum layer's.
+            Found::Present(_) => {
+                let gate = match parts.extensions.get::<GateRan>() {
+                    Some(GateRan(Some(gate))) => Some(Arc::clone(gate)),
+                    _ => None,
+                };
+                let layer = parts.extensions.get::<LayerRan>().map(|l| &*l.0.inner);
+                Err(match (gate, layer) {
+                    (Some(gate), Some(Mode::Enforce(enforce)))
+                        if Arc::ptr_eq(&gate, &enforce.gate) =>
+                    {
+                        enforce.refuse_scoped(parts, &required)
+                    }
+                    (None, Some(Mode::Enforce(enforce))) => enforce.refuse_scoped(parts, &required),
+                    // Accepted by the `tower` feature's layer (inside or
+                    // outside the axum one), or by an outer layer around an
+                    // `allow_unauthenticated` one: the same shared refusal
+                    // path, through the gate marker.
                     _ => crate::http_layer::scope_refusal::<Body>(
                         parts,
                         &TokenRejection::InsufficientScope,
                         &required,
                         "Scoped",
                     ),
-                },
-            ),
+                })
+            }
             Found::Absent(layer) => Err(refuse_absent(&layer, parts, Wants::OAuthToken)),
             // No axum layer, but the `tower` feature's `HttpAuthLayer` ran
             // (an `optional()` one passed a request with no credential): its
@@ -1853,6 +1894,34 @@ mod tests {
             AuthLayer::builder().static_token("").build().unwrap_err(),
             AuthLayerError::NoCredential
         );
+        // A whitespace-only token could never match: a layer holding only it
+        // would lock every route without saying so. It is no credential.
+        for blank in ["   ", "\t", " \n "] {
+            assert_eq!(
+                AuthLayer::builder()
+                    .static_token(blank)
+                    .build()
+                    .unwrap_err(),
+                AuthLayerError::NoCredential,
+                "{blank:?}"
+            );
+            assert_eq!(
+                AuthLayer::builder()
+                    .static_token(blank)
+                    .optional()
+                    .build()
+                    .unwrap_err(),
+                AuthLayerError::NoCredential,
+                "{blank:?}"
+            );
+            assert_eq!(
+                AuthLayer::builder()
+                    .build_with_decision(StaticTokenDecision::StaticOnly(blank.into()))
+                    .unwrap_err(),
+                AuthLayerError::NoCredential,
+                "{blank:?}"
+            );
+        }
         assert_eq!(
             AuthLayer::builder()
                 .optional_static_token(None)
@@ -1878,19 +1947,23 @@ mod tests {
     async fn only_the_explicit_opt_out_passes_requests_through() {
         let layer = AuthLayer::allow_unauthenticated();
         assert!(layer.allows_unauthenticated());
-        let app =
-            Router::new()
-                .route(
-                    "/test",
-                    get(
-                        |c: Option<Extension<Credential>>,
-                         t: Option<Extension<AuthorizedToken>>| async move {
-                            assert!(c.is_none() && t.is_none(), "a pass-through inserts nothing");
-                            "ok"
-                        },
-                    ),
-                )
-                .route_layer(middleware::from_fn_with_state(layer, require_auth));
+        let app = Router::new()
+            .route(
+                "/test",
+                get(
+                    |c: Option<Extension<Credential>>,
+                     t: Option<Extension<AuthorizedToken>>,
+                     headers: http::HeaderMap| async move {
+                        assert!(c.is_none() && t.is_none(), "a pass-through inserts nothing");
+                        // It still marks what a client sent anyway.
+                        for value in headers.get_all(http::header::AUTHORIZATION) {
+                            assert!(value.is_sensitive(), "Authorization must be sensitive");
+                        }
+                        "ok"
+                    },
+                ),
+            )
+            .route_layer(middleware::from_fn_with_state(layer, require_auth));
         assert_eq!(get_with_auth(&app, None).await.status(), StatusCode::OK);
         assert_eq!(
             get_with_auth(&app, Some("Bearer anything")).await.status(),

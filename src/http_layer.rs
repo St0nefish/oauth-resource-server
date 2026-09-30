@@ -21,8 +21,11 @@
 //!
 //! On an axum app use [`crate::axum::AuthLayer`] instead (feature `axum`, which
 //! turns this feature on): it is the same check, with axum's `Response`, the
-//! `require_auth` middleware form, and the axum extractors, which answer 500
-//! behind an [`HttpAuthLayer`] because they cannot tell it ran.
+//! `require_auth` middleware form, and the axum extractors. Behind an
+//! [`HttpAuthLayer`] alone those extractors return the value it inserted
+//! (`AuthorizedToken`, `Credential`, `StaticTokenMatch`, and their `Option`
+//! forms), but answer 500 when there is none — even `Option<..>` behind an
+//! `optional()` pass-through, never `None` — because they cannot tell it ran.
 //!
 //! # Behavior
 //!
@@ -49,7 +52,9 @@
 //! [`StaticTokenDecision::Unauthenticated`] handed to
 //! [`HttpAuthLayerBuilder::build_with_decision`]). Every configured source
 //! header is marked sensitive (`http::HeaderValue::set_sensitive`) on the
-//! request before the callback and the inner service see it, and the layer's
+//! request before the callback and the inner service see it (an
+//! `allow_unauthenticated` layer, which has no sources, marks `Authorization`),
+//! and the layer's
 //! `Debug` never prints a static token (the builder's single one shows as
 //! `<redacted>`, a [`StaticTokens`] set as its count and labels).
 //!
@@ -298,7 +303,8 @@ fn redacted_request_uri(uri: &http::Uri) -> String {
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
 #[non_exhaustive]
 pub enum AuthLayerError {
-    /// Neither a (non-empty) static token nor an OAuth validator was given. A
+    /// Neither a (non-blank) static token nor an OAuth validator was given (a
+    /// whitespace-only static token counts as none: it could never match). A
     /// layer that could accept nothing would lock every route; one that
     /// accepted everything must be asked for by name.
     #[error(
@@ -475,7 +481,7 @@ macro_rules! log_oauth_accepted {
             path = %parts.uri.path(),
             principal = ?token.principal.as_deref().map(crate::token::for_log),
             subject = ?token.subject.as_deref().map(crate::token::for_log),
-            scopes = ?token.scopes,
+            scopes = ?crate::token::scopes_for_log(&token.scopes),
             auth.outcome = crate::observe::Outcome::Accepted.as_str(),
             auth.mechanism = crate::observe::Mechanism::OAuth.as_str(),
             "OAuth bearer auth accepted"
@@ -971,6 +977,18 @@ pub(crate) const fn all_scope_tokens(scopes: &[&str]) -> bool {
     true
 }
 
+/// Mark every `Authorization` value sensitive: what an
+/// `allow_unauthenticated` layer (which has no sources of its own) does, so a
+/// credential a client sends anyway never reaches a `Debug` of the request
+/// unmarked — a tracing layer's, or a handler's.
+pub(crate) fn mark_authorization_sensitive(headers: &mut http::HeaderMap) {
+    for (name, value) in headers.iter_mut() {
+        if name == http::header::AUTHORIZATION {
+            value.set_sensitive(true);
+        }
+    }
+}
+
 /// Inserted into a request's extensions by every layer it passes — the axum
 /// `AuthLayer` and [`HttpAuthLayer`] alike — so a route-level scope check
 /// behind either ([`RequireScopes`], the `mcp` feature's `McpToolScopes`)
@@ -1081,8 +1099,12 @@ pub(crate) fn scope_refusal<B: Default + 'static>(
 ) -> Response<B> {
     let path = parts.uri.path();
     let mechanism = Mechanism::of_request(parts.extensions.get::<Credential>(), rejection);
-    // `Scoped` is the one handler-side caller; the others are route layers.
-    let stage = if what == "Scoped" {
+    // `Scoped` and the axum extractors are the handler-side callers; the
+    // others are route layers.
+    let stage = if matches!(
+        what,
+        "Scoped" | "AuthorizedToken" | "Credential" | "StaticTokenMatch"
+    ) {
         Stage::Handler
     } else {
         Stage::Route
@@ -1152,7 +1174,7 @@ pub(crate) fn scope_refusal<B: Default + 'static>(
                 path = %path,
                 what,
                 required = ?required,
-                present = ?present,
+                present = ?crate::token::scopes_for_log(&present),
                 static_token = matches!(parts.extensions.get::<Credential>(), Some(Credential::StaticToken)),
                 auth.outcome = Outcome::Rejected.as_str(),
                 auth.mechanism = mechanism.as_str(),
@@ -1494,6 +1516,9 @@ impl HttpAuthLayer {
     ///
     /// Every request reaches the wrapped service. Use it only where something
     /// else (a trusted network, a proxy that authenticates) stands in front.
+    /// It still marks every `Authorization` header value sensitive
+    /// (`http::HeaderValue::set_sensitive`), so a credential a client sends
+    /// anyway is not printed by a `Debug` of the request downstream.
     pub fn allow_unauthenticated() -> Self {
         Self {
             mode: Arc::new(HttpMode::AllowUnauthenticated),
@@ -1551,6 +1576,7 @@ impl<R> HttpAuthLayer<R> {
                     REASON_NONE,
                 );
                 let mut request = request;
+                mark_authorization_sensitive(request.headers_mut());
                 self.mark::<ResBody>(request.extensions_mut(), None);
                 return Ok(request);
             }
@@ -1920,7 +1946,7 @@ impl<R> HttpAuthLayerBuilder<R> {
     ///
     /// # Errors
     ///
-    /// [`AuthLayerError::NoCredential`] with neither a non-empty static token
+    /// [`AuthLayerError::NoCredential`] with neither a non-blank static token
     /// (from [`static_token`](Self::static_token) or a non-empty
     /// [`static_tokens`](Self::static_tokens) set) nor an OAuth validator;
     /// [`AuthLayerError::NoSources`] with an empty
@@ -2172,8 +2198,8 @@ mod tests {
 
     #[tokio::test]
     async fn only_the_explicit_opt_out_passes_everything() {
-        // Like the axum layer's pass-through, it reads (and marks) no header,
-        // so this test's service does not use `inner`'s sensitivity check.
+        // Like the axum layer's pass-through, it reads no header, but it marks
+        // `Authorization` sensitive: a client may send one anyway.
         let layer = HttpAuthLayer::allow_unauthenticated();
         let service = tower_layer::Layer::layer(
             &layer,
@@ -2181,6 +2207,9 @@ mod tests {
                 let inserted = request.extensions().get::<Credential>().is_some()
                     || request.extensions().get::<AuthorizedToken>().is_some();
                 assert!(!inserted, "a pass-through inserts nothing");
+                for value in request.headers().get_all("authorization") {
+                    assert!(value.is_sensitive(), "Authorization must be sensitive");
+                }
                 Ok::<_, std::convert::Infallible>(Response::new(String::from("anonymous")))
             }),
         );
@@ -2520,6 +2549,43 @@ mod tests {
         }
         let (_, _, body) = seen(&layer, &[("authorization", "Bearer key-extra")]).await;
         assert!(body.ends_with("label: None })"), "{body}");
+    }
+
+    /// A whitespace-only static token can never match (blank candidates are
+    /// discarded before any comparison), so it counts as no static token:
+    /// alone it is `NoCredential` rather than a layer that silently admits
+    /// nobody; next to OAuth it is dropped.
+    #[tokio::test]
+    async fn a_whitespace_static_token_is_no_credential() {
+        for blank in ["   ", "\t", " \r\n "] {
+            for builder in [
+                HttpAuthLayer::builder().static_token(blank),
+                HttpAuthLayer::builder().static_token(blank).optional(),
+                HttpAuthLayer::builder()
+                    .static_token(blank)
+                    .static_tokens(StaticTokens::new()),
+            ] {
+                assert_eq!(
+                    builder.build().unwrap_err(),
+                    AuthLayerError::NoCredential,
+                    "{blank:?}"
+                );
+            }
+            assert_eq!(
+                HttpAuthLayer::builder()
+                    .build_with_decision(StaticTokenDecision::StaticOnly(blank.into()))
+                    .unwrap_err(),
+                AuthLayerError::NoCredential
+            );
+        }
+        let v = validator("http://127.0.0.1:1/jwks");
+        let layer = HttpAuthLayer::builder()
+            .oauth(v)
+            .static_token("   ")
+            .build()
+            .unwrap();
+        let refused = send(&layer, &[("authorization", "Bearer    ")]).await;
+        assert_eq!(refused.status(), StatusCode::UNAUTHORIZED);
     }
 
     #[test]

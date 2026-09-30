@@ -934,10 +934,10 @@ hu4/P7MxyziTbEQzIKcRZrul7dt0eiqlr6cR25zxQIqJB5f+05DAbMFl
             }
             for url in [
                 "https://idp.example.test/jwks",
-                "http://10.0.0.1/jwks",
+                "http://203.0.113.1/jwks",
                 "http://localhost.example.test/jwks",
                 "http://[::2]/jwks",
-                "http://128.0.0.1/jwks",
+                "http://198.51.100.1/jwks",
                 "not a url",
                 "http:/idp.example.test/jwks",
                 "http:localhost.example.test/jwks",
