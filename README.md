@@ -2044,7 +2044,7 @@ needs:
 
 | Request | Requires |
 |---|---|
-| no body (the event stream `GET`, `DELETE`) | the default |
+| an empty body (the event stream `GET`, `DELETE`, `Content-Length: 0`) | the default |
 | a body, under **any** method, with a `tools/call` for a listed tool | that tool's scopes |
 | `tools/call` for another tool, or any other method | the default |
 | a JSON-RPC batch | every scope any of its messages needs |
@@ -2061,8 +2061,12 @@ body type must be buildable from bytes (`axum::body::Body`, `Full<Bytes>`);
 nothing from the body is ever logged. The body is parsed in one streaming
 pass that builds no document, so memory stays at about the body itself
 however many messages a batch holds. A request with no credential (behind
-an `optional()` layer) is refused before its body is read whenever any tool
-needs a scope.
+an `optional()` layer) gets the auth layer's 401 when what it needs is not
+empty and is served when it needs nothing (an anonymous `initialize`, a
+public tool behind an empty default); only when every request needs a scope
+is it refused before its body is read. Every request's body is read whatever
+its method or size hint (an empty one ends at once); whitespace alone is not
+empty, so it needs every scope.
 
 **Tool names are matched exactly** — byte for byte on the JSON-decoded
 `params.name`, with no case folding, trimming or normalization — and a name

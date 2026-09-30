@@ -50,7 +50,7 @@
 //!
 //! | Request | Scopes required (all-of, on top of the layer's) |
 //! |---|---|
-//! | no body (no `Content-Length` above 0, no `Transfer-Encoding`, and a body whose size hint is exactly 0) — the `GET` event stream, `DELETE`, … | the default |
+//! | an empty body (nothing read: the `GET` event stream, `DELETE`, `Content-Length: 0`, a chunked body with no chunks) | the default |
 //! | a body, **whatever the method**, whose JSON-RPC message is `tools/call` for a configured tool | that tool's (not the default's) |
 //! | a body whose message is `tools/call` for any other tool | the default |
 //! | a body whose message is anything else (`initialize`, `tools/list`, a notification, a response) | the default |
@@ -58,9 +58,12 @@
 //! | a body that is not JSON, or a `tools/call` without a readable string `params.name`, or a message with a repeated `method`, `params` or `params.name` | the **strictest** set: the default and every tool's scopes together |
 //! | a body larger than the [limit](McpToolScopes::body_limit) | refused with 413, unread beyond the limit |
 //!
-//! Every method is classified, not just `POST`: MCP's own transport sends
-//! JSON-RPC in `POST`s only, but another JSON-RPC server may read a
-//! `tools/call` from any request with a body.
+//! Every request's body is read and classified, whatever the method — MCP's
+//! own transport sends JSON-RPC in `POST`s only, but another JSON-RPC server
+//! may read a `tools/call` from any request with a body — and whatever its
+//! headers or size hint claim: an empty body ends at once, and a size hint
+//! of exactly 0 is not taken as proof that no `tools/call` follows. A body
+//! of whitespace alone is not empty: it is unreadable, so the strictest set.
 //!
 //! A request whose credential lacks the scopes is refused with 403 and the
 //! authentication layer's own refusal (its `on_reject` body), with a
@@ -70,8 +73,11 @@
 //! whenever scopes are required, unless
 //! [`static_token_bypasses_scopes`](McpToolScopes::static_token_bypasses_scopes).
 //! A request with no credential (an `optional` layer passed it through) gets
-//! the layer's own 401 — before its body is read, whenever any tool or the
-//! default requires a scope — and is served when nothing is required.
+//! the layer's own 401 when what it needs is not empty, and is served when
+//! it needs nothing — an anonymous `initialize` or a call to a public tool
+//! behind an empty default. Only when every request needs a scope (a
+//! non-empty default and no tool with an empty list) is it refused before
+//! its body is read.
 //! Anything served reaches the MCP server with its body byte-identical.
 //!
 //! # Tool names are matched exactly
@@ -102,8 +108,9 @@
 //!
 //! The body is held once (reserved up front when its length is announced),
 //! and parsed in a single streaming pass that validates it fully but builds
-//! no document: memory beyond the body itself stays small and does not grow
-//! with the number of messages in a batch.
+//! no document and copies no tool name: memory beyond the body itself stays
+//! small and does not grow with the number of messages in a batch or the
+//! length of a name.
 //!
 //! Reading the body has **no timeout of its own**: a client that trickles
 //! a body in slowly (slow-loris) holds the request open for as long as the
@@ -199,6 +206,10 @@ struct Rules {
     tools: Vec<(String, Vec<String>)>,
     /// `default` followed by every tool's scopes, deduplicated.
     strictest: Vec<String>,
+    /// Whether every request needs at least one scope, whatever its body:
+    /// a non-empty default and no tool with an empty list. Only then is a
+    /// request with no credential refused before its body is read.
+    always_scoped: bool,
     body_limit: usize,
     static_bypasses: bool,
 }
@@ -216,6 +227,8 @@ impl Rules {
             }
         }
         self.strictest = all;
+        self.always_scoped =
+            !self.default.is_empty() && self.tools.iter().all(|(_, scopes)| !scopes.is_empty());
         self
     }
 
@@ -230,24 +243,40 @@ impl Rules {
     /// folded message by message as the body is parsed: what is kept is one
     /// flag per configured tool, never the messages themselves, so a batch of
     /// any length costs no more memory than one call.
+    ///
+    /// An empty body (nothing at all: `Content-Length: 0`, a chunked body
+    /// with no chunks, a `GET`) needs the default; anything else that is not
+    /// a JSON object or array — whitespace alone included — the strictest
+    /// set.
     fn for_body(&self, body: &[u8]) -> Vec<String> {
+        if body.is_empty() {
+            return self.default.clone();
+        }
         let mut needs_default = false;
         let mut needs_strictest = false;
         let mut needs_tool = vec![false; self.tools.len()];
         let mut seen_any = false;
-        let readable = for_each_message(body, &mut |message| {
-            seen_any = true;
-            match message {
-                Message::NotToolCall => needs_default = true,
-                Message::ToolCall(name) => {
-                    match self.tools.iter().position(|(tool, _)| *tool == name) {
-                        Some(i) => needs_tool[i] = true,
-                        None => needs_default = true,
-                    }
+        let tools = &self.tools;
+        let readable = for_each_message(
+            body,
+            // Compared against the configured names as the value streams by:
+            // the name itself is never copied, however long it is.
+            &mut |name| {
+                tools
+                    .iter()
+                    .position(|(tool, _)| tool == name)
+                    .unwrap_or(UNKNOWN_TOOL)
+            },
+            &mut |message| {
+                seen_any = true;
+                match message {
+                    Message::NotToolCall => needs_default = true,
+                    Message::ToolCall(UNKNOWN_TOOL) => needs_default = true,
+                    Message::ToolCall(i) => needs_tool[i] = true,
+                    Message::Ambiguous => needs_strictest = true,
                 }
-                Message::Ambiguous => needs_strictest = true,
-            }
-        });
+            },
+        );
         if !readable || needs_strictest {
             return self.strictest.clone();
         }
@@ -306,6 +335,7 @@ impl McpToolScopes {
                 default: Vec::new(),
                 tools: Vec::new(),
                 strictest: Vec::new(),
+                always_scoped: false,
                 body_limit: DEFAULT_BODY_LIMIT,
                 static_bypasses: false,
             }),
@@ -321,7 +351,7 @@ impl McpToolScopes {
     }
 
     /// The scopes every request needs unless a [`tool`](Self::tool) entry
-    /// says otherwise: every request without a body, every JSON-RPC message
+    /// says otherwise: every request with an empty body, every JSON-RPC message
     /// other than `tools/call`, and a `tools/call` for a tool with no entry.
     /// Replaces a default given earlier. For literals in code; see
     /// [`try_default`](Self::try_default) for scopes from configuration.
@@ -580,17 +610,11 @@ where
                 .and_then(|v| v.to_str().ok())
                 .and_then(|v| v.trim().parse::<u64>().ok());
             let hint = body.size_hint();
-            // Any method: a JSON-RPC server other than MCP's Streamable HTTP
-            // transport may read a `tools/call` from a `GET` or a `PUT` just
-            // as well, so a body is classified wherever one may be present.
-            let has_body = hint.upper() != Some(0)
-                || content_length.is_some_and(|n| n > 0)
-                || parts.headers.contains_key(http::header::TRANSFER_ENCODING);
-            // No credential (an `optional()` layer passed the request): when
-            // any tool needs a scope, refuse before reading the body — it
-            // could need one, and an anonymous caller could not satisfy it.
-            if has_body
-                && !rules.strictest.is_empty()
+            // No credential (an `optional()` layer passed the request), and
+            // every request needs a scope whatever its body says (a
+            // non-empty default, no tool with an empty list): refuse before
+            // reading a byte. Otherwise the body decides, so it is read.
+            if rules.always_scoped
                 && parts
                     .extensions
                     .get::<crate::authenticate::Credential>()
@@ -599,11 +623,17 @@ where
                 return Ok(scope_refusal(
                     &parts,
                     &TokenRejection::Missing,
-                    &rules.strictest,
+                    &rules.default,
                     "McpToolScopes",
                 ));
             }
-            let (required, body) = if has_body {
+            // Every request's body is read, whatever the method and whatever
+            // its size hint or headers claim: an empty one ends at once, and
+            // a hint of exactly 0 is not trusted as proof that no
+            // `tools/call` follows. A JSON-RPC server other than MCP's
+            // Streamable HTTP transport may read one from a `GET` or a `PUT`
+            // just as well.
+            let (required, body) = {
                 let announced = content_length.unwrap_or(0).max(hint.lower());
                 let read = if announced > rules.body_limit as u64 {
                     Err(ReadError::TooLarge)
@@ -629,8 +659,6 @@ where
                     }
                 };
                 (rules.for_body(&bytes), ReqBody::from(bytes))
-            } else {
-                (rules.default.clone(), body)
             };
             match judge_scopes(&parts, &required, rules.static_bypasses) {
                 ScopeVerdict::Pass => inner.call(Request::from_parts(parts, body)).await,
@@ -651,16 +679,33 @@ where
     }
 }
 
+/// `Message::ToolCall` for a tool the matcher does not know.
+pub(crate) const UNKNOWN_TOOL: usize = usize::MAX;
+
 /// One JSON-RPC message, as far as tool scopes are concerned.
 #[derive(Debug, PartialEq, Eq)]
 pub(crate) enum Message {
     /// Anything but a `tools/call` request.
     NotToolCall,
-    /// A `tools/call` for this tool.
-    ToolCall(String),
+    /// A `tools/call` for the tool the name matcher mapped to this index
+    /// ([`UNKNOWN_TOOL`] for none). The name itself is never copied.
+    ToolCall(usize),
     /// A `tools/call` with no readable string `params.name`, a message with
     /// a repeated `method`, `params` or `params.name` member, or a batch
     /// element that is not an object: not classified with certainty.
+    Ambiguous,
+}
+
+/// One message with the tool name spelled out (tests and the fuzz oracle
+/// only).
+#[cfg(any(test, fuzzing))]
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) enum NamedMessage {
+    /// See [`Message::NotToolCall`].
+    NotToolCall,
+    /// A `tools/call` for this tool.
+    ToolCall(String),
+    /// See [`Message::Ambiguous`].
     Ambiguous,
 }
 
@@ -670,28 +715,47 @@ pub(crate) enum Message {
 #[derive(Debug, PartialEq, Eq)]
 pub(crate) enum Classified {
     /// One message, or a batch's messages in order (possibly none).
-    Messages(Vec<Message>),
+    Messages(Vec<NamedMessage>),
     /// Not JSON, or JSON that is neither an object nor an array.
     Unreadable,
 }
 
-/// [`for_each_message`], collected.
+/// [`for_each_message`], collected, with every tool name kept.
 #[cfg(any(test, fuzzing))]
 pub(crate) fn classify(body: &[u8]) -> Classified {
+    let mut names: Vec<String> = Vec::new();
     let mut messages = Vec::new();
-    if for_each_message(body, &mut |m| messages.push(m)) {
-        Classified::Messages(messages)
-    } else {
-        Classified::Unreadable
+    let readable = for_each_message(
+        body,
+        &mut |name| {
+            names.push(name.to_string());
+            names.len() - 1
+        },
+        &mut |m| messages.push(m),
+    );
+    if !readable {
+        return Classified::Unreadable;
     }
+    Classified::Messages(
+        messages
+            .into_iter()
+            .map(|m| match m {
+                Message::NotToolCall => NamedMessage::NotToolCall,
+                Message::ToolCall(i) => NamedMessage::ToolCall(names[i].clone()),
+                Message::Ambiguous => NamedMessage::Ambiguous,
+            })
+            .collect(),
+    )
 }
 
 /// Hand every message of `body` — one object, or each element of a batch
-/// array, in order — to `sink`, in ONE streaming pass that builds nothing
-/// but a short-lived `String` per tool name. Returns `false` when the body is
-/// not a JSON object or array, or is not valid JSON anywhere in it; `sink`
-/// may then have seen some messages already, and the caller must discard
-/// them (the request path answers `false` with the strictest set).
+/// array, in order — to `sink`, in ONE streaming pass that builds nothing:
+/// a tool name is handed to `tool` as a borrowed `&str` (which maps it to
+/// an index) and never copied, and `method` is compared in place. Returns
+/// `false` when the body is not a JSON object or array, or is not valid JSON
+/// anywhere in it; `sink` may then have seen some messages already, and the
+/// caller must discard them (the request path answers `false` with the
+/// strictest set).
 ///
 /// Every value it does not look at is still fully validated
 /// ([`Validate`]: every string's UTF-8 and escapes, every number's range),
@@ -699,9 +763,16 @@ pub(crate) fn classify(body: &[u8]) -> Classified {
 /// the `mcp_tool_calls` fuzz target checks that against `Value` — without
 /// materializing the document (which costs about 16× the body). Bounded by
 /// `serde_json`'s recursion limit; never panics.
-pub(crate) fn for_each_message(body: &[u8], sink: &mut dyn FnMut(Message)) -> bool {
+pub(crate) fn for_each_message(
+    body: &[u8],
+    tool: &mut dyn FnMut(&str) -> usize,
+    sink: &mut dyn FnMut(Message),
+) -> bool {
     let mut deserializer = serde_json::Deserializer::from_slice(body);
-    TopSeed { sink }.deserialize(&mut deserializer).is_ok() && deserializer.end().is_ok()
+    TopSeed { tool, sink }
+        .deserialize(&mut deserializer)
+        .is_ok()
+        && deserializer.end().is_ok()
 }
 
 /// Accept every scalar JSON value (after the deserializer has validated it)
@@ -721,6 +792,28 @@ macro_rules! accept_scalars {
             Ok($value)
         }
         fn visit_str<E>(self, _: &str) -> Result<Self::Value, E> {
+            Ok($value)
+        }
+        fn visit_unit<E>(self) -> Result<Self::Value, E> {
+            Ok($value)
+        }
+    };
+}
+
+/// Accept every non-string scalar as `$value` (a string is handled by the
+/// visitor itself).
+macro_rules! accept_non_string_scalars {
+    ($value:expr) => {
+        fn visit_bool<E>(self, _: bool) -> Result<Self::Value, E> {
+            Ok($value)
+        }
+        fn visit_i64<E>(self, _: i64) -> Result<Self::Value, E> {
+            Ok($value)
+        }
+        fn visit_u64<E>(self, _: u64) -> Result<Self::Value, E> {
+            Ok($value)
+        }
+        fn visit_f64<E>(self, _: f64) -> Result<Self::Value, E> {
             Ok($value)
         }
         fn visit_unit<E>(self) -> Result<Self::Value, E> {
@@ -758,6 +851,7 @@ impl<'de> Deserialize<'de> for Validate {
 /// The top-level value: one message (an object) or a batch (an array);
 /// anything else is an error, i.e. unreadable.
 struct TopSeed<'s> {
+    tool: &'s mut dyn FnMut(&str) -> usize,
     sink: &'s mut dyn FnMut(Message),
 }
 
@@ -765,31 +859,36 @@ impl<'de> DeserializeSeed<'de> for TopSeed<'_> {
     type Value = ();
 
     fn deserialize<D: Deserializer<'de>>(self, deserializer: D) -> Result<(), D::Error> {
-        struct V<'s>(&'s mut dyn FnMut(Message));
+        struct V<'s>(TopSeed<'s>);
         impl<'de> Visitor<'de> for V<'_> {
             type Value = ();
             fn expecting(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
                 f.write_str("a JSON-RPC message or batch")
             }
             fn visit_map<A: MapAccess<'de>>(self, map: A) -> Result<(), A::Error> {
-                let message = read_message(map)?;
-                (self.0)(message);
+                let message = read_message(map, self.0.tool)?;
+                (self.0.sink)(message);
                 Ok(())
             }
             fn visit_seq<A: SeqAccess<'de>>(self, mut seq: A) -> Result<(), A::Error> {
+                let TopSeed { tool, sink } = self.0;
                 while seq
-                    .next_element_seed(ElementSeed { sink: &mut *self.0 })?
+                    .next_element_seed(ElementSeed {
+                        tool: &mut *tool,
+                        sink: &mut *sink,
+                    })?
                     .is_some()
                 {}
                 Ok(())
             }
         }
-        deserializer.deserialize_any(V(self.sink))
+        deserializer.deserialize_any(V(self))
     }
 }
 
 /// One batch element: a message, or anything else (`Ambiguous`).
 struct ElementSeed<'s> {
+    tool: &'s mut dyn FnMut(&str) -> usize,
     sink: &'s mut dyn FnMut(Message),
 }
 
@@ -797,22 +896,22 @@ impl<'de> DeserializeSeed<'de> for ElementSeed<'_> {
     type Value = ();
 
     fn deserialize<D: Deserializer<'de>>(self, deserializer: D) -> Result<(), D::Error> {
-        struct V;
-        impl<'de> Visitor<'de> for V {
+        struct V<'s>(&'s mut dyn FnMut(&str) -> usize);
+        impl<'de> Visitor<'de> for V<'_> {
             type Value = Message;
             fn expecting(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
                 f.write_str("any JSON value")
             }
             accept_scalars!(Message::Ambiguous);
             fn visit_map<A: MapAccess<'de>>(self, map: A) -> Result<Message, A::Error> {
-                read_message(map)
+                read_message(map, self.0)
             }
             fn visit_seq<A: SeqAccess<'de>>(self, mut seq: A) -> Result<Message, A::Error> {
                 while seq.next_element::<Validate>()?.is_some() {}
                 Ok(Message::Ambiguous)
             }
         }
-        let message = deserializer.deserialize_any(V)?;
+        let message = deserializer.deserialize_any(V(self.tool))?;
         (self.sink)(message);
         Ok(())
     }
@@ -847,69 +946,89 @@ impl<'de> Deserialize<'de> for Key {
     }
 }
 
-/// A value read as a string when it is one (`Some`); any other value is
-/// validated, consumed, and read as `None`.
-struct StringValue(Option<String>);
+/// Whether `method` is the string `"tools/call"` (`Some(true)`), another
+/// string (`Some(false)`), or not a string (`None`) — compared in place.
+struct IsToolsCall(Option<bool>);
 
-impl<'de> Deserialize<'de> for StringValue {
+impl<'de> Deserialize<'de> for IsToolsCall {
     fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
         struct V;
         impl<'de> Visitor<'de> for V {
-            type Value = StringValue;
+            type Value = IsToolsCall;
             fn expecting(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
                 f.write_str("any JSON value")
             }
-            fn visit_bool<E>(self, _: bool) -> Result<StringValue, E> {
-                Ok(StringValue(None))
+            accept_non_string_scalars!(IsToolsCall(None));
+            fn visit_str<E>(self, v: &str) -> Result<IsToolsCall, E> {
+                Ok(IsToolsCall(Some(v == "tools/call")))
             }
-            fn visit_i64<E>(self, _: i64) -> Result<StringValue, E> {
-                Ok(StringValue(None))
-            }
-            fn visit_u64<E>(self, _: u64) -> Result<StringValue, E> {
-                Ok(StringValue(None))
-            }
-            fn visit_f64<E>(self, _: f64) -> Result<StringValue, E> {
-                Ok(StringValue(None))
-            }
-            fn visit_unit<E>(self) -> Result<StringValue, E> {
-                Ok(StringValue(None))
-            }
-            fn visit_str<E>(self, v: &str) -> Result<StringValue, E> {
-                Ok(StringValue(Some(v.to_string())))
-            }
-            fn visit_map<A: MapAccess<'de>>(self, mut map: A) -> Result<StringValue, A::Error> {
+            fn visit_map<A: MapAccess<'de>>(self, mut map: A) -> Result<IsToolsCall, A::Error> {
                 while map.next_entry::<Validate, Validate>()?.is_some() {}
-                Ok(StringValue(None))
+                Ok(IsToolsCall(None))
             }
-            fn visit_seq<A: SeqAccess<'de>>(self, mut seq: A) -> Result<StringValue, A::Error> {
+            fn visit_seq<A: SeqAccess<'de>>(self, mut seq: A) -> Result<IsToolsCall, A::Error> {
                 while seq.next_element::<Validate>()?.is_some() {}
-                Ok(StringValue(None))
+                Ok(IsToolsCall(None))
             }
         }
         deserializer.deserialize_any(V)
     }
 }
 
-/// What a message's `params` says about the tool name: `Some` only for an
-/// object with exactly one `name`, a string.
-struct ParamsName(Option<String>);
+/// A `params.name` value handed to the tool matcher as a borrowed `&str`:
+/// `Some(index)` for a string, `None` for anything else (validated,
+/// consumed).
+struct NameSeed<'s>(&'s mut dyn FnMut(&str) -> usize);
 
-impl<'de> Deserialize<'de> for ParamsName {
-    fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
-        struct V;
-        impl<'de> Visitor<'de> for V {
-            type Value = ParamsName;
+impl<'de> DeserializeSeed<'de> for NameSeed<'_> {
+    type Value = Option<usize>;
+
+    fn deserialize<D: Deserializer<'de>>(self, deserializer: D) -> Result<Option<usize>, D::Error> {
+        struct V<'s>(&'s mut dyn FnMut(&str) -> usize);
+        impl<'de> Visitor<'de> for V<'_> {
+            type Value = Option<usize>;
             fn expecting(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
                 f.write_str("any JSON value")
             }
-            accept_scalars!(ParamsName(None));
-            fn visit_map<A: MapAccess<'de>>(self, mut map: A) -> Result<ParamsName, A::Error> {
-                let mut name: Option<Option<String>> = None;
+            accept_non_string_scalars!(None);
+            fn visit_str<E>(self, v: &str) -> Result<Option<usize>, E> {
+                Ok(Some((self.0)(v)))
+            }
+            fn visit_map<A: MapAccess<'de>>(self, mut map: A) -> Result<Option<usize>, A::Error> {
+                while map.next_entry::<Validate, Validate>()?.is_some() {}
+                Ok(None)
+            }
+            fn visit_seq<A: SeqAccess<'de>>(self, mut seq: A) -> Result<Option<usize>, A::Error> {
+                while seq.next_element::<Validate>()?.is_some() {}
+                Ok(None)
+            }
+        }
+        deserializer.deserialize_any(V(self.0))
+    }
+}
+
+/// What a message's `params` says about the tool: `Some(index)` only for an
+/// object with exactly one `name`, a string.
+struct ParamsSeed<'s>(&'s mut dyn FnMut(&str) -> usize);
+
+impl<'de> DeserializeSeed<'de> for ParamsSeed<'_> {
+    type Value = Option<usize>;
+
+    fn deserialize<D: Deserializer<'de>>(self, deserializer: D) -> Result<Option<usize>, D::Error> {
+        struct V<'s>(&'s mut dyn FnMut(&str) -> usize);
+        impl<'de> Visitor<'de> for V<'_> {
+            type Value = Option<usize>;
+            fn expecting(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+                f.write_str("any JSON value")
+            }
+            accept_scalars!(None);
+            fn visit_map<A: MapAccess<'de>>(self, mut map: A) -> Result<Option<usize>, A::Error> {
+                let mut name: Option<Option<usize>> = None;
                 let mut repeated = false;
                 while let Some(key) = map.next_key::<Key>()? {
                     match key {
                         Key::Name if name.is_none() => {
-                            name = Some(map.next_value::<StringValue>()?.0);
+                            name = Some(map.next_value_seed(NameSeed(&mut *self.0))?);
                         }
                         Key::Name => {
                             repeated = true;
@@ -920,29 +1039,38 @@ impl<'de> Deserialize<'de> for ParamsName {
                         }
                     }
                 }
-                Ok(ParamsName(match (repeated, name) {
+                Ok(match (repeated, name) {
                     (false, Some(name)) => name,
                     _ => None,
-                }))
+                })
             }
-            fn visit_seq<A: SeqAccess<'de>>(self, mut seq: A) -> Result<ParamsName, A::Error> {
+            fn visit_seq<A: SeqAccess<'de>>(self, mut seq: A) -> Result<Option<usize>, A::Error> {
                 while seq.next_element::<Validate>()?.is_some() {}
-                Ok(ParamsName(None))
+                Ok(None)
             }
         }
-        deserializer.deserialize_any(V)
+        deserializer.deserialize_any(V(self.0))
     }
 }
 
-/// Read one message object.
-fn read_message<'de, A: MapAccess<'de>>(mut map: A) -> Result<Message, A::Error> {
-    let mut method: Option<Option<String>> = None;
-    let mut params: Option<Option<String>> = None;
+/// Read one message object. `params` may come before `method`, so its tool
+/// name is matched as it streams past whatever the method turns out to be;
+/// only the index is kept.
+fn read_message<'de, A: MapAccess<'de>>(
+    mut map: A,
+    tool: &mut dyn FnMut(&str) -> usize,
+) -> Result<Message, A::Error> {
+    let mut method: Option<Option<bool>> = None;
+    let mut params: Option<Option<usize>> = None;
     let mut repeated = false;
     while let Some(key) = map.next_key::<Key>()? {
         match key {
-            Key::Method if method.is_none() => method = Some(map.next_value::<StringValue>()?.0),
-            Key::Params if params.is_none() => params = Some(map.next_value::<ParamsName>()?.0),
+            Key::Method if method.is_none() => {
+                method = Some(map.next_value::<IsToolsCall>()?.0);
+            }
+            Key::Params if params.is_none() => {
+                params = Some(map.next_value_seed(ParamsSeed(&mut *tool))?);
+            }
             Key::Method | Key::Params => {
                 repeated = true;
                 map.next_value::<Validate>()?;
@@ -954,14 +1082,13 @@ fn read_message<'de, A: MapAccess<'de>>(mut map: A) -> Result<Message, A::Error>
     }
     Ok(match (repeated, method) {
         (true, _) => Message::Ambiguous,
-        (false, Some(Some(method))) if method == "tools/call" => match params {
-            Some(Some(name)) => Message::ToolCall(name),
+        (false, Some(Some(true))) => match params {
+            Some(Some(index)) => Message::ToolCall(index),
             _ => Message::Ambiguous,
         },
         _ => Message::NotToolCall,
     })
 }
-
 #[cfg(all(test, feature = "axum"))]
 mod service_tests;
 
@@ -972,32 +1099,35 @@ mod tests {
     #[test]
     fn classification() {
         let one = |json: &str| classify(json.as_bytes());
-        let msgs = |m: Vec<Message>| Classified::Messages(m);
+        let msgs = |m: Vec<NamedMessage>| Classified::Messages(m);
         assert_eq!(
             one(
                 r#"{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"w","arguments":{"name":"x"}}}"#
             ),
-            msgs(vec![Message::ToolCall("w".into())])
+            msgs(vec![NamedMessage::ToolCall("w".into())])
         );
         assert_eq!(
             one(r#"{"jsonrpc":"2.0","id":1,"method":"tools/list"}"#),
-            msgs(vec![Message::NotToolCall])
+            msgs(vec![NamedMessage::NotToolCall])
         );
         // A response, a notification: not tool calls.
         assert_eq!(
             one(r#"{"jsonrpc":"2.0","id":1,"result":{}}"#),
-            msgs(vec![Message::NotToolCall])
+            msgs(vec![NamedMessage::NotToolCall])
         );
         assert_eq!(
             one(r#"{"jsonrpc":"2.0","method":"notifications/initialized"}"#),
-            msgs(vec![Message::NotToolCall])
+            msgs(vec![NamedMessage::NotToolCall])
         );
         // A method that is not a string is not `tools/call`.
-        assert_eq!(one(r#"{"method":7}"#), msgs(vec![Message::NotToolCall]));
+        assert_eq!(
+            one(r#"{"method":7}"#),
+            msgs(vec![NamedMessage::NotToolCall])
+        );
         // Escapes are decoded exactly as any JSON parser decodes them.
         assert_eq!(
             one(r#"{"method":"tools\/call","params":{"name":"w"}}"#),
-            msgs(vec![Message::ToolCall("w".into())])
+            msgs(vec![NamedMessage::ToolCall("w".into())])
         );
         // No readable name: ambiguous.
         for json in [
@@ -1009,15 +1139,15 @@ mod tests {
             r#"{"method":"tools/list","method":"tools/call","params":{"name":"w"}}"#,
             r#"{"method":"tools/call","params":{"name":"r"},"params":{"name":"w"}}"#,
         ] {
-            assert_eq!(one(json), msgs(vec![Message::Ambiguous]), "{json}");
+            assert_eq!(one(json), msgs(vec![NamedMessage::Ambiguous]), "{json}");
         }
         // Batches, element by element; a non-object element is ambiguous.
         assert_eq!(
             one(r#"[{"method":"tools/list"},{"method":"tools/call","params":{"name":"w"}},3]"#),
             msgs(vec![
-                Message::NotToolCall,
-                Message::ToolCall("w".into()),
-                Message::Ambiguous
+                NamedMessage::NotToolCall,
+                NamedMessage::ToolCall("w".into()),
+                NamedMessage::Ambiguous
             ])
         );
         assert_eq!(one("[]"), msgs(vec![]));
@@ -1067,6 +1197,9 @@ mod tests {
             ["mcp:read", "mcp:write"]
         );
         assert_eq!(req("[]"), ["mcp:read"]);
+        // Nothing at all: the default; whitespace alone: unreadable.
+        assert_eq!(req(""), ["mcp:read"]);
+        assert_eq!(req("  "), strictest);
         // Anything a strict JSON parser refuses is unreadable, even in a
         // member nobody looks at: an out-of-range number, invalid UTF-8.
         assert_eq!(req(r#"{"method":"initialize","x":1e999}"#), strictest);
