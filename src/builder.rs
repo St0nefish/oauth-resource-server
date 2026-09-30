@@ -600,6 +600,12 @@ hu4/P7MxyziTbEQzIKcRZrul7dt0eiqlr6cR25zxQIqJB5f+05DAbMFl
     /// answering every request with `body`. Returns its JWKS URL and how many
     /// requests got through the TLS handshake.
     async fn spawn_https_jwks(body: String) -> (String, Arc<AtomicUsize>) {
+        spawn_https("200 OK\r\nContent-Type: application/json", body).await
+    }
+
+    /// [`spawn_https_jwks`] answering with the status line and extra headers
+    /// `head` (`"302 Found\r\nLocation: ..."`, say).
+    async fn spawn_https(head: &'static str, body: String) -> (String, Arc<AtomicUsize>) {
         let certs: Vec<CertificateDer<'static>> =
             CertificateDer::pem_slice_iter(TEST_SERVER_CERT_PEM.as_bytes())
                 .collect::<Result<_, _>>()
@@ -637,8 +643,7 @@ hu4/P7MxyziTbEQzIKcRZrul7dt0eiqlr6cR25zxQIqJB5f+05DAbMFl
                     }
                     counter.fetch_add(1, Ordering::SeqCst);
                     let resp = format!(
-                        "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\n\
-                         Content-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                        "HTTP/1.1 {head}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
                         body.len()
                     );
                     let _ = tls.write_all(resp.as_bytes()).await;
@@ -710,6 +715,34 @@ hu4/P7MxyziTbEQzIKcRZrul7dt0eiqlr6cR25zxQIqJB5f+05DAbMFl
         assert_eq!(with.refresh_now().await.unwrap(), 1);
         with.validate(&testing::valid_token()).await.unwrap();
         assert_eq!(hits.load(Ordering::SeqCst), 1);
+    }
+
+    /// End to end: an https key fetch redirected to plain http is refused —
+    /// loopback target or not, opt-in or not — and the plain-http URL is
+    /// never requested.
+    #[tokio::test]
+    async fn an_https_fetch_redirected_to_plain_http_is_refused() {
+        let plain = testing::spawn_jwks_server("200 OK", testing::jwks_body()).await;
+        let head: &'static str =
+            Box::leak(format!("302 Found\r\nLocation: {}", plain.url).into_boxed_str());
+        let (url, hits) = spawn_https(head, String::new()).await;
+        for allow_insecure_http in [false, true] {
+            let mut cfg = testing::resolved_config(&url);
+            cfg.allow_insecure_http = allow_insecure_http;
+            let v = OAuthValidator::builder(&cfg)
+                .add_root_certificate_pem(TEST_CA_PEM.as_bytes())
+                .build()
+                .unwrap();
+            let err = v.refresh_now().await.unwrap_err();
+            assert_eq!(err.kind(), RefreshErrorKind::Fetch);
+            assert!(
+                err.to_string()
+                    .contains("redirect from https to a non-https URL refused"),
+                "{err}"
+            );
+        }
+        assert_eq!(hits.load(Ordering::SeqCst), 2, "the https URL was asked");
+        assert_eq!(plain.hits.load(Ordering::SeqCst), 0, "the http one never");
     }
 
     #[tokio::test]

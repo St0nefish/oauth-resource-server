@@ -878,3 +878,40 @@ async fn the_scoped_extractor_answers_from_the_innermost_layer_like_require_scop
         Some(crate::refusal::BARE_INSUFFICIENT_SCOPE_CHALLENGE)
     );
 }
+
+/// The innermost-`Credential` rule: behind a strict OAuth layer around a
+/// strict static-only one, a request presenting both carries the outer
+/// layer's `AuthorizedToken` (with every scope) AND the inner layer's
+/// `Credential::StaticToken`. A route check judges the innermost credential,
+/// the static token, which has no scopes: 403, never served on the outer
+/// token's scopes.
+#[tokio::test]
+async fn a_route_check_judges_the_innermost_credential_not_an_outer_token() {
+    let (_jwks, v) = validator().await;
+    let inner = || {
+        AuthLayer::builder()
+            .static_token(STATIC)
+            .sources([CredentialSource::Raw(http::HeaderName::from_static(
+                "x-api-key",
+            ))])
+            .build()
+            .unwrap()
+    };
+    let outer = || AuthLayer::builder().oauth(Arc::clone(&v)).build().unwrap();
+    let app = ok_app(|r| {
+        r.route_layer(RequireScopes::new(["mcp:write"]))
+            .route_layer(inner())
+            .route_layer(outer())
+    });
+    let full = bearer(&token("mcp:read mcp:write"));
+    let both = [("authorization", full.as_str()), ("x-api-key", STATIC)];
+    assert_eq!(seen_with(&app, Method::GET, &both).await.0, 403);
+    // With the static bypass the same request is served: it is the static
+    // token being judged.
+    let bypass = ok_app(|r| {
+        r.route_layer(RequireScopes::new(["mcp:write"]).static_token_bypasses_scopes())
+            .route_layer(inner())
+            .route_layer(outer())
+    });
+    assert_eq!(seen_with(&bypass, Method::GET, &both).await.0, 200);
+}

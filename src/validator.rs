@@ -3491,8 +3491,17 @@ mod tests {
             tokio::task::yield_now().await;
         }
 
-        let status = v.key_set_status();
-        let ready = v.is_ready();
+        // Read on a thread of its own, with a deadline: were the status ever
+        // to wait on the refresh in flight (which cannot finish until the
+        // server is released below), this fails instead of hanging.
+        let probe = Arc::clone(&v);
+        let (sent, received) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let _ = sent.send((probe.key_set_status(), probe.is_ready()));
+        });
+        let (status, ready) = received
+            .recv_timeout(Duration::from_secs(10))
+            .expect("the status read waited on the refresh in flight");
         assert!(
             v.keys.refresh_in_flight(),
             "read while the fetch was in flight"
@@ -5232,5 +5241,290 @@ mod tests {
             .into_iter()
             .collect();
         assert!(required_claim_footguns(&cfg).is_empty());
+    }
+
+    // ── lifted from the crate reviews: fetch bounds and fail-closed paths ────
+
+    /// A raw TCP server on 127.0.0.1 writing `chunks()` (the whole response,
+    /// head included) to every connection, `pause` apart. Returns its JWKS
+    /// URL and how many bytes it managed to write before the client left.
+    async fn raw_http_server(
+        chunks: impl Fn() -> Vec<Vec<u8>> + Send + Sync + 'static,
+        pause: Duration,
+    ) -> (String, Arc<std::sync::atomic::AtomicUsize>) {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let written = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let counter = Arc::clone(&written);
+        let chunks = Arc::new(chunks);
+        tokio::spawn(async move {
+            while let Ok((mut sock, _)) = listener.accept().await {
+                let counter = Arc::clone(&counter);
+                let chunks = Arc::clone(&chunks);
+                tokio::spawn(async move {
+                    let mut request = vec![0u8; 4096];
+                    let _ = sock.read(&mut request).await;
+                    for chunk in chunks() {
+                        if sock.write_all(&chunk).await.is_err() {
+                            return;
+                        }
+                        counter.fetch_add(chunk.len(), Ordering::SeqCst);
+                        if !pause.is_zero() {
+                            tokio::time::sleep(pause).await;
+                        }
+                    }
+                });
+            }
+        });
+        (format!("http://{addr}/jwks"), written)
+    }
+
+    /// The byte cap holds while STREAMING a body that announces no length
+    /// (chunked, never ending): the fetch stops soon after the cap instead
+    /// of reading on. The `Content-Length` precheck alone would never see it.
+    #[tokio::test]
+    async fn the_byte_cap_is_enforced_while_streaming_a_chunked_body() {
+        let (url, written) = raw_http_server(
+            || {
+                let mut out = vec![
+                    b"HTTP/1.1 200 OK\r\nContent-Type: application/json\r\n\
+                      Transfer-Encoding: chunked\r\n\r\n"
+                        .to_vec(),
+                ];
+                let chunk = "x".repeat(32 * 1024);
+                for _ in 0..1000 {
+                    out.push(format!("{:x}\r\n{chunk}\r\n", chunk.len()).into_bytes());
+                }
+                out
+            },
+            Duration::from_millis(1),
+        )
+        .await;
+        let v = validator_no_cooldown(&url);
+        let err = tokio::time::timeout(Duration::from_secs(10), v.refresh_now())
+            .await
+            .expect("the fetch stops at the cap")
+            .unwrap_err();
+        assert_eq!(err.kind(), RefreshErrorKind::Fetch);
+        assert!(err.to_string().contains("response exceeds the"), "{err}");
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        let sent = written.load(Ordering::SeqCst);
+        assert!(
+            sent < 2 * MAX_FETCH_BYTES + 64 * 1024,
+            "the server wrote {sent} bytes before the client went away"
+        );
+
+        // A well-formed chunked key set is read as usual.
+        let (url, _) = raw_http_server(
+            || {
+                let body = jwks_body();
+                vec![
+                    format!(
+                        "HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n{:x}\r\n{body}\r\n0\r\n\r\n",
+                        body.len()
+                    )
+                    .into_bytes(),
+                ]
+            },
+            Duration::ZERO,
+        )
+        .await;
+        assert_eq!(validator_no_cooldown(&url).refresh_now().await.unwrap(), 1);
+    }
+
+    /// A `Content-Length` over the cap is refused before a byte of the body is
+    /// read — even when the body actually sent is a small, valid key set,
+    /// which the streaming cap alone would accept.
+    #[tokio::test]
+    async fn a_content_length_over_the_cap_is_refused_before_reading() {
+        let (url, _) = raw_http_server(
+            || {
+                vec![
+                    format!(
+                        "HTTP/1.1 200 OK\r\nContent-Length: 99999999\r\n\r\n{}",
+                        jwks_body()
+                    )
+                    .into_bytes(),
+                ]
+            },
+            Duration::ZERO,
+        )
+        .await;
+        let err = validator_no_cooldown(&url).refresh_now().await.unwrap_err();
+        assert_eq!(err.kind(), RefreshErrorKind::Fetch);
+        assert!(
+            err.to_string()
+                .contains(&format!("over the {MAX_FETCH_BYTES}-byte cap")),
+            "{err}"
+        );
+        // A body of exactly the cap is accepted.
+        let mut body = jwks_body();
+        let pad = MAX_FETCH_BYTES - body.len() - ",\"p\":\"\"".len();
+        body.insert_str(body.len() - 1, &format!(",\"p\":\"{}\"", "y".repeat(pad)));
+        assert_eq!(body.len(), MAX_FETCH_BYTES);
+        let jwks = spawn_jwks_server("200 OK", body).await;
+        assert_eq!(
+            validator_no_cooldown(&jwks.url)
+                .refresh_now()
+                .await
+                .unwrap(),
+            1
+        );
+    }
+
+    /// A FETCHED key set is held to `MAX_JWKS_KEYS` exactly as a seeded one
+    /// is: the 65th entry is dropped, not the set.
+    #[tokio::test]
+    async fn a_fetched_key_set_keeps_only_the_first_64_keys() {
+        let keys: Vec<serde_json::Value> = (0..=crate::jwks::MAX_JWKS_KEYS)
+            .map(|i| jwk_rsa_a_any_alg(&format!("k{i}")))
+            .collect();
+        let jwks = spawn_jwks_server("200 OK", jwks_of(&keys)).await;
+        let v = validator_no_cooldown(&jwks.url);
+        assert_eq!(v.refresh_now().await.unwrap(), crate::jwks::MAX_JWKS_KEYS);
+        let body = claims(serde_json::json!({"scope": "mcp:read"}));
+        assert!(v.validate(&mint(KEY_A_PEM, "k63", &body)).await.is_ok());
+        match v.validate(&mint(KEY_A_PEM, "k64", &body)).await {
+            Err(TokenRejection::Invalid(invalid)) => {
+                assert_eq!(invalid.kind(), InvalidTokenKind::KeyNotFound)
+            }
+            other => panic!("{other:?}"),
+        }
+    }
+
+    /// An explicit proxy carries every non-loopback fetch, but never a
+    /// redirect hop to loopback (`PROXY_BYPASS`): the hop goes direct.
+    #[tokio::test]
+    async fn an_explicit_proxy_is_bypassed_for_a_redirect_hop_to_loopback() {
+        let jwks = spawn_jwks_server("200 OK", jwks_body()).await;
+        let target = "http://jwks.example.test/jwks";
+        for hop in [
+            jwks.url.clone(),
+            jwks.url.replace("127.0.0.1", "localhost"),
+            jwks.url.replace("127.0.0.1", "127.0.0.9"),
+        ] {
+            // The proxy answers the first, non-loopback fetch with a redirect
+            // to `hop`; were the hop proxied too, it would see a second
+            // request (and answer it 404).
+            let status: &'static str =
+                Box::leak(format!("302 Found\r\nLocation: {hop}").into_boxed_str());
+            let proxy = spawn_http_server(
+                HashMap::from([(target.to_string(), (status, String::new()))]),
+                None,
+            )
+            .await;
+            let mut cfg = oauth_config(target);
+            cfg.allow_insecure_http = true;
+            let v = OAuthValidator::builder(&cfg)
+                .proxy(&proxy.base)
+                .build()
+                .unwrap();
+            let result = v.refresh_now().await;
+            assert_eq!(proxy.hits.load(Ordering::SeqCst), 1, "{hop}: proxy hits");
+            if hop.contains("127.0.0.9") {
+                // Nothing listens there: refused on a direct connect.
+                assert!(result.is_err(), "{hop}");
+            } else {
+                assert_eq!(result.unwrap(), 1, "{hop}");
+            }
+        }
+    }
+
+    /// A correctly signed token over the 16 KiB cap is refused as `TooLarge`
+    /// before anything is decoded or fetched — its size alone decides.
+    #[tokio::test]
+    async fn a_signed_token_over_the_size_cap_is_too_large_without_a_fetch() {
+        let jwks = spawn_jwks_server("200 OK", jwks_body()).await;
+        let v = validator(&jwks.url);
+        let body = claims(serde_json::json!({"scope": "mcp:read"}));
+        let fits = |kid_len: usize| mint(KEY_A_PEM, &"k".repeat(kid_len), &body);
+        // The longest kid that keeps the token at the cap, then one more byte.
+        let (mut kid_len, mut too_long) = (0, MAX_TOKEN_BYTES);
+        while too_long - kid_len > 1 {
+            let mid = (kid_len + too_long) / 2;
+            if fits(mid).len() <= MAX_TOKEN_BYTES {
+                kid_len = mid;
+            } else {
+                too_long = mid;
+            }
+        }
+        let at_cap = fits(kid_len);
+        let over = fits(kid_len + 1);
+        assert!(at_cap.len() <= MAX_TOKEN_BYTES && over.len() > MAX_TOKEN_BYTES);
+        match v.validate(&over).await {
+            Err(TokenRejection::Invalid(invalid)) => {
+                assert_eq!(invalid.kind(), InvalidTokenKind::TooLarge)
+            }
+            other => panic!("{other:?}"),
+        }
+        assert_eq!(jwks.hits.load(Ordering::SeqCst), 0, "no key fetch");
+        // At the cap it is judged on its merits (an unknown kid).
+        match v.validate(&at_cap).await {
+            Err(TokenRejection::Invalid(invalid)) => {
+                assert_eq!(invalid.kind(), InvalidTokenKind::KeyNotFound)
+            }
+            other => panic!("{other:?}"),
+        }
+    }
+
+    /// Keys already held survive a refresh that fails on a PARSE error (a key
+    /// set that is not JSON, not a JWK Set, or holds no usable key) and on a
+    /// DISCOVERY failure — not only on a failed fetch.
+    #[tokio::test]
+    async fn held_keys_survive_a_parse_or_discovery_failure() {
+        let server = spawn_http_server(HashMap::new(), None).await;
+        let set = |path: &str, status: &'static str, body: String| {
+            server
+                .routes
+                .lock()
+                .unwrap()
+                .insert(path.to_string(), (status, body));
+        };
+        set("/jwks", "200 OK", jwks_body());
+        let v = validator_no_cooldown(&server.url);
+        assert!(v.validate(&valid_token()).await.is_ok());
+        for (body, kind) in [
+            ("not json".to_string(), RefreshErrorKind::Parse),
+            ("{}".to_string(), RefreshErrorKind::Parse),
+            (
+                jwks_of(&[serde_json::json!({"kty": "oct", "k": "c2VjcmV0"})]),
+                RefreshErrorKind::NoUsableKeys,
+            ),
+        ] {
+            set("/jwks", "200 OK", body.clone());
+            assert_eq!(v.refresh_now().await.unwrap_err().kind(), kind, "{body}");
+            assert_eq!(v.key_set_status().keys, 1, "{body}");
+            assert!(v.validate(&valid_token()).await.is_ok(), "{body}");
+        }
+
+        // Discovery: keys loaded through the metadata, then the metadata and
+        // the key set both break. The discovered URI is dropped after the
+        // failed fetch, and the re-discovery that follows fails too.
+        let issuer = format!("{}/app/", server.base);
+        const METADATA: &str = "/app/.well-known/openid-configuration";
+        set(
+            METADATA,
+            "200 OK",
+            serde_json::json!({"issuer": issuer, "jwks_uri": format!("{}/keys", server.base)})
+                .to_string(),
+        );
+        set("/keys", "200 OK", jwks_body());
+        let mut cfg = oauth_config("");
+        cfg.issuer = issuer;
+        let v = OAuthValidator::build(&cfg, Duration::ZERO).unwrap();
+        assert_eq!(v.refresh_now().await.unwrap(), 1);
+        set(METADATA, "404 Not Found", "{}".into());
+        set("/keys", "404 Not Found", "{}".into());
+        assert_eq!(
+            v.refresh_now().await.unwrap_err().kind(),
+            RefreshErrorKind::Fetch
+        );
+        assert_eq!(
+            v.refresh_now().await.unwrap_err().kind(),
+            RefreshErrorKind::Discovery
+        );
+        assert_eq!(v.key_set_status().keys, 1);
+        assert!(v.is_ready());
     }
 }
