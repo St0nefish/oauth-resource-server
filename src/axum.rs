@@ -152,17 +152,29 @@
 //!
 //! The layer logs every outcome itself, so applications need not (target
 //! `oauth_resource_server::axum`): an accepted OAuth token at `debug` (principal,
-//! subject, scopes — never the token); a request with no credential at `debug`
+//! subject, scopes — never the token); an accepted static token at `debug`
+//! (its label, never the token); a request with no credential at `debug`
 //! when OAuth is configured, since every OAuth client's first request looks like
 //! that; a request with no credential passed through by an
 //! [`optional`](AuthLayerBuilder::optional) layer at `debug`; any other refusal
 //! at `warn`, with the reason when OAuth is configured. The reason goes to the
 //! log only, never to the caller. The extractors log their refusals the same
-//! way. Three wiring mistakes are logged at `error`: an extractor on a route no
+//! way, and a [`Scoped`] extractor's insufficient scope at `info`. Three
+//! wiring mistakes are logged at `error`: an extractor on a route no
 //! [`AuthLayer`] covers (500), a required extractor behind an
 //! [`allow_unauthenticated`](AuthLayer::allow_unauthenticated) layer, and an
 //! [`AuthorizedToken`] extractor behind a layer with no OAuth validator (both
 //! a 401 no credential can ever satisfy).
+//!
+//! Every one of these events (the extractors' included) also
+//! carries the stable, low-cardinality fields `auth.outcome` (`accepted`,
+//! `rejected`, `passed_through`), `auth.mechanism` (`static`, `oauth`,
+//! `none`) and, on a refusal, `auth.reason` (an `InvalidTokenKind` label,
+//! `missing`, `insufficient_scope` or `misconfigured`) and `auth.status`
+//! (401, 403 or 500); an accepted labeled static token adds
+//! `auth.static_label`. Unlike the message text, their names and values are
+//! covered by semver — the README's "Observability" section lists them all,
+//! with the spans and the `metrics` feature's counters.
 
 use std::future::Future;
 use std::pin::Pin;
@@ -179,20 +191,26 @@ use ::axum::routing::{any, get};
 use http::header::WWW_AUTHENTICATE;
 use http::request::Parts;
 use http::{HeaderValue, Method, StatusCode};
-use tracing::{debug, error, info, warn};
+use tracing::{error, info};
 use zeroize::Zeroizing;
 
 use crate::authenticate::{Credential, StaticTokenMatch, StaticTokens};
 use crate::challenge::PROTECTED_RESOURCE_METADATA_PREFIX;
 use crate::policy::StaticTokenDecision;
-use crate::token::{AuthorizedToken, InvalidTokenKind, TokenRejection, for_log};
+use crate::token::{AuthorizedToken, InvalidTokenKind, TokenRejection};
 use crate::validator::OAuthValidator;
 
-use crate::http_layer::{Admission, Gate, GateRan, RefusalBody};
+use crate::http_layer::{
+    Admission, Gate, GateRan, RefusalBody, log_layer_refusal, log_oauth_accepted,
+    log_passed_through, log_static_accepted,
+};
 #[doc(inline)]
 pub use crate::http_layer::{
     AuthLayerError, CredentialSource, InvalidScope, RejectContext, RequireScopes,
     RequireScopesService,
+};
+use crate::observe::{
+    self, Mechanism, Outcome, REASON_MISCONFIGURED, REASON_NONE, Stage, count_request,
 };
 pub use crate::refusal::DEFAULT_STATIC_CHALLENGE;
 // What the test module (`use super::*`) used from here before these moved to
@@ -843,14 +861,31 @@ impl Enforce {
     fn refuse_scoped(&self, request: &Parts, required: &[String]) -> Response {
         let path = request.uri.path();
         let rejection = TokenRejection::InsufficientScope;
+        let mechanism = Mechanism::of_request(request.extensions.get::<Credential>(), &rejection);
         if self.gate.oauth.is_none() {
+            count_request(
+                Stage::Handler,
+                Outcome::Rejected,
+                mechanism,
+                REASON_MISCONFIGURED,
+            );
             error!(
                 path = %path,
                 required = ?required,
+                auth.outcome = Outcome::Rejected.as_str(),
+                auth.mechanism = mechanism.as_str(),
+                auth.reason = REASON_MISCONFIGURED,
+                auth.status = 403u16,
                 "Server misconfiguration: the handler requires scopes, but its AuthLayer has no \
                  OAuth validator, so no credential can carry them; refusing the request"
             );
         } else {
+            count_request(
+                Stage::Handler,
+                Outcome::Rejected,
+                mechanism,
+                observe::reason(&rejection),
+            );
             let present = match request.extensions.get::<Credential>() {
                 Some(Credential::OAuth(token)) => token.scopes.clone(),
                 _ => Vec::new(),
@@ -859,6 +894,10 @@ impl Enforce {
                 path = %path,
                 required = ?required,
                 present = ?present,
+                auth.outcome = Outcome::Rejected.as_str(),
+                auth.mechanism = mechanism.as_str(),
+                auth.reason = observe::reason(&rejection),
+                auth.status = 403u16,
                 "The credential lacks the scopes this handler requires"
             );
         }
@@ -867,23 +906,21 @@ impl Enforce {
         self.reject_with(&rejection, request, insufficient.as_ref())
     }
 
-    /// Log a refusal at the level the [module docs](self#logging) give, then
-    /// build its response with [`Enforce::reject`]. Every refusal — the
-    /// layer's own and an extractor's — goes through here.
-    fn refuse(&self, rejection: &TokenRejection, request: &Parts) -> Response {
-        let path = request.uri.path();
-        match (&self.gate.oauth, rejection) {
-            (None, _) => warn!(path = %path, "Bearer auth rejected"),
-            // Every OAuth client's first request carries no credential
-            // (401 → read `resource_metadata` → authorize), so it is not
-            // worth a warning.
-            (Some(_), TokenRejection::Missing) => {
-                debug!(path = %path, "No bearer credential presented");
-            }
-            (Some(_), _) => {
-                warn!(path = %path, reason = ?rejection, "OAuth bearer auth rejected");
-            }
-        }
+    /// Log a refusal at the level the [module docs](self#logging) give (with
+    /// `mechanism` as `auth.mechanism`), then build its response with
+    /// [`Enforce::reject`]. Every refusal — the layer's own and an
+    /// extractor's — goes through here.
+    fn refuse(
+        &self,
+        rejection: &TokenRejection,
+        request: &Parts,
+        mechanism: Mechanism,
+        stage: Stage,
+    ) -> Response {
+        // Every OAuth client's first request carries no credential (401 →
+        // read `resource_metadata` → authorize), so it is logged at `debug`,
+        // not as a warning.
+        log_layer_refusal!(&self.gate, request, rejection, mechanism, stage);
         self.reject(rejection, request)
     }
 }
@@ -941,6 +978,12 @@ impl AuthLayer {
     async fn check(&self, mut request: Request) -> Result<Request, Response> {
         let enforce = match &*self.inner {
             Mode::AllowUnauthenticated => {
+                count_request(
+                    Stage::Layer,
+                    Outcome::PassedThrough,
+                    Mechanism::None,
+                    REASON_NONE,
+                );
                 // Inside another axum layer, leave its `LayerRan` in place,
                 // exactly as `mark` leaves its `GateRan`: the extractors and
                 // the route-level checks then refuse with the same (outer)
@@ -962,23 +1005,12 @@ impl AuthLayer {
         // and decide an optional layer's pass-through. Logging stays here, so
         // its target stays `oauth_resource_server::axum`.
         match enforce.gate.admit(&mut parts).await {
-            Admission::Static => {}
-            Admission::OAuth(token) => {
-                debug!(
-                    path = %parts.uri.path(),
-                    principal = ?token.principal.as_deref().map(for_log),
-                    subject = ?token.subject.as_deref().map(for_log),
-                    scopes = ?token.scopes,
-                    "OAuth bearer auth accepted"
-                );
+            Admission::Static => log_static_accepted!(&parts),
+            Admission::OAuth(token) => log_oauth_accepted!(&parts, &token),
+            Admission::PassedThrough => log_passed_through!(&parts),
+            Admission::Refused(rejection, mechanism) => {
+                return Err(enforce.refuse(&rejection, &parts, mechanism, Stage::Layer));
             }
-            Admission::PassedThrough => {
-                debug!(
-                    path = %parts.uri.path(),
-                    "No credential presented; optional auth passes the request through"
-                );
-            }
-            Admission::Refused(rejection) => return Err(enforce.refuse(&rejection, &parts)),
         }
         parts.extensions.insert(LayerRan(self.clone()));
         self.mark(&mut parts.extensions);
@@ -1002,12 +1034,26 @@ impl AuthLayer {
         parts: &Parts,
         wants: Wants,
     ) -> Response {
+        let mechanism = Mechanism::of_request(parts.extensions.get::<Credential>(), rejection);
+        let misconfigured = || {
+            count_request(
+                Stage::Handler,
+                Outcome::Rejected,
+                mechanism,
+                REASON_MISCONFIGURED,
+            )
+        };
         match &*self.inner {
             Mode::Enforce(enforce)
                 if wants == Wants::OAuthToken && enforce.gate.oauth.is_none() =>
             {
+                misconfigured();
                 error!(
                     path = %parts.uri.path(),
+                    auth.outcome = Outcome::Rejected.as_str(),
+                    auth.mechanism = mechanism.as_str(),
+                    auth.reason = REASON_MISCONFIGURED,
+                    auth.status = observe::status(rejection),
                     "Server misconfiguration: the handler requires an OAuth access token, but \
                      its AuthLayer has no OAuth validator; refusing the request"
                 );
@@ -1016,19 +1062,29 @@ impl AuthLayer {
             Mode::Enforce(enforce)
                 if wants == Wants::StaticToken && enforce.gate.static_tokens.is_none() =>
             {
+                misconfigured();
                 error!(
                     path = %parts.uri.path(),
+                    auth.outcome = Outcome::Rejected.as_str(),
+                    auth.mechanism = mechanism.as_str(),
+                    auth.reason = REASON_MISCONFIGURED,
+                    auth.status = observe::status(rejection),
                     "Server misconfiguration: the handler requires a static token, but its \
                      AuthLayer has no static token; refusing the request"
                 );
                 enforce.reject(rejection, parts)
             }
-            Mode::Enforce(enforce) => enforce.refuse(rejection, parts),
+            Mode::Enforce(enforce) => enforce.refuse(rejection, parts, mechanism, Stage::Handler),
             // No challenge of its own to send: the default one, as a
             // static-only layer would (RFC 9110 §15.5.2).
             Mode::AllowUnauthenticated => {
+                misconfigured();
                 error!(
                     path = %parts.uri.path(),
+                    auth.outcome = Outcome::Rejected.as_str(),
+                    auth.mechanism = mechanism.as_str(),
+                    auth.reason = REASON_MISCONFIGURED,
+                    auth.status = 401u16,
                     "Server misconfiguration: the handler requires a credential, but its \
                      AuthLayer allows unauthenticated requests; refusing the request"
                 );
@@ -1080,9 +1136,19 @@ fn find<T: Clone + Send + Sync + 'static>(parts: &Parts) -> Found<T> {
 /// The response for an extractor on a route no [`AuthLayer`] covers: 500, and
 /// an `error` log naming the mistake. Never access, never "anonymous".
 fn no_layer(parts: &Parts, extractor: &'static str) -> Response {
+    count_request(
+        Stage::Handler,
+        Outcome::Rejected,
+        Mechanism::None,
+        REASON_MISCONFIGURED,
+    );
     error!(
         path = %parts.uri.path(),
         extractor,
+        auth.outcome = Outcome::Rejected.as_str(),
+        auth.mechanism = Mechanism::None.as_str(),
+        auth.reason = REASON_MISCONFIGURED,
+        auth.status = 500u16,
         "Server misconfiguration: an authentication extractor ran on a route no AuthLayer \
          covers; refusing the request"
     );
@@ -1411,9 +1477,19 @@ impl<S: ScopeSet, St: Send + Sync> FromRequestParts<St> for Scoped<S> {
         // Unreachable after the check above; kept so the extractor never
         // proceeds on an unchecked set even if the check were removed.
         let Ok(required) = crate::http_layer::checked_scopes(S::SCOPES.iter().copied()) else {
+            count_request(
+                Stage::Handler,
+                Outcome::Rejected,
+                Mechanism::None,
+                REASON_MISCONFIGURED,
+            );
             error!(
                 path = %parts.uri.path(),
                 extractor = std::any::type_name::<S>(),
+                auth.outcome = Outcome::Rejected.as_str(),
+                auth.mechanism = Mechanism::None.as_str(),
+                auth.reason = REASON_MISCONFIGURED,
+                auth.status = 500u16,
                 "Server misconfiguration: a ScopeSet holds an entry that is not a valid scope, \
                  which no token can carry; refusing the request"
             );

@@ -58,6 +58,11 @@ axum = ["tower", "dep:axum"]
 # layer. Implies `tower`; reads request bodies with `http-body`/`bytes` and
 # parses them with `serde_json` — no MCP SDK dependency.
 mcp = ["tower", "dep:http-body", "dep:bytes"]
+# `observability` module and the counters/gauge it names: authentication
+# decisions and JWKS refreshes reported through the `metrics` facade
+# (oauth-resource-server#11). Off by default; without it the crate has no
+# `metrics` dependency and records nothing.
+metrics = ["dep:metrics"]
 # `testing` module: throwaway keys, token minting and a fake JWKS server for
 # CONSUMERS' TESTS. Never enable this in a production build.
 testing = ["tokio/net", "tokio/io-util"]
@@ -129,6 +134,9 @@ tower-service = { version = "0.3.3", optional = true }
 # `direct-minimal-versions` needs to resolve against axum's own floor.
 http-body = { version = "1", optional = true }
 bytes = { version = "1.2", optional = true }
+# The `metrics` feature: the facade only (no exporter, no recorder), so the
+# application picks its own. Nothing of it appears in a public signature.
+metrics = { version = "0.24", optional = true }
 
 [dev-dependencies]
 tokio = { version = "1", features = ["macros", "rt", "rt-multi-thread", "net", "io-util", "time", "sync", "test-util"] }
@@ -155,6 +163,9 @@ bytes = "1"
 # tests (`src/builder.rs`). Already in the tree through reqwest's rustls
 # backend; default features off so it adds `ring`, never `aws-lc-rs`.
 tokio-rustls = { version = "0.26", default-features = false, features = ["ring", "tls12"] }
+# `tests/observability_metrics.rs`: a recorder that keeps every value for
+# the assertions.
+metrics-util = { version = "0.20", default-features = false, features = ["debugging"] }
 
 # Each example names the features it needs, so `cargo build --examples` with
 # fewer features skips it rather than failing to compile it.

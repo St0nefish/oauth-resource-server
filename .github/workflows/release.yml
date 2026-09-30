@@ -320,6 +320,12 @@ jobs:
       - name: Clippy (rustls-tls-native-roots only)
         run: cargo clippy --all-targets --no-default-features --features rustls-tls-native-roots -- -D warnings
 
+      - name: Clippy (tower without axum)
+        run: cargo clippy --all-targets --no-default-features --features rustls-tls,tower -- -D warnings
+
+      - name: Clippy (metrics and mcp without axum)
+        run: cargo clippy --all-targets --no-default-features --features rustls-tls,metrics,mcp -- -D warnings
+
       - name: Tests (all features)
         run: cargo test --all-features
 

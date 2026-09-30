@@ -122,9 +122,11 @@
 //!
 //! Nothing from the body — tool name, arguments, identifiers — is ever
 //! logged; refusals are logged (target `oauth_resource_server::http_layer`,
-//! as for [`crate::http_layer::RequireScopes`]) with the request path and
-//! the configured scopes only. Oversized and unreadable bodies are logged at
-//! `warn` with the path and the limit.
+//! as for [`crate::http_layer::RequireScopes`], with the same stable
+//! `auth.*` fields) with the request path and the configured scopes only.
+//! Oversized and unreadable bodies are logged at `warn` with the path and
+//! the limit; those are not authentication decisions, so they carry no
+//! `auth.*` field and are not counted by the `metrics` feature.
 //!
 //! # Checking scopes in the tool handler instead
 //!

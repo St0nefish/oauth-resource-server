@@ -16,6 +16,8 @@ cargo clippy --all-targets --all-features -- -D warnings
 cargo clippy --all-targets -- -D warnings
 cargo clippy --all-targets --no-default-features --features native-tls -- -D warnings
 cargo clippy --all-targets --no-default-features --features rustls-tls-native-roots -- -D warnings
+cargo clippy --all-targets --no-default-features --features rustls-tls,tower -- -D warnings
+cargo clippy --all-targets --no-default-features --features rustls-tls,metrics,mcp -- -D warnings
 cargo test --all-features
 cargo test
 cargo test --doc --no-default-features --features rustls-tls,mcp   # doc examples without axum
@@ -48,10 +50,12 @@ cargo "+1.89" build --all-features --locked
 # with the latest release on crates.io)
 cargo +1.93 semver-checks check-release --all-features
 
-# feature-powerset: every feature combination builds (needs cargo-hack)
+# feature-powerset: every feature combination builds (needs cargo-hack;
+# `metrics` is toggled together with `testing`, see ci.yml)
 cargo hack check --feature-powerset --no-dev-deps \
   --mutually-exclusive-features rustls-tls,native-tls,rustls-tls-native-roots \
-  --at-least-one-of rustls-tls,native-tls,rustls-tls-native-roots
+  --at-least-one-of rustls-tls,native-tls,rustls-tls-native-roots \
+  --group-features metrics,testing
 
 # minimal-versions: every dependency lower bound in Cargo.toml really builds.
 # It rewrites Cargo.toml and Cargo.lock, so run it in a throwaway copy of the

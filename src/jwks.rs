@@ -23,10 +23,11 @@ use jsonwebtoken::DecodingKey;
 use jsonwebtoken::jwk::{Jwk, KeyOperations, PublicKeyUse};
 use serde_json::Value;
 use tokio::sync::{Mutex, OwnedMutexGuard, RwLock};
-use tracing::{debug, info, warn};
+use tracing::{Instrument, Span, debug, info, warn};
 
 use crate::algorithms::{Algorithm, key_algorithms, signing_algorithm};
 use crate::config::{KeyNamingBuf, ResolvedOAuthConfig};
+use crate::observe::record_field;
 use crate::token::{InvalidTokenKind, TokenRejection, describe_kid, for_log};
 use crate::validator::{
     is_canonical_url, parsed_plain_http_non_loopback, plain_http_non_loopback, url_is_loopback,
@@ -255,6 +256,20 @@ impl KeySetStatus {
 /// is then no telling where a credential in it might be. Never panics.
 pub(crate) fn redact_url(raw: &str) -> String {
     try_redact_url(raw).unwrap_or_else(|| "<unparseable URL, redacted>".to_string())
+}
+
+/// The host of `raw` alone, for a span field: [`redact_url`]'s parse, then
+/// nothing but the host (no scheme, port, path, userinfo, query or
+/// fragment, so nothing a credential could sit in), or its placeholder.
+pub(crate) fn jwks_host(raw: &str) -> String {
+    try_redact_url(raw)
+        .and_then(|shown| {
+            reqwest::Url::parse(&shown)
+                .ok()?
+                .host_str()
+                .map(str::to_owned)
+        })
+        .unwrap_or_else(|| redact_url(""))
 }
 
 /// A URL for a `Debug` impl: blank stays as given (an unset field), anything
@@ -555,6 +570,11 @@ impl Tracked {
 /// fetch that fills it.
 pub(crate) struct JwksStore {
     issuer: String,
+    /// The issuer's host alone ([`jwks_host`]): the `issuer_host` label of
+    /// the `metrics` feature's key-set metrics and the discovery span field.
+    /// Fixed by configuration, so its cardinality is the number of
+    /// validators, never anything a request controls.
+    issuer_host: String,
     /// See [`crate::OAuthConfig::allow_insecure_http`]: whether a discovered
     /// `jwks_uri` may be plain http on a non-loopback host.
     allow_insecure_http: bool,
@@ -607,8 +627,11 @@ impl JwksStore {
         tracked.set_jwks_uri(config.jwks_uri.clone().filter(|uri| !uri.trim().is_empty()));
         tracked.public.keys = seed.len();
         warn_about_new_ambiguous_keys(&[], &seed, &config.key_naming);
+        let issuer_host = jwks_host(&config.issuer);
+        crate::observe::set_keys(&issuer_host, seed.len());
         Self {
             issuer: config.issuer.clone(),
+            issuer_host,
             allow_insecure_http: config.allow_insecure_http,
             algorithms: config.algorithms.clone(),
             naming: config.key_naming.clone(),
@@ -674,10 +697,16 @@ impl JwksStore {
         // next number.
         let ours = self.status_fields().attempts + 1;
         let store = Arc::clone(self);
-        let task = tokio::spawn(async move {
-            let _refreshing = guard;
-            store.refresh().await
-        });
+        // `in_current_span`: the refresh's span is a child of the caller's
+        // (a request's `oauth_rs.validate`), so a trace shows what the request
+        // waited on. Tracing only; the task is detached exactly as before.
+        let task = tokio::spawn(
+            async move {
+                let _refreshing = guard;
+                store.refresh().await
+            }
+            .in_current_span(),
+        );
         task.await.unwrap_or_else(|e| {
             let err = RefreshError::new(
                 RefreshErrorKind::Fetch,
@@ -803,7 +832,33 @@ impl JwksStore {
     /// the network. Records the attempt time first, so a failure is backed off like
     /// a success, and leaves the old keys in place on any failure. The outcome is
     /// recorded in the status fields once it is known.
+    ///
+    /// Runs in an `info` span `oauth_rs.jwks_refresh` (target
+    /// `oauth_resource_server::jwks`) with `jwks.host` (the host alone, from
+    /// [`jwks_host`]), `result` (`success` or the [`RefreshErrorKind`] label)
+    /// and `keys` (held afterwards); feature `metrics` counts it in
+    /// `oauth_rs_jwks_refresh_total` and sets `oauth_rs_jwks_keys`.
     async fn refresh(&self) -> Result<usize, RefreshError> {
+        let span = tracing::info_span!(
+            "oauth_rs.jwks_refresh",
+            jwks.host = tracing::field::Empty,
+            result = tracing::field::Empty,
+            keys = tracing::field::Empty,
+        );
+        let result = self.refresh_in(&span).instrument(span.clone()).await;
+        let label = match &result {
+            Ok(_) => "success",
+            Err(e) => e.kind().as_str(),
+        };
+        let held = self.status_fields().public.keys;
+        record_field(&span, "result", label);
+        record_field(&span, "keys", held);
+        crate::observe::count_refresh(&self.issuer_host, label, held);
+        result
+    }
+
+    /// The body of [`JwksStore::refresh`].
+    async fn refresh_in(&self, span: &Span) -> Result<usize, RefreshError> {
         self.jwks.write().await.last_attempt = Some(Instant::now());
         let known_uri = {
             let mut status = self.status_fields();
@@ -811,7 +866,12 @@ impl JwksStore {
             status.public.last_attempt = Some(SystemTime::now());
             status.jwks_uri.clone()
         };
-        let result = self.load(known_uri).await;
+        if !span.is_disabled()
+            && let Some(uri) = known_uri.as_deref()
+        {
+            record_field(span, "jwks.host", jwks_host(uri).as_str());
+        }
+        let result = self.load(known_uri, span).await;
         let status = &mut self.status_fields().public;
         match &result {
             Ok(count) => {
@@ -826,11 +886,14 @@ impl JwksStore {
 
     /// Discover the JWKS URI if `known_uri` is `None`, then fetch the key set
     /// and swap it in: the body of [`JwksStore::refresh`].
-    async fn load(&self, known_uri: Option<String>) -> Result<usize, RefreshError> {
+    async fn load(&self, known_uri: Option<String>, span: &Span) -> Result<usize, RefreshError> {
         let jwks_uri = match known_uri {
             Some(uri) => uri,
             None => {
                 let uri = self.discover_jwks_uri().await?;
+                if !span.is_disabled() {
+                    record_field(span, "jwks.host", jwks_host(&uri).as_str());
+                }
                 info!(
                     issuer = %redact_url(&self.issuer),
                     jwks_uri = %redact_url(&uri),
@@ -873,7 +936,37 @@ impl JwksStore {
     /// §3.3, OIDC Discovery §4.3: a mismatching document MUST NOT be used), which is
     /// what stops a proxy or a misconfigured path from handing us some other
     /// server's keys.
+    ///
+    /// Runs in an `info` span `oauth_rs.jwks_discovery` with `issuer.host`
+    /// and, once found, `jwks.host` (hosts alone, from [`jwks_host`]), and
+    /// `result` (`success` or `discovery`).
     async fn discover_jwks_uri(&self) -> Result<String, RefreshError> {
+        let span = tracing::info_span!(
+            "oauth_rs.jwks_discovery",
+            issuer.host = tracing::field::Empty,
+            jwks.host = tracing::field::Empty,
+            result = tracing::field::Empty,
+        );
+        if !span.is_disabled() {
+            record_field(&span, "issuer.host", self.issuer_host.as_str());
+        }
+        let result = self.discover_in().instrument(span.clone()).await;
+        match &result {
+            Ok(uri) => {
+                if !span.is_disabled() {
+                    record_field(&span, "jwks.host", jwks_host(uri).as_str());
+                }
+                record_field(&span, "result", "success");
+            }
+            Err(e) => {
+                record_field(&span, "result", e.kind().as_str());
+            }
+        }
+        result
+    }
+
+    /// The body of [`JwksStore::discover_jwks_uri`].
+    async fn discover_in(&self) -> Result<String, RefreshError> {
         let issuer_key = self.naming.key("issuer");
         let mut errors = Vec::new();
         for url in discovery_urls(&self.issuer) {

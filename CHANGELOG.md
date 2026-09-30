@@ -121,6 +121,38 @@ response body are byte-for-byte what 0.1 sent.
 
 ### Added
 
+- Observability (oauth-resource-server#11), all additive: no message text,
+  log level, response or public signature changes.
+  - Every auth-outcome log event of both layers, `RequireScopes`,
+    `McpToolScopes` and the axum extractors carries stable, low-cardinality
+    fields next to its existing ones: `auth.outcome` (`accepted`,
+    `rejected`, `passed_through`), `auth.mechanism` (`static`, `oauth`,
+    `none`), and on a refusal `auth.reason` (an `InvalidTokenKind` label,
+    `missing`, `insufficient_scope`, or `misconfigured` for the
+    `error`-level wiring mistakes) and `auth.status` (401, 403, 500). An
+    accepted static token is now logged too, at `debug`
+    (`Static bearer auth accepted`), with `auth.static_label` for a labeled
+    entry.
+  - Tracing spans: `oauth_rs.validate` and `oauth_rs.validate_cached`
+    (`debug`; the unverified header's `kid` and `alg`, cut to 128
+    characters with anything outside printable ASCII escaped — the raw
+    strings when the header cannot be parsed — and the outcome), `oauth_rs.jwks_refresh` and `oauth_rs.jwks_discovery`
+    (`info`; the JWKS/issuer host only, the result, the keys held). A
+    refresh a request triggers is a child of that request's span. A
+    disabled span formats and allocates nothing.
+  - A `metrics` feature (off by default; the `metrics` 0.24 facade, MSRV
+    1.71.1): counters
+    `oauth_rs_requests_total{stage, outcome, mechanism, reason}` (one per
+    decision; `stage` is `layer`, `route` or `handler`) and
+    `oauth_rs_jwks_refresh_total{issuer_host, result}`, and a gauge
+    `oauth_rs_jwks_keys{issuer_host}` (set at construction too, so seeded
+    keys show), named in the new `observability` module
+    (`describe_metrics()` registers HELP text and units). `issuer_host` is
+    the configured issuer's host, one value per validator. Without the
+    feature there is no new dependency.
+  - The field, span and metric names and their values are covered by
+    semver (the README's new "Observability" section lists them all);
+    message text still is not.
 - Per-route and per-operation scope requirements, with a 403 challenge per
   request (oauth-resource-server#4, including the typed per-handler scope
   extractor deferred from oauth-resource-server#8). All additive: no
@@ -535,7 +567,13 @@ response body are byte-for-byte what 0.1 sent.
   the per-scope work: `scope_challenge` (the per-request challenge on
   arbitrary scopes and descriptions) and `mcp_tool_calls` (the `mcp`
   feature's JSON-RPC classification, against `serde_json::Value` as an
-  oracle). The `feature-powerset` job now also covers `mcp`.
+  oracle). The `feature-powerset` job now also covers `mcp`, and `metrics`
+  grouped with `testing` (`--group-features metrics,testing`: neither has a
+  `cfg` touching the other, so this keeps 160 builds instead of 320). Two
+  clippy runs were added to `checks` and `verify`,
+  `--no-default-features --features rustls-tls,tower` and
+  `rustls-tls,metrics,mcp`, after a dead-code warning shipped in every
+  `tower`-only build (`all_scope_tokens`, now `cfg(feature = "axum")`).
 
 ## [0.1.2] - 2026-09-28
 
