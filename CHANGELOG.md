@@ -8,6 +8,8 @@ Before 1.0, a breaking change increments the minor version.
 
 ## [Unreleased]
 
+## [0.2.0] - 2026-09-29
+
 ### Breaking changes (0.2.0)
 
 This is the 0.2.0 breaking batch. **Upgrading from 0.1.x:** change your
@@ -867,7 +869,8 @@ MSRV: Rust 1.89. License: MIT.
   resource on a non-loopback host needs `<PREFIX>ALLOW_INSECURE_HTTP=true`
   (`allow_insecure_http`).
 
-[Unreleased]: https://github.com/St0nefish/oauth-resource-server/compare/v0.1.2...HEAD
+[Unreleased]: https://github.com/St0nefish/oauth-resource-server/compare/v0.2.0...HEAD
+[0.2.0]: https://github.com/St0nefish/oauth-resource-server/compare/v0.1.2...v0.2.0
 [0.1.2]: https://github.com/St0nefish/oauth-resource-server/compare/v0.1.1...v0.1.2
 [0.1.1]: https://github.com/St0nefish/oauth-resource-server/compare/v0.1.0...v0.1.1
 [0.1.0]: https://github.com/St0nefish/oauth-resource-server/releases/tag/v0.1.0
