@@ -925,8 +925,8 @@ The flow:
   against `reqwest`'s and `axum`'s own minimums. None is an exhaustive search
   for the oldest working release; a new dependency or bound that regresses
   fails this job.
-- `.github/workflows/fuzz.yml` (nightly `schedule` plus `workflow_dispatch`,
-  never a PR or push trigger, GitHub-hosted) runs each `fuzz/` cargo-fuzz
+- `.github/workflows/fuzz.yml` (a `push` to `master` touching `src/`, `fuzz/` or the manifests, plus `workflow_dispatch`;
+  never a PR trigger or a schedule, GitHub-hosted) runs each `fuzz/` cargo-fuzz
   target for a bounded time. The targets call `src/__fuzz.rs`, a
   `#[doc(hidden)] pub mod __fuzz` that exists only under `--cfg fuzzing`
   (which cargo-fuzz sets), so the internals it reaches are never public API;
@@ -1085,7 +1085,7 @@ cargo update -p time
 cargo build --all-features
 ```
 
-Fuzzing is not part of the PR matrix (`fuzz.yml` runs it nightly). To run a
+Fuzzing is not part of the PR matrix (`fuzz.yml` runs it after each merge to `master`). To run a
 target locally: `cargo install --locked cargo-fuzz`, then
 `cargo +nightly fuzz run <target> -- -max_total_time=30` (targets:
 `bearer_credential`, `check_header`, `extract_claims`, `metadata_urls`,
