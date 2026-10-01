@@ -90,7 +90,10 @@ jobs:
       - name: Install cargo-fuzz
         # Pinned and --locked. taiki-e/install-action has no cargo-fuzz
         # manifest, so this builds it from crates.io, once per cache miss.
-        run: command -v cargo-fuzz || cargo install --locked --version 0.13.2 cargo-fuzz
+        # Built with nightly too: a bare `cargo` resolves to
+        # rust-toolchain.toml's MSRV pin, which cargo-fuzz's locked
+        # dependencies outgrew.
+        run: command -v cargo-fuzz || cargo +nightly install --locked --version 0.13.2 cargo-fuzz
 
       - name: Restore the target's corpus
         # Inputs found by earlier runs, so each night starts where the last
