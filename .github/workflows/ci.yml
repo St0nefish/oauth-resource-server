@@ -20,7 +20,8 @@ name: CI
 # accepted, knowing the runner mounts the host docker socket, so such code
 # can reach the host beyond its own ephemeral container. The mitigation is
 # that nothing secret lives on that runner: these jobs hold only a read-only
-# token, and release.yml's publish job runs on a GitHub-hosted runner.
+# token, and the jobs that hold a write credential — `release-on-bump` below
+# and release.yml's `publish` — run on GitHub-hosted runners.
 # `ci-pass` is a pure result check and stays on a GitHub-hosted runner.
 #
 # `checks` builds once with the toolchain pinned in `rust-toolchain.toml`
@@ -69,9 +70,21 @@ name: CI
 # two PRs each green against an older base can still combine into a broken
 # `master`; re-running the full gate on every push to `master` catches that
 # immediately. There is deliberately no separate `post-merge.yml` — this
-# workflow already is one, and a second would only duplicate the build. A
-# merge runs this workflow and nothing else: publishing happens only when the
-# maintainer publishes a GitHub release (see `release.yml`).
+# workflow already is one, and a second would only duplicate the build.
+#
+# Bump-is-release: a merged PR that changes Cargo.toml's `[package] version` is
+# the release. On a `push` run only, `release-on-bump` waits for all five heavy
+# jobs to succeed on that commit, then (`.github/scripts/release-on-bump.sh`)
+# creates GitHub release `vX.Y.Z` at it with the auto-merge App's token, which
+# is what starts `release.yml`. Every other commit, and a pre-release version,
+# releases nothing; a bump whose CHANGELOG.md has no non-empty `## [X.Y.Z]`
+# section fails the job instead of creating a release `release.yml` would
+# refuse. It lives here because this run already is the post-merge
+# verification and a `needs:` cannot reach across workflows. It is not in
+# `ci-pass`'s `needs:` (it never runs on a PR), and it runs on a GitHub-hosted
+# runner, never the self-hosted one: it holds a `contents: write` App token,
+# and the self-hosted runner runs unreviewed Dependabot code with the host
+# docker socket mounted.
 #
 # Every action is pinned to a full commit SHA, with the release it
 # corresponds to in a trailing comment (dtolnay/rust-toolchain publishes no
@@ -83,17 +96,21 @@ on:
   push:
     branches: [master]
 
-# Least-privilege default for every job; no job here needs to write anything.
+# Least-privilege default for every job. Only `release-on-bump` writes
+# anything, and it does so with its own App token, not this one.
 permissions:
   contents: read
 
 # PR runs and post-merge runs live in separate groups. A PR's group is keyed
-# by its number and cancels a superseded run of the same PR. Post-merge runs
-# share one constant group and never cancel a run that has started. GitHub
-# still replaces a *pending* post-merge run when a newer push queues behind
-# it; the newer run checks a tree that contains the replaced one's commit.
+# by its number and cancels a superseded run of the same PR. A post-merge run's
+# group is keyed by its commit and is never cancelled: with one shared group,
+# GitHub replaced a *pending* post-merge run when a newer push queued behind
+# it, and a version-bump commit whose run vanished that way would never reach
+# `release-on-bump` (which compares that commit with its own first parent, so
+# a later commit's run cannot release it). Re-runs of one commit still
+# serialize with each other.
 concurrency:
-  group: ${{ github.event_name == 'pull_request' && format('ci-pr-{0}', github.event.pull_request.number) || 'ci-master' }}
+  group: ${{ github.event_name == 'pull_request' && format('ci-pr-{0}', github.event.pull_request.number) || format('ci-master-{0}', github.sha) }}
   cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
 jobs:
@@ -227,8 +244,8 @@ jobs:
       - name: cargo publish --dry-run
         # Packages and verifies the crate (metadata, `include` list, doc
         # build inside the package) without uploading anything. This never
-        # touches crates.io; only `release.yml`, when the maintainer
-        # publishes a GitHub release, does that.
+        # touches crates.io; only `release.yml`, started by a published
+        # GitHub release, does that.
         run: cargo publish --dry-run
 
   msrv:
@@ -498,3 +515,48 @@ jobs:
             exit 1
           fi
           echo "all required checks passed"
+
+  # Bump-is-release (see the header): creates release vX.Y.Z when this master
+  # commit changed Cargo.toml's version, which starts release.yml. Push runs
+  # only, and only when every heavy job succeeded on this commit (an `if:`
+  # without a status function keeps the implicit `success()`). Not in
+  # `ci-pass`'s `needs:`. GitHub-hosted, never self-hosted: it holds a
+  # `contents: write` App token. The repository check keeps a fork's own
+  # push runs (which have no App credentials) from trying to release.
+  release-on-bump:
+    needs: [checks, msrv, semver, feature-powerset, minimal-versions]
+    if: github.event_name == 'push' && github.repository == 'St0nefish/oauth-resource-server'
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      contents: read
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          # The commit and its first parent, to compare their versions.
+          fetch-depth: 2
+          # The persisted credential is this job's read-only GITHUB_TOKEN
+          # (checkout runs before the App token exists), for `git ls-remote`
+          # to list the tags. The App token is only ever passed to the
+          # script's `gh` through GH_TOKEN, never written to git config.
+          persist-credentials: true
+
+      # An App installation token, never GITHUB_TOKEN: GitHub starts no
+      # workflow run for a release GITHUB_TOKEN creates (release.yml would
+      # never run), and the `v*` tag ruleset refuses it the tag. The App is a
+      # bypass actor on that ruleset and in release.yml's RELEASE_SENDERS.
+      # Minted only here, narrowed to `contents: write`.
+      - name: Generate App token
+        id: app-token
+        uses: actions/create-github-app-token@bcd2ba49218906704ab6c1aa796996da409d3eb1 # v3.2.0
+        with:
+          client-id: ${{ vars.APP_CLIENT_ID }}
+          private-key: ${{ secrets.APP_PRIVATE_KEY }}
+          permission-contents: write
+
+      - name: Create the release if this commit bumped the version
+        env:
+          COMMIT: ${{ github.sha }}
+          GH_TOKEN: ${{ steps.app-token.outputs.token }}
+        run: .github/scripts/release-on-bump.sh
