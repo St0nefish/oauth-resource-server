@@ -868,7 +868,8 @@ from, and never a local plan/review label ("chunk p2", "round one").
 
 ## Workflow
 
-**pr-manual-release** (CI-gated PRs, release on demand) on GitHub, `master` as the default branch. The
+**pr-manual-release** (CI-gated PRs; an ordinary merge ships nothing, and a
+merged version bump is the release — bump-is-release) on GitHub, `master` as the default branch. The
 repository settings below are configured on GitHub, not tracked in this tree,
 so they are maintainer-owned configuration rather than something a change in
 this repo can alter directly — treat them as always-in-effect policy:
@@ -887,11 +888,13 @@ this repo can alter directly — treat them as always-in-effect policy:
   there. That is accepted even though the runner mounts the host docker
   socket, so such code can reach the host beyond its own ephemeral
   container: nothing secret lives on that runner (CI jobs hold only a
-  read-only token), and the job that can mint a crates.io token never runs
-  there (see Release process).
-- A GitHub App's Client ID (`APP_CLIENT_ID` repo variable) and private key
-  (`APP_PRIVATE_KEY` repo secret) are what `auto-merge.yml` authenticates
-  with. The App deliberately lacks the `workflows` permission. A PR that
+  read-only token), and neither the job that can mint a crates.io token nor
+  `ci.yml`'s `release-on-bump` (which holds a `contents: write` App token)
+  ever runs there (see Release process).
+- A GitHub App (`stonefish-ci`, bot login `st0nefish-ci[bot]`): its Client ID
+  (`APP_CLIENT_ID` repo variable) and private key (`APP_PRIVATE_KEY` repo
+  secret) are what `auto-merge.yml` and `ci.yml`'s `release-on-bump`
+  authenticate with. The App deliberately lacks the `workflows` permission. A PR that
   changes a file under `.github/workflows/` still auto-merges when its
   branch contains master's current version of those files; when master has
   changed one of them since the branch was cut, the auto-merge job fails
@@ -901,8 +904,9 @@ this repo can alter directly — treat them as always-in-effect policy:
   `v*` tags, which `release.yml`'s `publish` job runs in; crates.io trusted
   publishing is bound to it.
 - A tag ruleset on `refs/tags/v*` that lets only repository admins (the
-  owner) create, move or delete a release tag. `GITHUB_TOKEN` and the
-  auto-merge App cannot, so no workflow may ever create a tag.
+  owner) and the App (a bypass actor) create, move or delete a release tag.
+  `GITHUB_TOKEN` cannot, so the only workflow that may ever create a tag is
+  `release-on-bump`, with the App token, through `gh release create`.
 - Every action in `.github/workflows/` is pinned to a full commit SHA with
   its release in a trailing `# vX.Y.Z` comment (`dtolnay/rust-toolchain`,
   which has no releases, to a commit of its `master` branch). Keep it that
@@ -972,31 +976,63 @@ The flow:
   re-check, catching two PRs that were each green against an older `master`
   but break once combined; there is deliberately no separate
   `post-merge.yml`. It is not a required check (it runs after the merge).
+  Its concurrency group is per commit (`ci-master-<sha>`), never cancelled:
+  a single shared group let GitHub replace a pending post-merge run when a
+  newer push queued behind it, and a bump commit whose run vanished would
+  never be released. That push run is also where the release starts: a
+  sixth job, `release-on-bump` (push runs only, `needs:` all five heavy
+  jobs, not in `ci-pass`'s `needs`, GitHub-hosted), runs
+  `.github/scripts/release-on-bump.sh` — see Release process.
 - Don't rebase an open PR just because `master` moved; refresh a branch only
   to resolve a real conflict.
 
 ## Release process
 
-- **A merge never publishes.** Publishing happens only when the owner
-  publishes a GitHub release: `.github/workflows/release.yml` triggers on
-  `release: published` and nothing else (no push or manual trigger). The
-  guarantee is that the owner must do both halves: create the `v*` tag (the
-  tag ruleset allows only admins) and publish the release (`check` fails
-  unless `github.event.sender.login` is `St0nefish` — needed because a
-  release published with a GitHub App installation token *does* start
-  workflow runs, and the auto-merge App has `contents: write`, so it could
-  otherwise publish a release on an existing, unpublished `v*` tag). A
-  release created with `GITHUB_TOKEN` starts no workflow run at all. A
-  prerelease publishes too (a `X.Y.Z-rc.N` version, which Cargo never
-  selects unless asked for). `check` (GitHub-hosted, read-only) checks out
-  the tagged commit (the event's `github.sha`, confirmed against the tag)
-  and fails closed unless the sender is the owner, the tag is `v<version>`
-  for `Cargo.toml`'s version at that commit, the commit is an ancestor of
-  `master` (a mistake check, not a security boundary: the run uses the
-  workflow file at the tagged commit), crates.io answers `404` for the version
-  (`200` fails the first attempt — the release is for an already-published
-  version; any other answer always fails), and `CHANGELOG.md` has a
-  non-empty `## [X.Y.Z]` section. Then `verify`, `msrv` and `semver`
+- **A merged version bump is the release; any other merge publishes
+  nothing.** `ci.yml`'s `release-on-bump` job (push runs on `master` only,
+  after all five heavy jobs succeeded on that commit, on `ubuntu-latest`,
+  `contents: read` plus an App token minted in that job alone with
+  `permission-contents: write`) runs `.github/scripts/release-on-bump.sh`,
+  which creates release `vX.Y.Z` with
+  `gh release create vX.Y.Z --target <full sha> --title vX.Y.Z --generate-notes`
+  only when: `COMMIT` has a first parent; its `[package] version` differs
+  from the first parent's; the version is stable `X.Y.Z` (a pre-release is
+  logged and skipped — those stay owner-published by hand); no `vX.Y.Z` tag
+  exists on origin; and `vX.Y.Z` would be the highest stable `v*` tag
+  (`.github/scripts/highest-release-tag.sh`). Otherwise it logs why and
+  passes. It **fails**, creating nothing, on a version that is not semver,
+  on a missing token, and on a bump whose `CHANGELOG.md` has no non-empty
+  `## [X.Y.Z]` section (`.github/scripts/changelog-section.sh`, the same
+  extraction `check` and `release-notes` use) — never create a release
+  `check` will refuse. `DRY_RUN=1` runs every check and prints the command
+  instead. There is no `repository`-field guard (the template it was adapted
+  from has one for uninitialised template copies); the job's `if:` pins
+  `github.repository` instead, so a fork's push runs never try to release.
+  `.github/workflows/release.yml` triggers on `release: published` and
+  nothing else (no push or manual trigger). The App's release starts it
+  because a release created with a GitHub App installation token *does*
+  start workflow runs; one created with `GITHUB_TOKEN` starts none.
+  **The tradeoff, accepted deliberately:** release authority is now "can get
+  a version bump merged to `master`" — the owner, plus anything that can act
+  as the App — not "is the owner". What the App can release is constrained
+  by `check`, not by who it is. `check` (GitHub-hosted, read-only) checks
+  out the tagged commit (the event's `github.sha`, confirmed against the
+  tag) and fails closed unless the sender is in `RELEASE_SENDERS`
+  (`St0nefish st0nefish-ci[bot]`), the release is not a draft, a
+  pre-release (the event's flag, or a tag with a `-pre` suffix) comes from
+  `St0nefish` only, the tag matches
+  `^v[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z.-]+)?$` and `GITHUB_REF` is
+  `refs/tags/<tag>`, the tag is `v<version>` for `Cargo.toml`'s version at
+  that commit, the commit is an ancestor of `master` (a mistake check, not
+  a security boundary: the run uses the workflow file at the tagged
+  commit), a stable tag is the highest stable `v*` tag on origin
+  (`.github/scripts/require-highest-tag.sh`, `git ls-remote`, fail closed —
+  which also means a backport release of an older minor line is refused),
+  crates.io answers `404` for the version (`200` fails the first attempt —
+  the release is for an already-published version; any other answer always
+  fails), and `CHANGELOG.md` has a non-empty `## [X.Y.Z]` section. An
+  owner-published pre-release (`X.Y.Z-rc.N`, which Cargo never selects
+  unless asked for) publishes too. Then `verify`, `msrv` and `semver`
   (self-hosted, read-only, no OIDC permission) repeat `ci.yml`'s `checks`,
   `msrv` and `semver` jobs step for step — keep the lists in step
   (`feature-powerset` and `minimal-versions` are not repeated: they ran on
@@ -1005,25 +1041,39 @@ The flow:
   `publish`
   (GitHub-hosted, in the `release` environment, the only job with
   `id-token: write`, running nothing but checkout, toolchain, auth and
-  publish, with no restored cache) re-checks crates.io, then authenticates
+  publish, with no restored cache) re-checks crates.io, re-runs
+  `require-highest-tag.sh` for a stable tag (plain git/coreutils from the
+  tagged commit, no build tooling, placed just before authentication so a
+  refusal never mints a token), then authenticates
   via `rust-lang/crates-io-auth-action` (a short-lived OIDC-exchanged token;
   no long-lived token secret is ever stored in this repo) and runs
   `cargo publish`; and `release-notes` (`contents: write` with
   `GITHUB_TOKEN`) replaces the release's notes with that CHANGELOG section
-  via `gh release edit`. No job creates or moves a tag. Keep build
-  scripts, proc macros and dev-dependencies out of the job that can mint the
-  token, and keep that job off the self-hosted runner, which has its host's
-  Docker daemon socket mounted and runs unreviewed Dependabot code.
-- **To cut a release**: (1) merge a PR that bumps `version` in `Cargo.toml`
-  (and `Cargo.lock`) — unless a breaking PR already bumped it, which the
-  `semver` job requires — and moves `CHANGELOG.md`'s `[Unreleased]` entries under
-  `## [X.Y.Z] - <date>` (plus the link references at the bottom) — merging
-  it publishes nothing; (2) the owner runs
-  `gh release create vX.Y.Z --target <sha of the bump commit> --title vX.Y.Z --notes "..."`
-  (or uses the web UI), which creates the tag and starts `release.yml`.
-  Target the bump commit's SHA, not `master`: with `--target master`,
-  anything merged after the bump would ride along into the release without
-  a CHANGELOG entry.
+  via `gh release edit`. No job in `release.yml` creates or moves a tag.
+  Keep build scripts, proc macros and dev-dependencies out of the job that
+  can mint the token, and keep that job — and `release-on-bump`, which holds
+  a `contents: write` App token — off the self-hosted runner, which has its
+  host's Docker daemon socket mounted and runs unreviewed Dependabot code.
+- **To cut a release**: open a PR that bumps `version` in `Cargo.toml` and
+  `Cargo.lock` (`cargo release version minor --execute --no-confirm`, or
+  `patch`/`major`/`X.Y.Z`, or a hand edit of both) — unless a breaking PR
+  already bumped it, which the `semver` job requires — and moves
+  `CHANGELOG.md`'s `[Unreleased]` entries under `## [X.Y.Z] - <date>` (plus
+  the link references at the bottom). Merge it. That is the whole release:
+  the bump commit's post-merge CI run ends in `release-on-bump`, which
+  creates the release and starts `release.yml`.
+  **Manual fallback** (a pre-release, which `release-on-bump` never
+  creates, or a bump whose `release-on-bump` could not create the release
+  — re-run that job first if the failure was transient), as the owner, under
+  exactly the same `check`:
+  `gh release create vX.Y.Z --target <full sha of the bump commit> --title vX.Y.Z --generate-notes`
+  (add `--prerelease` for `X.Y.Z-pre`). Target the bump commit's full SHA,
+  not `master`: with `--target master`, anything merged after the bump
+  would ride along into the release without a CHANGELOG entry.
+- A bump with no CHANGELOG section fails `release-on-bump` and creates
+  nothing. Merge a fix adding the section (its version is unchanged, so
+  `release-on-bump` releases nothing for it), then release that fix commit
+  with the manual fallback.
 - A transient failure (crates.io outage, runner hiccup) is re-run with
   "re-run failed jobs" on that run: `publish` skips the upload and succeeds
   if an earlier attempt already made it, and `release-notes` just writes the
@@ -1031,23 +1081,26 @@ The flow:
 - A genuine `verify`/`msrv`/`semver` failure (the tagged commit is broken)
   cannot be fixed by a re-run, which repeats the same commit. Merge the fix,
   then as the owner delete the release and its tag
-  (`gh release delete vX.Y.Z --cleanup-tag`) and create the release again at
-  the new commit. Nothing was uploaded: `publish` needs all of them.
+  (`gh release delete vX.Y.Z --cleanup-tag`) and create the release by hand
+  at the fix commit (its version is unchanged, so `release-on-bump` will
+  not), or merge a fresh bump. Nothing was uploaded: `publish` needs all of
+  them.
 - `release.yml` must keep its filename, and `publish` must keep
   `environment: release`: crates.io trusted publishing is registered for
   this repository + `release.yml` + environment `release`. That
-  environment's policy (only `v*` tags), the tag ruleset (only admins create
-  `v*` tags) and the sender check together limit minting a publish token to
-  an owner-created, owner-published release.
-- There is no deploy-hold switch: nothing publishes until the owner
-  creates a release, so batching changes is only a matter of when to do
-  that.
+  environment's policy (only `v*` tags), the tag ruleset (only admins and
+  the App create `v*` tags) and the sender check together limit minting a
+  publish token to a release created by the owner or the App.
+- There is no deploy-hold switch: nothing publishes until a version bump
+  merges, so batching changes is only a matter of when to merge the bump.
 - **0.1.0 was published manually** with a personal crates.io API token,
   because crates.io only lets a trusted publisher be attached to a crate
   that already exists. Trusted publishing was configured after that (bound
   to environment `release`), and every later release goes through
   `release.yml`. 0.1.1 was published on merge by an earlier version of that
-  workflow; releases from 0.1.2 on are published from GitHub releases.
+  workflow; releases from 0.1.2 to 0.3.0 were published from GitHub
+  releases the owner created by hand; later stable releases are created by
+  `release-on-bump`.
 - **Repo setup**: private vulnerability reporting must be enabled —
   `gh api -X PUT repos/St0nefish/oauth-resource-server/private-vulnerability-reporting`
   (Settings → Code security → Private vulnerability reporting). It is off by

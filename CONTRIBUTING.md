@@ -155,19 +155,23 @@ This repository follows a simple trunk-based flow on `master`:
 You don't need to keep your branch up to date with `master` — CI re-runs on
 `master` after every merge. Rebase only if GitHub reports a conflict.
 
-Merging a PR never publishes anything. A release happens in two steps: a
-merged PR bumps `version` in `Cargo.toml` (unless a breaking PR already did,
-which `semver` requires) and adds the matching
-`CHANGELOG.md` section, and then the maintainer publishes a GitHub release
-`vX.Y.Z` targeting that bump commit's SHA (not `master`, so a later merge
-cannot ride along into the release without a CHANGELOG entry). Publishing
-the release is what runs `release.yml`, which verifies the tagged commit,
+An ordinary merge publishes nothing. **A merged PR that changes `version` in
+`Cargo.toml` is the release** (bump-is-release): the bump PR changes
+`Cargo.toml` and `Cargo.lock` (`cargo release version minor --execute
+--no-confirm`, or by hand) — unless a breaking PR already did, which
+`semver` requires — and moves `CHANGELOG.md`'s `[Unreleased]` entries under
+a matching `## [X.Y.Z]` section. Once that commit's post-merge CI run passes
+on `master`, its `release-on-bump` job creates GitHub release `vX.Y.Z` at
+the bump commit, which runs `release.yml`: it verifies the tagged commit,
 publishes it to crates.io, and sets the release notes from `CHANGELOG.md`.
+A bump with no non-empty `CHANGELOG.md` section fails `release-on-bump`
+instead of creating a release, and a pre-release version (`X.Y.Z-rc.N`) is
+never released automatically — the maintainer publishes one by hand.
 Publishing uses crates.io trusted publishing, bound to this repository's
 `release` GitHub environment, which only `v*` release tags can deploy to;
-only repository admins can create those tags, only the maintainer's own
-release publication starts a publish, and no crates.io token is stored
-anywhere in the repository.
+only repository admins and the project's CI GitHub App can create those
+tags, only a release from the maintainer or that App starts a publish, and
+no crates.io token is stored anywhere in the repository.
 Contributors don't bump the version or push tags — put your entry under
 `CHANGELOG.md`'s `[Unreleased]` section. See
 `.github/workflows/release.yml`'s header comment for the details.

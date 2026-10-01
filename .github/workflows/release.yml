@@ -1,53 +1,78 @@
 name: Release
 
-# Publishes to crates.io when the maintainer publishes a GitHub release — and
-# only then. A merge to `master` runs CI and nothing else.
+# Publishes to crates.io when a GitHub release is published — and only then.
+# pr-manual-release with bump-is-release: a merged PR that changes Cargo.toml's
+# `[package] version` IS the release. ci.yml's `release-on-bump` job, on that
+# commit's post-merge run and only once all five heavy jobs passed there,
+# creates release `vX.Y.Z` at the bump commit with the auto-merge App's token
+# (`.github/scripts/release-on-bump.sh`); that published release starts this
+# workflow. An ordinary merge runs CI and nothing else.
 #
 # Cutting a release:
-#   1. Merge a PR that bumps `version` in Cargo.toml (and Cargo.lock) and
-#      moves CHANGELOG.md's `[Unreleased]` entries under a matching
-#      `## [X.Y.Z] - <date>` heading, with its link reference at the bottom.
-#   2. The maintainer creates the release for that commit, naming the bump
-#      commit's SHA rather than `master`:
-#        gh release create vX.Y.Z --target <sha of the bump commit> \
-#          --title vX.Y.Z --notes "..."
-#      or the same through the web UI. With `--target master`, anything
-#      merged after the bump would ride along into the release without a
-#      CHANGELOG entry. Publishing the release creates the `vX.Y.Z` tag and
-#      starts this workflow. The notes given there are replaced by the
+#   1. On a branch, bump `version` in Cargo.toml and Cargo.lock
+#      (`cargo release version minor --execute --no-confirm`, or patch/major/
+#      X.Y.Z, or by hand) and move CHANGELOG.md's `[Unreleased]` entries under
+#      a matching `## [X.Y.Z] - <date>` heading, with its link reference at
+#      the bottom. Open a PR and let it merge. That is all: `release-on-bump`
+#      creates the release. It refuses (fails, creating nothing) a bump with
+#      no non-empty CHANGELOG section, since `check` below would refuse it.
+#   2. Manual fallback — a pre-release (`release-on-bump` creates stable
+#      releases only), or a bump whose `release-on-bump` could not create the
+#      release — the owner, under exactly the same `check`:
+#        gh release create vX.Y.Z --target <full sha of the bump commit> \
+#          --title vX.Y.Z --generate-notes     # add --prerelease for X.Y.Z-pre
+#      Target the bump commit's SHA, not `master`: with `--target master`,
+#      anything merged after the bump would ride along into the release
+#      without a CHANGELOG entry. The notes given there are replaced by the
 #      CHANGELOG section once the crate is published.
 #
-# Only the owner can cause a publish, and they have to do two things: create
-# the `v*` tag — a tag ruleset lets only repository admins create, move or
-# delete `v*` tags, so neither GITHUB_TOKEN nor the auto-merge App can — and
-# publish the release, which `check` enforces by failing unless the event's
-# sender is the owner. (A release published with a GitHub App installation
-# token does start workflow runs, and the auto-merge App has
-# `contents: write`, so without the sender check it could publish a release
-# on an existing, unpublished `v*` tag.) A release created with GITHUB_TOKEN
-# starts no workflow run at all. Nothing in this workflow ever creates or
-# edits a tag.
+# Only the owner or the App can cause a publish:
+#   - a tag ruleset on `refs/tags/v*` lets only repository admins and the
+#     auto-merge App (a bypass actor) create, move or delete a `v*` tag, so
+#     GITHUB_TOKEN cannot make one;
+#   - the `release` environment admits only `v*` tags, so `publish` cannot run
+#     from a branch;
+#   - `check` fails unless the release's sender is in RELEASE_SENDERS (the
+#     owner and the App's bot login). A release created with GITHUB_TOKEN
+#     starts no workflow run at all; one created with an App installation
+#     token does, which is what `release-on-bump` relies on.
+# The tradeoff: release authority is now "can get a version bump merged to
+# master" — the owner, plus anything that can act as the App — not "is the
+# owner". What the App can release is constrained by `check` (a stable,
+# non-draft release whose tag matches Cargo.toml at a master commit, above
+# every existing stable tag, with a CHANGELOG section, unpublished on
+# crates.io), not by who it is. A pre-release is accepted from the owner only.
+# Nothing in this workflow ever creates or edits a tag.
 #
 # If `verify`, `msrv` or `semver` fails because the tagged commit is genuinely broken,
 # "re-run failed jobs" cannot help — it re-runs the same commit. Merge the
 # fix, then, as the owner, delete the release and its tag
-# (`gh release delete vX.Y.Z --cleanup-tag`) and create the release again at
-# the new commit. Nothing was uploaded, since `publish` needs all three jobs.
+# (`gh release delete vX.Y.Z --cleanup-tag`) and create the release by hand
+# at the fix commit (its version is unchanged, so `release-on-bump` will not),
+# or merge a fresh bump. Nothing was uploaded, since `publish` needs all
+# three jobs.
 #
-# A prerelease is
-# handled like any other release: a version such as `0.2.0-rc.1` is
-# published to crates.io, where Cargo never picks a pre-release version
-# unless a consumer asks for it explicitly.
+# A prerelease (owner-published only) is otherwise handled like any other
+# release: a version such as `0.2.0-rc.1` is published to crates.io, where
+# Cargo never picks a pre-release version unless a consumer asks for it
+# explicitly. The highest-tag rule below applies to stable tags only.
 #
 #   check    GitHub-hosted, read-only. Checks out the tagged commit and
-#            fails closed unless: the release was published by the owner
-#            (`St0nefish`); the release's tag is `v<version>` for the
-#            Cargo.toml version at that commit; that commit is an ancestor of
-#            `master`; crates.io answers 404 for that version (200 fails the
+#            fails closed unless: the release's sender is in RELEASE_SENDERS;
+#            it is not a draft; it is a pre-release (or its tag carries a
+#            pre-release suffix) only if the sender is the owner; the
+#            release's tag is `v<version>` for the Cargo.toml version at
+#            that commit and GITHUB_REF is that tag; that commit is an
+#            ancestor of `master`; a stable tag is the highest stable `v*`
+#            tag on origin (`.github/scripts/require-highest-tag.sh`), so a
+#            release can never land below an existing one; crates.io answers
+#            404 for that version (200 fails the
 #            first attempt, since the release is for a version that is
 #            already published; any other answer always fails, so it never
 #            publishes on an uncertain answer); and CHANGELOG.md has a
-#            non-empty section for it (the release notes).
+#            non-empty section for it (the release notes,
+#            `.github/scripts/changelog-section.sh`, the same extraction
+#            `release-on-bump` checks before creating the release).
 #   verify   Self-hosted, read-only, no OIDC permission: the same steps as
 #   msrv     ci.yml's `checks` and `msrv` jobs, on the tagged commit.
 #   semver   ci.yml's `semver` job on the tagged commit. (ci.yml's
@@ -57,7 +82,10 @@ name: Release
 #            release's version bump, so it is.)
 #   publish  The only job with `id-token: write`, in the `release`
 #            environment. Re-checks crates.io, then does nothing but
-#            checkout, toolchain, crates.io authentication and
+#            checkout, toolchain, the highest-tag re-check (a plain
+#            git/coreutils script from the tagged commit, no build tooling,
+#            run just before the token is minted so a release published
+#            meanwhile is seen), crates.io authentication and
 #            `cargo publish`.
 #   release-notes
 #            `contents: write` with GITHUB_TOKEN. Replaces the release's
@@ -78,7 +106,7 @@ name: Release
 # deployment policy admits only `v*` tags. So this file must keep its name
 # and `publish` must keep `environment: release`: that environment policy,
 # together with the tag ruleset and the sender check, is what stops anything
-# but an owner-created, owner-published release from minting a publish
+# but a release created by the owner or the App from minting a publish
 # token. No crates.io token
 # is stored in this repository: `rust-lang/crates-io-auth-action` exchanges
 # the job's OIDC token for a publish token valid for that one run.
@@ -109,6 +137,14 @@ concurrency:
 permissions:
   contents: read
 
+env:
+  # The only identities whose published release may run this workflow
+  # (space-separated logins): the owner, by hand, and the auto-merge App's
+  # bot, from ci.yml's `release-on-bump`.
+  RELEASE_SENDERS: "St0nefish st0nefish-ci[bot]"
+  # The one sender that may publish a pre-release (the App never creates one).
+  PRERELEASE_SENDER: "St0nefish"
+
 jobs:
   check:
     runs-on: ubuntu-latest
@@ -116,18 +152,49 @@ jobs:
     outputs:
       version: ${{ steps.version.outputs.version }}
       tag: ${{ steps.version.outputs.tag }}
+      stable: ${{ steps.sender.outputs.stable }}
     steps:
-      - name: Require the release to be published by the owner
-        # The tag ruleset means only the owner can create a `v*` tag, but
-        # publishing a release on an existing tag is a separate act: a GitHub
-        # App installation token with `contents: write` can do it, and unlike
-        # GITHUB_TOKEN it does start workflow runs. Only the owner may.
+      - name: Require a non-draft release from an allowed sender
+        # A GitHub App installation token with `contents: write` can publish
+        # a release and, unlike GITHUB_TOKEN, that starts workflow runs, so
+        # the sender is checked against an explicit list. The App creates
+        # stable releases only; a pre-release (flagged as one, or a tag with a
+        # suffix) is accepted from the owner alone.
+        id: sender
         env:
           SENDER: ${{ github.event.sender.login }}
+          DRAFT: ${{ github.event.release.draft }}
+          PRERELEASE: ${{ github.event.release.prerelease }}
+          TAG: ${{ github.event.release.tag_name }}
         run: |
-          if [[ "$SENDER" != "St0nefish" ]]; then
-            echo "::error::this release was published by '${SENDER}'; only the repository owner may publish a release."
+          allowed=false
+          for s in ${RELEASE_SENDERS}; do
+            if [[ -n "$SENDER" && "$SENDER" == "$s" ]]; then allowed=true; fi
+          done
+          if [[ "$allowed" != "true" ]]; then
+            echo "::error::this release was published by '${SENDER}', not one of: ${RELEASE_SENDERS}."
             exit 1
+          fi
+          if [[ "$DRAFT" != "false" ]]; then
+            echo "::error::a draft release is never shipped (draft=${DRAFT})."
+            exit 1
+          fi
+          if [[ ! "$TAG" =~ ^v[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z.-]+)?$ ]]; then
+            echo "::error::release tag '${TAG}' is not of the form vX.Y.Z[-pre]"
+            exit 1
+          fi
+          if [[ "$GITHUB_REF" != "refs/tags/${TAG}" ]]; then
+            echo "::error::GITHUB_REF is ${GITHUB_REF}, expected refs/tags/${TAG}"
+            exit 1
+          fi
+          if [[ "$PRERELEASE" != "false" || ! "$TAG" =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+            if [[ "$SENDER" != "$PRERELEASE_SENDER" ]]; then
+              echo "::error::'${SENDER}' published a pre-release (prerelease=${PRERELEASE}, tag ${TAG}); only ${PRERELEASE_SENDER} may."
+              exit 1
+            fi
+            echo "stable=false" >> "$GITHUB_OUTPUT"
+          else
+            echo "stable=true" >> "$GITHUB_OUTPUT"
           fi
 
       - name: Checkout the tagged commit
@@ -151,11 +218,8 @@ jobs:
 
           # For a release event GITHUB_SHA is the commit the tag named when
           # the release was published. Confirm the tag still names it and
-          # that this checkout is that commit, rather than trust either.
-          if [[ "$GITHUB_REF" != "refs/tags/${TAG}" ]]; then
-            echo "::error::GITHUB_REF is ${GITHUB_REF}, expected refs/tags/${TAG}"
-            exit 1
-          fi
+          # that this checkout is that commit, rather than trust either
+          # (GITHUB_REF was matched to the tag in the first step).
           git fetch --no-tags origin "+refs/tags/${TAG}:refs/tags/${TAG}"
           tag_commit=$(git rev-parse "refs/tags/${TAG}^{commit}")
           head_commit=$(git rev-parse HEAD)
@@ -189,9 +253,9 @@ jobs:
           # This catches mistakes; it is not a security boundary. The run
           # uses the workflow file as it exists at the tagged commit, so a
           # tag on an unmerged commit could carry a copy of this file
-          # without the check. The boundary is the owner-only `v*` tag
-          # ruleset, the `release` environment's `v*`-only deployment
-          # policy, and the owner sender check at the top of this job.
+          # without the check. The boundary is the `v*` tag ruleset (admins
+          # and the App only), the `release` environment's `v*`-only
+          # deployment policy, and the sender check at the top of this job.
           git fetch --no-tags origin "+refs/heads/master:refs/remotes/origin/master"
           status=0
           git merge-base --is-ancestor "$GITHUB_SHA" origin/master || status=$?
@@ -208,6 +272,16 @@ jobs:
               exit 1
               ;;
           esac
+
+      - name: Require a stable tag to be the highest stable release tag
+        # A release can never land below an existing one: an older bump
+        # commit's CI re-run, or a release created by hand at an old commit.
+        # The tag itself already exists, so it must BE the highest. Stable
+        # tags only; an owner-published pre-release is not compared.
+        if: steps.sender.outputs.stable == 'true'
+        env:
+          TAG: ${{ steps.version.outputs.tag }}
+        run: .github/scripts/require-highest-tag.sh "$TAG"
 
       - name: Require the version to be unpublished on crates.io
         env:
@@ -242,20 +316,12 @@ jobs:
           esac
 
       - name: Require a non-empty CHANGELOG section for the version
-        # The same extraction `release-notes` uses, so a missing or empty
-        # section fails here, before anything is uploaded.
+        # The same extraction `release-notes` uses (and `release-on-bump`
+        # checks before creating a release), so a missing or empty section
+        # fails here, before anything is uploaded.
         env:
           VERSION: ${{ steps.version.outputs.version }}
-        run: |
-          awk -v heading="## [${VERSION}]" '
-            index($0, heading) == 1 { in_section = 1; next }
-            in_section && (/^## \[/ || /^\[[^]]+\]: /) { exit }
-            in_section { print }
-          ' CHANGELOG.md > "${RUNNER_TEMP}/release-notes.md"
-          if ! grep -q '[^[:space:]]' "${RUNNER_TEMP}/release-notes.md"; then
-            echo "::error::CHANGELOG.md's '## [${VERSION}]' section is missing or empty; the release notes are taken from it."
-            exit 1
-          fi
+        run: .github/scripts/changelog-section.sh "$VERSION" CHANGELOG.md
 
   # `verify` and `msrv` repeat ci.yml's `checks` and `msrv` jobs step for step
   # on the exact commit about to be published. They run every build script,
@@ -543,6 +609,18 @@ jobs:
           # missing a listed component would leave rustup to fill it in.
           components: clippy, rustfmt
 
+      - name: Require a stable tag to still be the highest stable release tag
+        # `check`'s guard again, immediately before the token is minted and
+        # the crate uploaded, so a release published since `check` ran is
+        # seen. A plain git/coreutils script from the tagged commit (the one
+        # `check` ran): no build tooling, no dependency, nothing it can pull
+        # in. Before authentication rather than between it and the upload,
+        # so a refusal never mints a token at all.
+        if: steps.recheck.outputs.upload == 'true' && needs.check.outputs.stable == 'true'
+        env:
+          TAG: ${{ needs.check.outputs.tag }}
+        run: .github/scripts/require-highest-tag.sh "$TAG"
+
       - name: Authenticate with crates.io
         if: steps.recheck.outputs.upload == 'true'
         id: auth
@@ -558,9 +636,10 @@ jobs:
           echo "### Published oauth-resource-server ${VERSION} to crates.io" >> "$GITHUB_STEP_SUMMARY"
 
   # Sets the release's notes to the CHANGELOG section once the crate is on
-  # crates.io. Edits the existing release only — never creates a release or
-  # a tag (the tag ruleset would refuse GITHUB_TOKEN anyway). Re-running it
-  # writes the same notes again.
+  # crates.io, replacing whatever placeholder `release-on-bump` (or the
+  # owner) created it with. Edits the existing release only — never creates
+  # a release or a tag (the tag ruleset would refuse GITHUB_TOKEN anyway).
+  # Re-running it writes the same notes again.
   release-notes:
     needs: [check, publish]
     runs-on: ubuntu-latest
@@ -585,15 +664,7 @@ jobs:
           # The `## [X.Y.Z]` section, up to the next version heading or the
           # link-reference block at the end of the file. `check` already ran
           # this same extraction and required it to be non-empty.
-          awk -v heading="## [${VERSION}]" '
-            index($0, heading) == 1 { in_section = 1; next }
-            in_section && (/^## \[/ || /^\[[^]]+\]: /) { exit }
-            in_section { print }
-          ' CHANGELOG.md > "${RUNNER_TEMP}/release-notes.md"
-          if ! grep -q '[^[:space:]]' "${RUNNER_TEMP}/release-notes.md"; then
-            echo "::error::CHANGELOG.md's '## [${VERSION}]' section is empty or missing."
-            exit 1
-          fi
+          .github/scripts/changelog-section.sh "$VERSION" CHANGELOG.md > "${RUNNER_TEMP}/release-notes.md"
 
           gh release edit "$TAG" \
             --repo "$GITHUB_REPOSITORY" \
