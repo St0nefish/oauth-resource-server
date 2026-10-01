@@ -8,6 +8,30 @@ Before 1.0, a breaking change increments the minor version.
 
 ## [Unreleased]
 
+## [0.3.1] - 2026-10-01
+
+### Security
+
+- **`McpToolScopes` per-tool scope bypass (affects 0.2.0–0.3.0, `mcp`
+  feature only).** When serde_json's `raw_value` feature is on in the
+  server's build (axum enables it, so feature unification turns it on for
+  most axum servers) and the MCP dispatcher parses bodies into
+  `serde_json::Value`, `Value` reads an object whose first key is
+  `$serde_json::private::RawValue` as the JSON inside that key's string. A
+  `tools/call` (or a whole batch) wrapped that way was classified as an
+  ordinary message needing only the default scopes, while the dispatcher ran
+  the wrapped call — so a caller with the default scopes could run a tool
+  configured to need more. `arbitrary_precision`'s
+  `$serde_json::private::Number` key reshapes a value the same way. Now a
+  message with either key anywhere in it (`method`, `params`, or any nested
+  value) is unclassifiable and needs the strictest set (the default and
+  every tool's scopes and claim clauses). This narrows accepted input — no
+  real MCP client sends these keys — and ships as a patch release under the
+  security-fix exception of this crate's semver policy. Found by the
+  `mcp_tool_calls` fuzz target, whose oracle now treats such bodies
+  separately from its `serde_json::Value` comparison. See `SECURITY.md`'s
+  advisory.
+
 ## [0.3.0] - 2026-10-01
 
 ### Upgrading (0.3.0)
@@ -902,7 +926,8 @@ MSRV: Rust 1.89. License: MIT.
   resource on a non-loopback host needs `<PREFIX>ALLOW_INSECURE_HTTP=true`
   (`allow_insecure_http`).
 
-[Unreleased]: https://github.com/St0nefish/oauth-resource-server/compare/v0.3.0...HEAD
+[Unreleased]: https://github.com/St0nefish/oauth-resource-server/compare/v0.3.1...HEAD
+[0.3.1]: https://github.com/St0nefish/oauth-resource-server/compare/v0.3.0...v0.3.1
 [0.3.0]: https://github.com/St0nefish/oauth-resource-server/compare/v0.2.0...v0.3.0
 [0.2.0]: https://github.com/St0nefish/oauth-resource-server/compare/v0.1.2...v0.2.0
 [0.1.2]: https://github.com/St0nefish/oauth-resource-server/compare/v0.1.1...v0.1.2

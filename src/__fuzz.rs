@@ -156,10 +156,30 @@ pub fn scope_challenge(scopes: &[String], description: Option<&str>) {
 /// `method` is `"tools/call"` and whose `params.name` is `name`; a
 /// `NotToolCall` is a message whose `method` is not `"tools/call"`.
 /// (`Ambiguous` — repeated members, no readable name — may be anything.)
+///
+/// A body holding serde_json's private token keys
+/// (`$serde_json::private::RawValue`/`Number`) anywhere — found by
+/// [`token_key_in`], a walk independent of `mcp.rs` — is not compared
+/// against `Value`, which (with `raw_value`/`arbitrary_precision` on, as in
+/// this crate's fuzz build) reads such an object as the JSON in its string:
+/// it must instead be read as messages, at least one of them `Ambiguous`, so
+/// the request needs the strictest set. That holds with the features off
+/// too, since the walk does not depend on them.
 #[cfg(feature = "mcp")]
 pub fn mcp_tool_calls(body: &[u8]) {
     use crate::mcp::{Classified, NamedMessage as Message};
 
+    if token_key_in(body) == Some(true) {
+        match crate::mcp::classify(body) {
+            Classified::Messages(messages) => {
+                assert!(messages.contains(&Message::Ambiguous), "{messages:?}")
+            }
+            Classified::Unreadable => {
+                panic!("a valid JSON body with a token key was unreadable")
+            }
+        }
+        return;
+    }
     let oracle = serde_json::from_slice::<Value>(body).ok();
     let elements: Option<Vec<&Value>> = match &oracle {
         Some(Value::Array(items)) => Some(items.iter().collect()),
@@ -195,6 +215,68 @@ pub fn mcp_tool_calls(body: &[u8]) {
             panic!("classify disagrees with serde_json: {classified:?} vs {elements:?}")
         }
     }
+}
+
+/// Whether `body`, a complete JSON document, has an object key equal to one
+/// of serde_json's private tokens at any depth (`None`: not JSON). Plain JSON
+/// structure only, with no `Value` involved, so the answer does not depend
+/// on serde_json's features.
+#[cfg(feature = "mcp")]
+fn token_key_in(body: &[u8]) -> Option<bool> {
+    use serde::de::{Deserialize, Deserializer, MapAccess, SeqAccess, Visitor};
+
+    struct Walk(bool);
+    impl<'de> Deserialize<'de> for Walk {
+        fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+            struct V;
+            impl<'de> Visitor<'de> for V {
+                type Value = Walk;
+                fn expecting(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+                    f.write_str("any JSON value")
+                }
+                fn visit_bool<E>(self, _: bool) -> Result<Walk, E> {
+                    Ok(Walk(false))
+                }
+                fn visit_i64<E>(self, _: i64) -> Result<Walk, E> {
+                    Ok(Walk(false))
+                }
+                fn visit_u64<E>(self, _: u64) -> Result<Walk, E> {
+                    Ok(Walk(false))
+                }
+                fn visit_f64<E>(self, _: f64) -> Result<Walk, E> {
+                    Ok(Walk(false))
+                }
+                fn visit_str<E>(self, _: &str) -> Result<Walk, E> {
+                    Ok(Walk(false))
+                }
+                fn visit_unit<E>(self) -> Result<Walk, E> {
+                    Ok(Walk(false))
+                }
+                fn visit_seq<A: SeqAccess<'de>>(self, mut seq: A) -> Result<Walk, A::Error> {
+                    let mut found = false;
+                    while let Some(Walk(f)) = seq.next_element()? {
+                        found |= f;
+                    }
+                    Ok(Walk(found))
+                }
+                fn visit_map<A: MapAccess<'de>>(self, mut map: A) -> Result<Walk, A::Error> {
+                    let mut found = false;
+                    while let Some((key, Walk(f))) = map.next_entry::<String, Walk>()? {
+                        found |= f
+                            || key == "$serde_json::private::RawValue"
+                            || key == "$serde_json::private::Number";
+                    }
+                    Ok(Walk(found))
+                }
+            }
+            deserializer.deserialize_any(V)
+        }
+    }
+
+    let mut deserializer = serde_json::Deserializer::from_slice(body);
+    let walk = Walk::deserialize(&mut deserializer).ok()?;
+    deserializer.end().ok()?;
+    Some(walk.0)
 }
 
 /// `jwks::discovery_urls`: OIDC first, at most one RFC 8414 fallback.
