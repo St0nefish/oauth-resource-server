@@ -70,7 +70,7 @@ or in `Cargo.toml`:
 
 ```toml
 [dependencies]
-oauth-resource-server = { version = "0.2", features = ["axum", "serde"] }
+oauth-resource-server = { version = "0.3", features = ["axum", "serde"] }
 ```
 
 ### Features
@@ -84,7 +84,7 @@ oauth-resource-server = { version = "0.2", features = ["axum", "serde"] }
 | `env` | no | The `env` module: load the config and secrets from environment variables, with `VAR_FILE` support. |
 | `tower` | no | The `http_layer` module: `HttpAuthLayer`, an authentication layer for any `tower` service over `http::Request<B>` (hyper, tonic, ...), whatever its body types. See [Using with other frameworks](#using-with-other-frameworks). |
 | `axum` | no | The `axum` module: the `AuthLayer` middleware, `metadata_router`, axum extractors for `Credential` and `AuthorizedToken`, and per-route scopes (`RequireScopes`, the `Scoped<S>` extractor). Implies `tower`. |
-| `mcp` | no | The `mcp` module, an integration helper for [Model Context Protocol](https://modelcontextprotocol.io) servers: `McpToolScopes`, a tower layer that requires scopes per tool by reading the JSON-RPC `tools/call` in the request body. No MCP SDK: it parses with `serde_json` and reads the body with `http-body` and `bytes`, all already in every build. Implies `tower`. See [Per-tool scopes](#per-tool-scopes-mcptoolscopes). |
+| `mcp` | no | The `mcp` module, an integration helper for [Model Context Protocol](https://modelcontextprotocol.io) servers: `McpToolScopes`, a tower layer that requires scopes (and, optionally, claim values such as a group) per tool by reading the JSON-RPC `tools/call` in the request body. No MCP SDK: it parses with `serde_json` and reads the body with `http-body` and `bytes`, all already in every build. Implies `tower`. See [Per-tool scopes](#per-tool-scopes-mcptoolscopes). |
 | `metrics` | no | Counters and a gauge for authentication decisions and JWKS refreshes, through the [`metrics`](https://docs.rs/metrics) facade, and the `observability` module naming them. See [Observability](#observability). Off, it adds no dependency and records nothing. |
 | `testing` | no | A fake authorization server (`TestAuthority`), a fluent token builder, and the throwaway signing keys behind them, for **your tests only**. Never enable it in a production build. It follows semver like the rest of the crate. |
 
@@ -114,7 +114,7 @@ defaults off:
 
 ```toml
 [dependencies]
-oauth-resource-server = { version = "0.2", default-features = false, features = ["rustls-tls-native-roots", "axum", "serde"] }
+oauth-resource-server = { version = "0.3", default-features = false, features = ["rustls-tls-native-roots", "axum", "serde"] }
 ```
 
 (and the same `default-features = false` on any `[dev-dependencies]` entry,
@@ -168,10 +168,10 @@ crate over as well, so the binary carries one TLS stack instead of two:
 
 ```toml
 [dependencies]
-oauth-resource-server = { version = "0.2", default-features = false, features = ["native-tls", "axum", "serde"] }
+oauth-resource-server = { version = "0.3", default-features = false, features = ["native-tls", "axum", "serde"] }
 
 [dev-dependencies]
-oauth-resource-server = { version = "0.2", default-features = false, features = ["native-tls", "testing"] }
+oauth-resource-server = { version = "0.3", default-features = false, features = ["native-tls", "testing"] }
 ```
 
 Repeat `default-features = false` in `[dev-dependencies]`. Cargo merges a
@@ -497,17 +497,9 @@ deserializes it into your own type.
 use std::time::SystemTime;
 
 use oauth_resource_server::AuthorizedToken;
-use serde::Deserialize;
-
-#[derive(Deserialize)]
-struct MyClaims {
-    #[serde(default)]
-    groups: Vec<String>,
-}
 
 async fn admin_only(token: AuthorizedToken) -> String {
-    let groups = token.claims_as::<MyClaims>().map(|c| c.groups).unwrap_or_default();
-    if !groups.iter().any(|g| g == "admins") {
+    if !token.has_claim_value("groups", "admins") {
         return "not an admin".to_string();
     }
     // Close a long-lived stream when the token behind it expires.
@@ -519,6 +511,17 @@ async fn admin_only(token: AuthorizedToken) -> String {
     )
 }
 ```
+
+For a role or group claim, `has_claim_value("groups", "admins")` is an exact,
+case-sensitive membership test, and `claim_values("groups")` returns the
+strings: a string claim is one value (not split on whitespace, unlike scopes),
+an array yields its string elements, anything else is empty. A claim nested in
+objects, such as Keycloak's `realm_access.roles`, is read by explicit segments:
+`claim_values_at(&["realm_access", "roles"])` and `has_claim_value_at(..)`.
+Segments, not a dotted string, because claim names can contain dots
+(`claim_values("https://example.com/roles")` looks up that literal key). These
+read the signature-verified claims for a per-request decision; the global
+`required_claims` setting is the gate every token must pass.
 
 The `AuthorizedToken` extractor behaves as the table in [Reading the caller in
 a handler](#reading-the-caller-in-a-handler) describes: a request the layer
@@ -1535,7 +1538,13 @@ an `InvalidToken`'s `kind()` names the check that failed).
   larger body with 413; a body it cannot classify with certainty (not JSON,
   a `tools/call` with no readable tool name, a repeated member) needs every
   scope any tool requires, never fewer; a JSON-RPC batch needs every scope
-  any of its calls needs; it never logs body content. Its tool names are
+  any of its calls needs; it never logs body content. Its claim clauses
+  (`default_claim`, `tool_claim`) follow the same rules — an unclassifiable
+  body needs every clause any tool has, a batch every clause any of its
+  calls needs, clauses are never merged by claim name — and are refused
+  with the same 403 and a challenge naming scopes only (no claim name or
+  value in a header; the log names the claim, never a value); a static
+  token meets them only with `static_token_bypasses_scopes()`. Its tool names are
   matched **exactly** (see [Per-tool scopes](#per-tool-scopes-mcptoolscopes)):
   an MCP server whose dispatcher normalizes names (case, whitespace) must not
   be put behind it with scopes on some tools and not others.
@@ -2051,8 +2060,9 @@ fits MCP's authorization model:
 - **Per-tool scopes need the request body.** The auth layer sees HTTP
   requests, not the JSON-RPC method inside a POST to `/mcp`, so on its own
   any accepted token can call every tool. The `mcp` feature's
-  `McpToolScopes` reads the tool name and requires that tool's scopes before
-  the MCP server sees the request (below); a tool handler can also check
+  `McpToolScopes` reads the tool name and requires that tool's scopes (and
+  any claim values, such as a group) before the MCP server sees the request
+  (below); a tool handler can also check
   scopes itself ([Reading the token inside a tool
   handler](#reading-the-token-inside-a-tool-handler)).
 
@@ -2117,7 +2127,7 @@ empty, so it needs every scope.
 `params.name`, with no case folding, trimming or normalization — and a name
 with no entry gets the default. Register every tool under exactly the name
 your MCP server dispatches on, and make sure its dispatcher is exact too: one
-that would also run `Write_Document` or `write_document ` as `write_document`
+that would also run `Write_Document` or `write_document` as `write_document`
 lets a caller reach that tool under a spelling this layer treats as
 unconfigured, with only the default's scopes.
 
@@ -2127,9 +2137,49 @@ for as long as your server allows: configure a header/body read or request
 timeout (hyper's, a `tower_http::timeout` layer, or your proxy's), as for
 any endpoint that reads a body.
 
-Scopes and limits read from configuration go through `try_default`,
-`try_tool` and `try_body_limit`, which return an `McpScopesError` naming the
-bad value; the plain forms panic and are for literals in code.
+**Claim requirements per tool.** Next to scopes, a tool (or the default) can
+require a verified claim value — a group or role a token carries as a claim
+rather than a scope:
+
+```text
+let tool_scopes = McpToolScopes::new()
+    .default(["mcp:read"])
+    .tool("purge", ["mcp:write"])
+    // `purge` also needs `groups` to hold `admins` or `ops`.
+    .tool_claim("purge", "groups", ["admins", "ops"])
+    // `approve` needs `role` = `approver`, and no scope of its own.
+    .tool_claim("approve", "role", ["approver"]);
+```
+
+- Each `tool_claim` / `default_claim` call adds one clause: the top-level
+  claim must hold **at least one** of the values (a string equal to it, or
+  an array with that string element; exact and case-sensitive, a
+  space-delimited string is one value), and **every** clause must hold.
+  Two clauses on the same claim are two requirements, never merged.
+- A tool is configured once it appears in `tool` **or** `tool_claim`; it then
+  needs its own scopes and its own clauses only, never the default's. A tool
+  given only `tool_claim` has no scopes of its own (add them with `tool`),
+  and `tool("x", [])` exempts `x` from the default clauses as well as the
+  default scopes. Everything else needs the default scopes and the
+  `default_claim` clauses.
+- A batch needs the union of its calls' clauses; a body it cannot classify
+  needs every clause in the configuration (so two tools needing
+  `role = a` and `role = b` make such a body need both).
+- A missing claim value is the same 403 as a missing scope, with a challenge
+  naming the scopes only (byte-identical to a scope-only refusal for the same
+  scopes): RFC 6750 has no claim error, and no claim name or value ever
+  enters `WWW-Authenticate`. The refusal is logged with `auth.reason =
+  insufficient_scope` and a `required_claims` field holding the claim
+  **names** only, never a configured or presented value.
+- A static token has no claims: it is refused wherever a clause applies,
+  unless `static_token_bypasses_scopes()`, which covers claims too. A request
+  with no credential gets the auth layer's 401 as for scopes.
+
+Scopes, claim requirements and limits read from configuration go through
+`try_default`, `try_tool`, `try_default_claim`, `try_tool_claim` and
+`try_body_limit`, which return an `McpScopesError` naming the bad value (a
+blank claim name, no values or a blank value is `InvalidClaimRequirement`);
+the plain forms panic and are for literals in code.
 
 ### Reading the token inside a tool handler
 
@@ -2151,6 +2201,9 @@ fn token_from_parts(parts: &Parts) -> Option<&AuthorizedToken> {
     parts.extensions.get::<AuthorizedToken>()
 }
 ```
+
+Once you hold the token, `token.has_claim_value("groups", "admins")` checks a
+group or role claim in the handler.
 
 With the [rmcp](https://docs.rs/rmcp) SDK, `StreamableHttpService` carries
 those `Parts` onto the request context a `#[tool]` handler receives (its own
@@ -2219,7 +2272,9 @@ With only a static token configured, the line is `Bearer auth rejected`, with
 no reason. A per-route scope refusal (`RequireScopes`, `McpToolScopes`) is
 logged under `oauth_resource_server::http_layer` at `info`, as `The credential
 lacks the scopes this route requires` with the required and present scopes
-(and a `Scoped` extractor's under `oauth_resource_server::axum`); a layer's
+(`The credential lacks the scopes or claim values this route requires`, with
+a `required_claims` field naming the claims, never their values, for an
+`McpToolScopes` requirement with claim clauses; and a `Scoped` extractor's under `oauth_resource_server::axum`); a layer's
 own `require_scopes` refusal is its usual `warn` line with
 `reason=InsufficientScope`. The table below is keyed on the detail text, which is for reading
 logs; in code, match `InvalidToken::kind()` instead. The validator and key-set messages come from the targets
@@ -2263,7 +2318,7 @@ keys are public, so anything that trusts them trusts everyone):
 
 ```toml
 [dev-dependencies]
-oauth-resource-server = { version = "0.2", features = ["testing"] }
+oauth-resource-server = { version = "0.3", features = ["testing"] }
 ```
 
 That keeps it out of a production build under Cargo's feature resolver
@@ -2382,8 +2437,8 @@ a vulnerability, where a forged, expired, wrongly-audienced or otherwise
 out-of-policy token was being accepted, ships as a patch release even though
 it refuses tokens that were accepted before. It comes with a `CHANGELOG.md`
 entry and a security advisory. Holding such a fix for the next minor release
-would leave everyone on the usual `"0.2"` requirement unprotected. If you pin
-an exact version (`=0.2.x`), expect a patch to narrow what is accepted when it
+would leave everyone on the usual `"0.3"` requirement unprotected. If you pin
+an exact version (`=0.3.x`), expect a patch to narrow what is accepted when it
 fixes a vulnerability.
 
 A new minor release is required for:

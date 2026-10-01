@@ -1045,28 +1045,59 @@ pub(crate) enum ScopeVerdict {
     NoLayer,
 }
 
+/// One per-request claim requirement (the `mcp` feature's `McpToolScopes`
+/// builds them; oauth-resource-server#53): the verified top-level claim
+/// `claim` must hold at least one of `any_of`, per
+/// [`AuthorizedToken::has_claim_value`] (a string equal to it, or an array
+/// with that string element; exact, case-sensitive). Clauses are all-of;
+/// values within one are any-of. Two clauses naming the same claim are never
+/// merged — that would widen access. Its `Debug` holds configured values: it
+/// is never logged (a refusal logs the claim names only).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct ClaimClause {
+    /// The top-level claim name, matched literally (a dot is part of it).
+    pub(crate) claim: String,
+    /// The accepted values, non-blank and deduplicated.
+    pub(crate) any_of: Vec<String>,
+}
+
+impl ClaimClause {
+    /// Whether `token` holds at least one of the accepted values.
+    pub(crate) fn satisfied_by(&self, token: &AuthorizedToken) -> bool {
+        self.any_of
+            .iter()
+            .any(|value| token.has_claim_value(&self.claim, value))
+    }
+}
+
 /// Judge `parts` against a route-level requirement of `required` (every
-/// scope, all-of). Reads the innermost [`Credential`] a layer accepted — not
-/// an [`AuthorizedToken`], which an outer layer may have inserted: an OAuth
-/// token must carry every scope (the same matching as the validator's); a
-/// static token has none, so it passes only with `static_bypasses`; no
-/// credential is `Missing`. An empty requirement passes whatever the layer
-/// let through. Without a layer marker it is always `NoLayer`, whatever the
+/// scope, all-of) and `claims` (every clause, all-of). Reads the innermost
+/// [`Credential`] a layer accepted — not an [`AuthorizedToken`], which an
+/// outer layer may have inserted: an OAuth token must carry every scope (the
+/// same matching as the validator's) and satisfy every claim clause; a static
+/// token has neither scopes nor claims, so it passes only with
+/// `static_bypasses`; no credential is `Missing`. A failed claim clause is
+/// `InsufficientScope` too (RFC 6750 has no claim error). An empty
+/// requirement (no scope and no clause) passes whatever the layer let
+/// through. Without a layer marker it is always `NoLayer`, whatever the
 /// requirement: that wiring mistake must surface, never pass.
 pub(crate) fn judge_scopes(
     parts: &Parts,
     required: &[String],
+    claims: &[ClaimClause],
     static_bypasses: bool,
 ) -> ScopeVerdict {
     if parts.extensions.get::<GateRan>().is_none() {
         return ScopeVerdict::NoLayer;
     }
-    if required.is_empty() {
+    if required.is_empty() && claims.is_empty() {
         return ScopeVerdict::Pass;
     }
     match parts.extensions.get::<Credential>() {
         Some(Credential::OAuth(token)) => {
-            if missing_scopes(&token.scopes, required.iter().map(String::as_str)).is_empty() {
+            if missing_scopes(&token.scopes, required.iter().map(String::as_str)).is_empty()
+                && claims.iter().all(|clause| clause.satisfied_by(token))
+            {
                 ScopeVerdict::Pass
             } else {
                 ScopeVerdict::Refuse(TokenRejection::InsufficientScope)
@@ -1097,6 +1128,23 @@ pub(crate) fn scope_refusal<B: Default + 'static>(
     required: &[String],
     what: &'static str,
 ) -> Response<B> {
+    scope_refusal_with_claims(parts, rejection, required, &[], what)
+}
+
+/// [`scope_refusal`] for a requirement that also had claim clauses
+/// (`McpToolScopes`). The response is byte-identical to the scope-only one
+/// for the same `required` scopes: the 403 challenge names scopes only, and
+/// no claim name or value ever enters `WWW-Authenticate`. With clauses, the
+/// refusal log line adds a `required_claims` field holding the claim NAMES
+/// only, never a configured or presented value.
+pub(crate) fn scope_refusal_with_claims<B: Default + 'static>(
+    parts: &Parts,
+    rejection: &TokenRejection,
+    required: &[String],
+    claims: &[ClaimClause],
+    what: &'static str,
+) -> Response<B> {
+    let claim_names: Vec<&str> = claims.iter().map(|c| c.claim.as_str()).collect();
     let path = parts.uri.path();
     let mechanism = Mechanism::of_request(parts.extensions.get::<Credential>(), rejection);
     // `Scoped` and the axum extractors are the handler-side callers; the
@@ -1152,6 +1200,19 @@ pub(crate) fn scope_refusal<B: Default + 'static>(
     };
     count_request(stage, Outcome::Rejected, mechanism, reason);
     match (rejection, &gate.oauth) {
+        (TokenRejection::InsufficientScope, None) if !claim_names.is_empty() => error!(
+            path = %path,
+            what,
+            required = ?required,
+            required_claims = ?claim_names,
+            auth.outcome = Outcome::Rejected.as_str(),
+            auth.mechanism = mechanism.as_str(),
+            auth.reason = reason,
+            auth.status = status,
+            "Server misconfiguration: the route requires scopes or claim values, but its \
+             authentication layer has no OAuth validator, so no credential can carry them; \
+             refusing the request"
+        ),
         (TokenRejection::InsufficientScope, None) => error!(
             path = %path,
             what,
@@ -1163,6 +1224,27 @@ pub(crate) fn scope_refusal<B: Default + 'static>(
             "Server misconfiguration: the route requires scopes, but its authentication layer \
              has no OAuth validator, so no credential can carry them; refusing the request"
         ),
+        (TokenRejection::InsufficientScope, Some(_)) if !claim_names.is_empty() => {
+            let present = match parts.extensions.get::<Credential>() {
+                Some(Credential::OAuth(token)) => token.scopes.clone(),
+                _ => Vec::new(),
+            };
+            // The claim names only: a configured value, and above all a
+            // presented one (a group membership), never reaches the log.
+            info!(
+                path = %path,
+                what,
+                required = ?required,
+                required_claims = ?claim_names,
+                present = ?crate::token::scopes_for_log(&present),
+                static_token = matches!(parts.extensions.get::<Credential>(), Some(Credential::StaticToken)),
+                auth.outcome = Outcome::Rejected.as_str(),
+                auth.mechanism = mechanism.as_str(),
+                auth.reason = reason,
+                auth.status = status,
+                "The credential lacks the scopes or claim values this route requires"
+            );
+        }
         (TokenRejection::InsufficientScope, Some(_)) => {
             let present = match parts.extensions.get::<Credential>() {
                 Some(Credential::OAuth(token)) => token.scopes.clone(),
@@ -1404,7 +1486,7 @@ where
             // Decided before the inner call and never held across it, so the
             // future is `Send` without `ResBody: Send`.
             let (parts, body) = request.into_parts();
-            let verdict = judge_scopes(&parts, &require.scopes, require.static_bypasses);
+            let verdict = judge_scopes(&parts, &require.scopes, &[], require.static_bypasses);
             let rejection = match verdict {
                 ScopeVerdict::Pass => return inner.call(Request::from_parts(parts, body)).await,
                 ScopeVerdict::Refuse(rejection) => rejection,

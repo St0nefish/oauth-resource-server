@@ -26,7 +26,15 @@ pub const STATIC_LABEL: &str = "ci-runner";
 pub const PURGE_CALL: &str =
     r#"{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"purge"}}"#;
 
-/// A 5 KB `kid` full of control characters and ANSI escapes.
+/// A `tools/call` for the one tool with a claim requirement.
+pub const PROMOTE_CALL: &str =
+    r#"{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"promote"}}"#;
+/// The `groups` value `promote` needs; a configured value, never logged.
+pub const PROMOTE_GROUP: &str = "obs-group-value-Zq9";
+/// A `groups` value a refused token carries; a presented value, never logged.
+pub const PRESENTED_GROUP: &str = "obs-presented-group-Kv4";
+
+/// A 5 KB `kid`full of control characters and ANSI escapes.
 pub fn hostile_kid() -> String {
     let mut kid = String::from("\u{1b}[31mRED\u{1b}[0m\u{7}\r\n\u{202e}");
     while kid.len() < 5 * 1024 {
@@ -66,9 +74,11 @@ pub async fn fixture() -> Fixture {
                 .route_layer(RequireScopes::new(["api:admin"])),
         )
         .merge(
-            Router::new()
-                .route("/mcp", post(ok))
-                .route_layer(McpToolScopes::new().tool("purge", ["api:admin"])),
+            Router::new().route("/mcp", post(ok)).route_layer(
+                McpToolScopes::new()
+                    .tool("purge", ["api:admin"])
+                    .tool_claim("promote", "groups", [PROMOTE_GROUP]),
+            ),
         )
         .route_layer(strict);
     let app = Router::new()

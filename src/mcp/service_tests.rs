@@ -556,3 +556,148 @@ async fn behind_the_http_layer_with_a_full_body() {
         (200, None, body.into_bytes())
     );
 }
+
+/// A token with `scope` and the extra claims in `extra`.
+fn token_with(scope: &str, extra: serde_json::Value) -> String {
+    let mut claims = serde_json::json!({
+        "iss": testing::ISSUER, "aud": testing::AUDIENCE, "sub": "user-1",
+        "exp": testing::now() + 3600, "scope": scope,
+    });
+    claims
+        .as_object_mut()
+        .unwrap()
+        .extend(extra.as_object().unwrap().clone());
+    testing::mint(testing::KEY_A_PEM, testing::KID_A, &claims)
+}
+
+/// `purge` needs `mcp:write` and the `admins` or `ops` group; `approve`
+/// needs a `role` of `approver` and no scope of its own.
+fn claim_scopes() -> McpToolScopes {
+    McpToolScopes::new()
+        .default(["mcp:read"])
+        .tool("purge", ["mcp:write"])
+        .tool_claim("purge", "groups", ["admins", "ops"])
+        .tool_claim("approve", "role", ["approver"])
+}
+
+/// The challenge the same layer sends a token lacking `mcp:write` on a
+/// scope-only `purge` entry.
+async fn scope_only_challenge(v: &Arc<OAuthValidator>) -> String {
+    let app = app(
+        strict(v),
+        McpToolScopes::new()
+            .default(["mcp:read"])
+            .tool("purge", ["mcp:write"]),
+    );
+    post(&app, Some(&token("mcp:read")), &call("purge"))
+        .await
+        .1
+        .unwrap()
+}
+
+#[tokio::test]
+async fn a_tool_claim_is_enforced_with_a_scope_only_challenge() {
+    let (_jwks, v) = validator().await;
+    let app = app(strict(&v), claim_scopes());
+    let body = call("purge");
+    // An array claim and a string claim both satisfy the clause.
+    for groups in [
+        serde_json::json!({"groups": ["staff", "admins"]}),
+        serde_json::json!({"groups": "ops"}),
+    ] {
+        let t = token_with("mcp:read mcp:write", groups.clone());
+        assert_eq!(post(&app, Some(&t), &body).await, served(&body), "{groups}");
+    }
+    // Lacking the value (a space-delimited string is one value, not split;
+    // matching is case-sensitive), or the claim altogether: 403, with
+    // exactly the challenge a scope-only refusal for the same scopes sends —
+    // no claim name or value in it.
+    let scope_only = scope_only_challenge(&v).await;
+    for groups in [
+        serde_json::json!({"groups": ["staff"]}),
+        serde_json::json!({"groups": "admins ops"}),
+        serde_json::json!({"groups": ["Admins"]}),
+        serde_json::json!({}),
+    ] {
+        let t = token_with("mcp:read mcp:write", groups.clone());
+        let seen = post(&app, Some(&t), &body).await;
+        assert_eq!(
+            seen,
+            (403, Some(challenge_for("mcp:read mcp:write")), Vec::new()),
+            "{groups}"
+        );
+        let challenge = seen.1.unwrap();
+        assert_eq!(challenge, scope_only);
+        assert!(!challenge.contains("groups") && !challenge.contains("admins"));
+    }
+    // The scope is still needed alongside the claim.
+    let t = token_with("mcp:read", serde_json::json!({"groups": ["admins"]}));
+    assert_eq!(
+        post(&app, Some(&t), &body).await,
+        (403, Some(challenge_for("mcp:read mcp:write")), Vec::new())
+    );
+    // A claim-only tool needs no scope of its own (only the validator's
+    // `mcp:read` floor), not the default's either.
+    let approve = call("approve");
+    let approver = token_with("mcp:read", serde_json::json!({"role": "approver"}));
+    assert_eq!(
+        post(&app, Some(&approver), &approve).await,
+        served(&approve)
+    );
+    assert_eq!(
+        post(&app, Some(&token("mcp:read mcp:write")), &approve).await,
+        (403, Some(challenge_for("mcp:read")), Vec::new())
+    );
+}
+
+#[tokio::test]
+async fn a_static_token_meets_a_claim_only_with_the_bypass() {
+    let (_jwks, v) = validator().await;
+    let approve = call("approve");
+    let refused = app(strict(&v), claim_scopes());
+    assert_eq!(
+        post(&refused, Some(STATIC), &approve).await,
+        (403, Some(challenge_for("mcp:read")), Vec::new())
+    );
+    let bypass = app(strict(&v), claim_scopes().static_token_bypasses_scopes());
+    assert_eq!(
+        post(&bypass, Some(STATIC), &approve).await,
+        served(&approve)
+    );
+}
+
+#[tokio::test]
+async fn no_credential_on_a_claim_requirement_is_the_layers_401() {
+    let (_jwks, v) = validator().await;
+    let optional = AuthLayer::builder()
+        .oauth(Arc::clone(&v))
+        .optional()
+        .build()
+        .unwrap();
+    // No default requirement: only the claim-only tool needs anything.
+    let app = app(
+        optional,
+        McpToolScopes::new().tool_claim("approve", "role", ["approver"]),
+    );
+    assert_eq!(
+        post(&app, None, &call("approve")).await,
+        (401, Some(v.invalid_token_challenge()), Vec::new())
+    );
+    assert_eq!(
+        post(&app, None, &call("search")).await,
+        served(&call("search"))
+    );
+}
+
+#[tokio::test]
+async fn a_batch_needs_every_calls_claims() {
+    let (_jwks, v) = validator().await;
+    let app = app(strict(&v), claim_scopes());
+    let batch = format!("[{},{}]", call("search"), call("approve"));
+    assert_eq!(
+        post(&app, Some(&token("mcp:read")), &batch).await,
+        (403, Some(challenge_for("mcp:read")), Vec::new())
+    );
+    let approver = token_with("mcp:read", serde_json::json!({"role": ["approver"]}));
+    assert_eq!(post(&app, Some(&approver), &batch).await, served(&batch));
+}

@@ -280,10 +280,7 @@ impl AuthorizedToken {
     ///
     /// let token = AuthorizedToken::new(Some("user-1".into()), None, ["api:read"])
     ///     .with_claims(json!({"groups": ["admins", "dev"]}).as_object().unwrap().clone());
-    /// let in_admins = token.claims()["groups"]
-    ///     .as_array()
-    ///     .is_some_and(|g| g.iter().any(|v| v == "admins"));
-    /// assert!(in_admins);
+    /// assert!(token.has_claim_value("groups", "admins"));
     /// ```
     pub fn claims(&self) -> &Map<String, Value> {
         &self.claims
@@ -325,6 +322,152 @@ impl AuthorizedToken {
     /// ```
     pub fn claims_as<T: DeserializeOwned>(&self) -> Result<T, serde_json::Error> {
         serde_json::from_value(Value::Object((*self.claims).clone()))
+    }
+
+    /// The string values of the top-level claim `name`, for reading a role or
+    /// group claim: a string claim is one value (`vec![s]`, NOT split on
+    /// whitespace, unlike scopes, and like
+    /// [`required_claims`](crate::OAuthConfig::required_claims)); an array
+    /// yields its string elements in order (non-strings are skipped, nested
+    /// arrays are not flattened); any other shape, or an absent claim, yields
+    /// an empty list.
+    ///
+    /// `name` is the literal claim name: a name containing dots, such as
+    /// `https://example.com/roles`, is looked up as that one key, never split.
+    /// For a claim nested in an object (Keycloak's `realm_access.roles`) use
+    /// [`claim_values_at`](Self::claim_values_at).
+    ///
+    /// # Security
+    ///
+    /// The values come from the signature-verified claim map, on a token a
+    /// validation produced. This is for per-request authorization decisions,
+    /// unlike the global [`required_claims`](crate::OAuthConfig::required_claims)
+    /// gate, which every token must pass.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use oauth_resource_server::AuthorizedToken;
+    /// use serde_json::json;
+    ///
+    /// let token = AuthorizedToken::new(None, None, ["api:read"]).with_claims(
+    ///     json!({"groups": ["admins", "dev"], "role": "a b"})
+    ///         .as_object()
+    ///         .unwrap()
+    ///         .clone(),
+    /// );
+    /// assert_eq!(token.claim_values("groups"), ["admins", "dev"]);
+    /// assert_eq!(token.claim_values("role"), ["a b"]);
+    /// assert!(token.claim_values("missing").is_empty());
+    /// ```
+    pub fn claim_values(&self, name: &str) -> Vec<&str> {
+        self.claims
+            .get(name)
+            .map(string_members)
+            .unwrap_or_default()
+    }
+
+    /// Like [`claim_values`](Self::claim_values) for a claim nested in objects,
+    /// named by explicit path segments, e.g. `&["realm_access", "roles"]`.
+    /// Every intermediate value must be a JSON object, else (and for an empty
+    /// path, or a missing segment) the result is empty.
+    ///
+    /// Segments rather than a dotted string, because claim names legitimately
+    /// contain dots (`https://example.com/roles` is one claim name):
+    /// [`claim_values`](Self::claim_values) with such a name looks up that
+    /// literal key.
+    ///
+    /// # Security
+    ///
+    /// Same as [`claim_values`](Self::claim_values): verified claims, meant for
+    /// per-request authorization decisions.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use oauth_resource_server::AuthorizedToken;
+    /// use serde_json::json;
+    ///
+    /// let token = AuthorizedToken::new(None, None, ["api:read"]).with_claims(
+    ///     json!({"realm_access": {"roles": ["editor", "viewer"]}})
+    ///         .as_object()
+    ///         .unwrap()
+    ///         .clone(),
+    /// );
+    /// assert_eq!(
+    ///     token.claim_values_at(&["realm_access", "roles"]),
+    ///     ["editor", "viewer"]
+    /// );
+    /// assert!(token.claim_values_at(&["realm_access", "nope"]).is_empty());
+    /// assert!(token.claim_values_at(&[]).is_empty());
+    /// ```
+    pub fn claim_values_at(&self, path: &[&str]) -> Vec<&str> {
+        let Some((first, rest)) = path.split_first() else {
+            return Vec::new();
+        };
+        let mut current = match self.claims.get(*first) {
+            Some(v) => v,
+            None => return Vec::new(),
+        };
+        for segment in rest {
+            match current.as_object().and_then(|o| o.get(*segment)) {
+                Some(v) => current = v,
+                None => return Vec::new(),
+            }
+        }
+        string_members(current)
+    }
+
+    /// Whether the top-level claim `name` holds `value` (exact, case-sensitive),
+    /// per [`claim_values`](Self::claim_values): the claim equals the string,
+    /// or is an array with that string element.
+    ///
+    /// # Security
+    ///
+    /// Reads the signature-verified claims; use it for per-request
+    /// authorization decisions (a handler checking a group), unlike the global
+    /// [`required_claims`](crate::OAuthConfig::required_claims) gate.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use oauth_resource_server::AuthorizedToken;
+    /// use serde_json::json;
+    ///
+    /// let token = AuthorizedToken::new(None, None, ["api:read"])
+    ///     .with_claims(json!({"groups": ["admins"]}).as_object().unwrap().clone());
+    /// assert!(token.has_claim_value("groups", "admins"));
+    /// assert!(!token.has_claim_value("groups", "Admins"));
+    /// assert!(!token.has_claim_value("roles", "admins"));
+    /// ```
+    pub fn has_claim_value(&self, name: &str, value: &str) -> bool {
+        self.claim_values(name).contains(&value)
+    }
+
+    /// Whether the nested claim at `path` holds `value` (exact, case-sensitive),
+    /// per [`claim_values_at`](Self::claim_values_at).
+    ///
+    /// # Security
+    ///
+    /// Same as [`has_claim_value`](Self::has_claim_value).
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use oauth_resource_server::AuthorizedToken;
+    /// use serde_json::json;
+    ///
+    /// let token = AuthorizedToken::new(None, None, ["api:read"]).with_claims(
+    ///     json!({"realm_access": {"roles": ["editor"]}})
+    ///         .as_object()
+    ///         .unwrap()
+    ///         .clone(),
+    /// );
+    /// assert!(token.has_claim_value_at(&["realm_access", "roles"], "editor"));
+    /// assert!(!token.has_claim_value_at(&["realm_access", "roles"], "admin"));
+    /// ```
+    pub fn has_claim_value_at(&self, path: &[&str], value: &str) -> bool {
+        self.claim_values_at(path).contains(&value)
     }
 
     /// Replace the claim set, for building a token in a test. Only the claim
@@ -1075,6 +1218,25 @@ pub(crate) fn describe_kid(kid: Option<&str>) -> String {
     }
 }
 
+/// The string members of a claim value: a string is itself, an array its
+/// string elements in order; anything else has none.
+fn string_members(v: &Value) -> Vec<&str> {
+    match v {
+        Value::String(s) => vec![s.as_str()],
+        Value::Array(items) => items.iter().filter_map(Value::as_str).collect(),
+        _ => Vec::new(),
+    }
+}
+
+/// Whether a token's claim satisfies a `required_claims` value: equal to it
+/// (JSON equality), or an array with an element equal to it. `required` is a
+/// string, number or boolean (`resolve` refuses anything else); a hand-edited
+/// `null`, array or object is matched by the same rule, never widened.
+pub(crate) fn claim_matches(actual: &Value, required: &Value) -> bool {
+    actual == required
+        || matches!(actual, Value::Array(items) if items.iter().any(|item| item == required))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1418,5 +1580,99 @@ mod tests {
             "\"expired\"",
             "a derived response type gets the label too"
         );
+    }
+
+    fn token_with(claims: Value) -> AuthorizedToken {
+        AuthorizedToken::new(None, None, ["a"]).with_claims(claims.as_object().unwrap().clone())
+    }
+
+    #[test]
+    fn claim_values_reads_a_string_as_one_value_and_an_array_as_its_strings() {
+        let t = token_with(serde_json::json!({
+            "one": "admins",
+            "many": ["a", 1, null, ["nested"], "b"],
+            "num": 5, "flag": true, "obj": {"x": "y"}, "nil": null
+        }));
+        assert_eq!(t.claim_values("one"), ["admins"]);
+        assert_eq!(t.claim_values("many"), ["a", "b"]);
+        for name in ["num", "flag", "obj", "nil", "absent"] {
+            assert!(t.claim_values(name).is_empty(), "{name}");
+        }
+    }
+
+    #[test]
+    fn claim_values_does_not_split_a_string_on_whitespace() {
+        let t = token_with(serde_json::json!({"role": "a b", "list": ["c d"]}));
+        assert_eq!(t.claim_values("role"), ["a b"]);
+        assert!(!t.has_claim_value("role", "a"));
+        assert_eq!(t.claim_values("list"), ["c d"]);
+    }
+
+    #[test]
+    fn claim_values_looks_up_a_dotted_name_as_one_literal_key() {
+        let t = token_with(serde_json::json!({
+            "https://example.com/roles": ["admin"],
+            "a": {"b": ["nested"]}
+        }));
+        assert_eq!(t.claim_values("https://example.com/roles"), ["admin"]);
+        assert!(t.claim_values("a.b").is_empty());
+    }
+
+    #[test]
+    fn claim_values_at_walks_objects_and_is_empty_for_every_miss() {
+        let t = token_with(serde_json::json!({
+            "realm_access": {"roles": ["editor", "viewer"], "one": "x"},
+            "scalar": "s", "list": [{"roles": ["r"]}]
+        }));
+        assert_eq!(
+            t.claim_values_at(&["realm_access", "roles"]),
+            ["editor", "viewer"]
+        );
+        assert_eq!(t.claim_values_at(&["realm_access", "one"]), ["x"]);
+        assert_eq!(t.claim_values_at(&["scalar"]), ["s"]);
+        assert!(t.claim_values_at(&["realm_access", "missing"]).is_empty());
+        assert!(t.claim_values_at(&["missing", "roles"]).is_empty());
+        assert!(t.claim_values_at(&["scalar", "roles"]).is_empty());
+        assert!(t.claim_values_at(&["list", "roles"]).is_empty());
+        assert!(t.claim_values_at(&[]).is_empty());
+    }
+
+    #[test]
+    fn has_claim_value_is_exact_and_case_sensitive() {
+        let t = token_with(serde_json::json!({
+            "groups": ["admins"], "realm_access": {"roles": ["editor"]}
+        }));
+        assert!(t.has_claim_value("groups", "admins"));
+        assert!(!t.has_claim_value("groups", "Admins"));
+        assert!(!t.has_claim_value("groups", "admin"));
+        assert!(t.has_claim_value_at(&["realm_access", "roles"], "editor"));
+        assert!(!t.has_claim_value_at(&["realm_access", "roles"], "EDITOR"));
+        assert!(!t.has_claim_value_at(&[], "editor"));
+    }
+
+    #[test]
+    fn has_claim_value_agrees_with_the_required_claims_matcher_for_every_shape() {
+        let shapes = [
+            ("s", serde_json::json!("admins")),
+            ("arr", serde_json::json!(["admins", "dev"])),
+            ("mixed", serde_json::json!(["admins", 1, true, null])),
+            ("num", serde_json::json!(1)),
+            ("bool", serde_json::json!(true)),
+            ("obj", serde_json::json!({"admins": "admins"})),
+            ("nil", serde_json::json!(null)),
+        ];
+        let mut claims = Map::new();
+        for (name, v) in &shapes {
+            claims.insert((*name).to_owned(), v.clone());
+        }
+        let t = AuthorizedToken::new(None, None, ["a"]).with_claims(claims.clone());
+        for name in ["s", "arr", "mixed", "num", "bool", "obj", "nil", "absent"] {
+            for value in ["admins", "dev", "1", "true", "null", "Admins", ""] {
+                let expected = claims
+                    .get(name)
+                    .is_some_and(|c| claim_matches(c, &Value::String(value.to_owned())));
+                assert_eq!(t.has_claim_value(name, value), expected, "{name} {value:?}");
+            }
+        }
     }
 }

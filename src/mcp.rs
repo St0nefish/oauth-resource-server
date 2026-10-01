@@ -1,5 +1,5 @@
 //! An integration helper for [Model Context Protocol](https://modelcontextprotocol.io)
-//! servers (feature `mcp`): per-tool scope requirements, enforced before the
+//! servers (feature `mcp`): per-tool scope (and claim) requirements, enforced before the
 //! MCP server sees the request. The rest of this crate is protocol-agnostic;
 //! this module is the one place that knows what a JSON-RPC `tools/call` looks
 //! like, and it depends on nothing MCP-specific (no MCP SDK — `serde_json`
@@ -81,6 +81,29 @@
 //! its body is read.
 //! Anything served reaches the MCP server with its body byte-identical.
 //!
+//! # Claim requirements
+//!
+//! Next to scopes, the default and each tool can require claim values
+//! ([`default_claim`](McpToolScopes::default_claim),
+//! [`tool_claim`](McpToolScopes::tool_claim)): a clause names a top-level
+//! claim and the values that satisfy it (any one of them, matched as
+//! [`AuthorizedToken::has_claim_value`](crate::AuthorizedToken::has_claim_value)
+//! does), and every clause must hold. Wherever the table above says "scopes",
+//! read "scopes and clauses": a configured tool (named by
+//! [`tool`](McpToolScopes::tool) or [`tool_claim`](McpToolScopes::tool_claim))
+//! needs its own scopes and clauses only, never the default's; a batch needs
+//! every clause any of its messages needs; the strictest set holds every
+//! clause in the configuration. Clauses are deduplicated but never merged by
+//! claim name, since merging their values would widen access — so two tools
+//! needing `role` = `a` and `role` = `b` make an unclassifiable body need
+//! both.
+//!
+//! A missing claim value is refused exactly as a missing scope: 403, with a
+//! challenge naming the scopes only (RFC 6750 has no claim error), so no
+//! claim name or value ever enters `WWW-Authenticate`. A static token has no
+//! claims and is refused whenever a clause applies, unless
+//! [`static_token_bypasses_scopes`](McpToolScopes::static_token_bypasses_scopes).
+//!
 //! # Tool names are matched exactly
 //!
 //! A `tools/call` is matched to a [`tool`](McpToolScopes::tool) entry byte
@@ -124,7 +147,9 @@
 //! Nothing from the body — tool name, arguments, identifiers — is ever
 //! logged; refusals are logged (target `oauth_resource_server::http_layer`,
 //! as for [`crate::http_layer::RequireScopes`], with the same stable
-//! `auth.*` fields) with the request path and the configured scopes only.
+//! `auth.*` fields) with the request path and the configured scopes only —
+//! plus, for a requirement with claim clauses, a `required_claims` field
+//! holding the claim names, never a configured or presented value.
 //! Oversized and unreadable bodies are logged at `warn` with the path and
 //! the limit; those are not authentication decisions, so they carry no
 //! `auth.*` field and are not counted by the `metrics` feature.
@@ -164,7 +189,10 @@ use serde::de::{DeserializeSeed, MapAccess, SeqAccess, Visitor};
 use serde::{Deserialize, Deserializer};
 use tracing::warn;
 
-use crate::http_layer::{InvalidScope, ScopeVerdict, checked_scopes, judge_scopes, scope_refusal};
+use crate::http_layer::{
+    ClaimClause, InvalidScope, ScopeVerdict, checked_scopes, judge_scopes, scope_refusal,
+    scope_refusal_with_claims,
+};
 use crate::token::TokenRejection;
 
 /// The default [`McpToolScopes::body_limit`]: 1 MiB.
@@ -190,26 +218,62 @@ pub const MAX_BODY_LIMIT: usize = 64 * 1024 * 1024;
 /// is not an RFC 6749 §3.3 scope-token (empty, or holding a space, `"`,
 /// `\`, a control or non-ASCII character) — no token can carry one — and
 /// [`body_limit`](Self::body_limit) outside
-/// [`MIN_BODY_LIMIT`]`..=`[`MAX_BODY_LIMIT`]. They are for literals in code;
-/// the `try_` forms ([`try_default`](Self::try_default),
-/// [`try_tool`](Self::try_tool), [`try_body_limit`](Self::try_body_limit))
-/// return a [`McpScopesError`] instead, for settings read from
-/// configuration.
+/// [`MIN_BODY_LIMIT`]`..=`[`MAX_BODY_LIMIT`]; [`default_claim`](Self::default_claim)
+/// and [`tool_claim`](Self::tool_claim) panic on a blank claim name, no
+/// values, or a blank value. They are for literals in code; the `try_` forms
+/// ([`try_default`](Self::try_default), [`try_tool`](Self::try_tool),
+/// [`try_default_claim`](Self::try_default_claim),
+/// [`try_tool_claim`](Self::try_tool_claim),
+/// [`try_body_limit`](Self::try_body_limit)) return a [`McpScopesError`]
+/// instead, for settings read from configuration.
 #[derive(Clone, Debug)]
 pub struct McpToolScopes {
     rules: Arc<Rules>,
 }
 
+/// What one kind of request needs: scopes (all-of) and claim clauses (all-of,
+/// each any-of within).
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+struct Requirement {
+    scopes: Vec<String>,
+    claims: Vec<ClaimClause>,
+}
+
+impl Requirement {
+    fn is_empty(&self) -> bool {
+        self.scopes.is_empty() && self.claims.is_empty()
+    }
+
+    /// Add `other`'s scopes and clauses, deduplicated in order. Clauses are
+    /// deduplicated by structural equality only, never merged by claim name:
+    /// merging two clauses' values would widen access.
+    fn absorb(&mut self, other: &Requirement) {
+        for scope in &other.scopes {
+            if !self.scopes.contains(scope) {
+                self.scopes.push(scope.clone());
+            }
+        }
+        for clause in &other.claims {
+            if !self.claims.contains(clause) {
+                self.claims.push(clause.clone());
+            }
+        }
+    }
+}
+
 #[derive(Clone, Debug)]
 struct Rules {
-    default: Vec<String>,
-    /// In the order configured; a repeated name replaces the earlier entry.
-    tools: Vec<(String, Vec<String>)>,
-    /// `default` followed by every tool's scopes, deduplicated.
-    strictest: Vec<String>,
-    /// Whether every request needs at least one scope, whatever its body:
-    /// a non-empty default and no tool with an empty list. Only then is a
-    /// request with no credential refused before its body is read.
+    default: Requirement,
+    /// In the order configured. `tool` replaces an entry's scopes (moving it
+    /// to the end, as a replaced entry always did) and keeps its clauses;
+    /// `tool_claim` adds a clause to an entry, creating it (with no scopes)
+    /// at the end when there is none.
+    tools: Vec<(String, Requirement)>,
+    /// `default` followed by every tool's requirement, deduplicated.
+    strictest: Requirement,
+    /// Whether every request needs something, whatever its body: a
+    /// non-empty default and no tool with an empty requirement. Only then is
+    /// a request with no credential refused before its body is read.
     always_scoped: bool,
     body_limit: usize,
     static_bypasses: bool,
@@ -217,30 +281,27 @@ struct Rules {
 
 impl Rules {
     fn with_strictest(mut self) -> Self {
-        let mut all: Vec<String> = Vec::new();
-        for scope in self
-            .default
-            .iter()
-            .chain(self.tools.iter().flat_map(|(_, scopes)| scopes))
-        {
-            if !all.contains(scope) {
-                all.push(scope.clone());
-            }
+        let mut all = self.default.clone();
+        for (_, requirement) in &self.tools {
+            all.absorb(requirement);
         }
         self.strictest = all;
-        self.always_scoped =
-            !self.default.is_empty() && self.tools.iter().all(|(_, scopes)| !scopes.is_empty());
+        self.always_scoped = !self.default.is_empty()
+            && self
+                .tools
+                .iter()
+                .all(|(_, requirement)| !requirement.is_empty());
         self
     }
 
-    fn for_tool(&self, name: &str) -> &[String] {
+    fn for_tool(&self, name: &str) -> &Requirement {
         self.tools
             .iter()
             .find(|(tool, _)| tool == name)
-            .map_or(&self.default, |(_, scopes)| scopes)
+            .map_or(&self.default, |(_, requirement)| requirement)
     }
 
-    /// The scopes a request body requires (see the module docs' table),
+    /// The requirement a request body carries (see the module docs' table),
     /// folded message by message as the body is parsed: what is kept is one
     /// flag per configured tool, never the messages themselves, so a batch of
     /// any length costs no more memory than one call.
@@ -249,7 +310,7 @@ impl Rules {
     /// with no chunks, a `GET`) needs the default; anything else that is not
     /// a JSON object or array — whitespace alone included — the strictest
     /// set.
-    fn for_body(&self, body: &[u8]) -> Vec<String> {
+    fn for_body(&self, body: &[u8]) -> Requirement {
         if body.is_empty() {
             return self.default.clone();
         }
@@ -286,22 +347,13 @@ impl Rules {
             return self.default.clone();
         }
         // The default first, then each needed tool's, in configuration order.
-        let mut all: Vec<String> = Vec::new();
-        let needed = needs_default
-            .then_some(&self.default[..])
-            .into_iter()
-            .chain(
-                self.tools
-                    .iter()
-                    .zip(&needs_tool)
-                    .filter(|(_, needed)| **needed)
-                    .map(|((_, scopes), _)| &scopes[..]),
-            );
-        for scopes in needed {
-            for scope in scopes {
-                if !all.contains(scope) {
-                    all.push(scope.clone());
-                }
+        let mut all = Requirement::default();
+        if needs_default {
+            all.absorb(&self.default);
+        }
+        for ((_, requirement), needed) in self.tools.iter().zip(&needs_tool) {
+            if *needed {
+                all.absorb(requirement);
             }
         }
         all
@@ -309,7 +361,8 @@ impl Rules {
 }
 
 /// Why [`McpToolScopes`]' fallible constructors ([`try_default`](McpToolScopes::try_default),
-/// [`try_tool`](McpToolScopes::try_tool), [`try_body_limit`](McpToolScopes::try_body_limit))
+/// [`try_tool`](McpToolScopes::try_tool), [`try_default_claim`](McpToolScopes::try_default_claim),
+/// [`try_tool_claim`](McpToolScopes::try_tool_claim), [`try_body_limit`](McpToolScopes::try_body_limit))
 /// refused a setting. `#[non_exhaustive]`: match with a wildcard arm.
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
 #[non_exhaustive]
@@ -320,6 +373,42 @@ pub enum McpScopesError {
     /// A body limit outside [`MIN_BODY_LIMIT`]`..=`[`MAX_BODY_LIMIT`].
     #[error("body limit {0} is outside {MIN_BODY_LIMIT}..={MAX_BODY_LIMIT}")]
     BodyLimitOutOfRange(usize),
+    /// A claim requirement ([`try_default_claim`](McpToolScopes::try_default_claim),
+    /// [`try_tool_claim`](McpToolScopes::try_tool_claim)) with a blank (empty
+    /// or whitespace-only) claim name, no accepted value, or a blank value —
+    /// none of which any token could satisfy as meant. `claim` is the claim
+    /// name as given.
+    #[error(
+        "the requirement on claim {claim:?} needs a non-blank claim name and at least one \
+         value, none of them blank"
+    )]
+    #[non_exhaustive]
+    InvalidClaimRequirement {
+        /// The claim name, as given (possibly blank).
+        claim: String,
+    },
+}
+
+/// A claim requirement, checked: a non-blank name and at least one value,
+/// none blank; values deduplicated in order.
+fn checked_claim(
+    claim: impl Into<String>,
+    values: impl IntoIterator<Item = impl Into<String>>,
+) -> Result<ClaimClause, McpScopesError> {
+    let claim = claim.into();
+    let mut any_of: Vec<String> = Vec::new();
+    let mut blank = claim.trim().is_empty();
+    for value in values {
+        let value = value.into();
+        blank |= value.trim().is_empty();
+        if !any_of.contains(&value) {
+            any_of.push(value);
+        }
+    }
+    if blank || any_of.is_empty() {
+        return Err(McpScopesError::InvalidClaimRequirement { claim });
+    }
+    Ok(ClaimClause { claim, any_of })
 }
 
 // `default` is the name the requirement reads best under; this type has no
@@ -333,9 +422,9 @@ impl McpToolScopes {
     pub fn new() -> Self {
         Self {
             rules: Arc::new(Rules {
-                default: Vec::new(),
+                default: Requirement::default(),
                 tools: Vec::new(),
-                strictest: Vec::new(),
+                strictest: Requirement::default(),
                 always_scoped: false,
                 body_limit: DEFAULT_BODY_LIMIT,
                 static_bypasses: false,
@@ -354,8 +443,10 @@ impl McpToolScopes {
     /// The scopes every request needs unless a [`tool`](Self::tool) entry
     /// says otherwise: every request with an empty body, every JSON-RPC message
     /// other than `tools/call`, and a `tools/call` for a tool with no entry.
-    /// Replaces a default given earlier. For literals in code; see
-    /// [`try_default`](Self::try_default) for scopes from configuration.
+    /// Replaces the default scopes given earlier (not the
+    /// [`default_claim`](Self::default_claim) clauses, which add to it). For
+    /// literals in code; see [`try_default`](Self::try_default) for scopes
+    /// from configuration.
     ///
     /// # Panics
     ///
@@ -376,14 +467,18 @@ impl McpToolScopes {
         scopes: impl IntoIterator<Item = impl Into<String>>,
     ) -> Result<Self, McpScopesError> {
         let scopes = checked_scopes(scopes)?;
-        Ok(self.update(|rules| rules.default = scopes))
+        Ok(self.update(|rules| rules.default.scopes = scopes))
     }
 
     /// The scopes a `tools/call` for the tool named `name` needs, instead of
     /// the [`default`](Self::default). An empty list means that tool needs
-    /// nothing beyond the authentication layer's own scopes. Replaces an
-    /// entry for the same name. For literals in code; see
-    /// [`try_tool`](Self::try_tool) for a map read from configuration.
+    /// nothing beyond the authentication layer's own scopes (and its own
+    /// [`tool_claim`](Self::tool_claim) clauses, if any): a configured tool
+    /// gets neither the default scopes nor the
+    /// [`default_claim`](Self::default_claim) clauses. Replaces the scopes of
+    /// an entry for the same name, keeping its claim clauses. For literals in
+    /// code; see [`try_tool`](Self::try_tool) for a map read from
+    /// configuration.
     ///
     /// # Security
     ///
@@ -443,8 +538,175 @@ impl McpToolScopes {
         let name = name.into();
         let scopes = checked_scopes(scopes)?;
         Ok(self.update(|rules| {
-            rules.tools.retain(|(tool, _)| *tool != name);
-            rules.tools.push((name, scopes));
+            let claims = rules
+                .tools
+                .iter()
+                .position(|(tool, _)| *tool == name)
+                .map(|i| rules.tools.remove(i).1.claims)
+                .unwrap_or_default();
+            rules.tools.push((name, Requirement { scopes, claims }));
+        }))
+    }
+
+    /// Add a claim clause every request needs unless its tool is configured
+    /// (by [`tool`](Self::tool) or [`tool_claim`](Self::tool_claim)): the
+    /// verified top-level claim `claim` must hold at least one of `values`.
+    /// Repeatable: every clause must hold (all-of), any one value within a
+    /// clause will do (any-of). Applies to the same requests as the
+    /// [`default`](Self::default) scopes, and on top of them. For literals in
+    /// code; see [`try_default_claim`](Self::try_default_claim) for values
+    /// from configuration.
+    ///
+    /// A value matches as
+    /// [`AuthorizedToken::has_claim_value`](crate::AuthorizedToken::has_claim_value)
+    /// does: the claim is that string, or an array with that string element —
+    /// exact and case-sensitive; a space-delimited string is one value, not
+    /// split. `claim` names a top-level claim literally (a dot is part of the
+    /// name).
+    ///
+    /// # Security
+    ///
+    /// A refusal is a 403 whose `WWW-Authenticate` challenge names scopes
+    /// only — RFC 6750 has no claim error — so a client is never told which
+    /// claim or value it lacked, and no claim name or value enters a header.
+    /// The log line names the claim, never a value. A static token carries
+    /// no claims: it is refused whenever a clause applies, unless
+    /// [`static_token_bypasses_scopes`](Self::static_token_bypasses_scopes),
+    /// which covers claims too.
+    ///
+    /// # Panics
+    ///
+    /// On a blank claim name, no values, or a blank value; see
+    /// [`McpScopesError::InvalidClaimRequirement`].
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use oauth_resource_server::mcp::McpToolScopes;
+    ///
+    /// // Every request needs the `staff` group, except calls to `search`.
+    /// let layer = McpToolScopes::new()
+    ///     .default_claim("groups", ["staff"])
+    ///     .tool("search", [] as [&str; 0]);
+    /// let staff = ["staff".to_string()];
+    /// assert_eq!(layer.claims_for_tool("write_document"), [("groups", &staff[..])]);
+    /// assert!(layer.claims_for_tool("search").is_empty());
+    /// ```
+    pub fn default_claim(
+        self,
+        claim: impl Into<String>,
+        values: impl IntoIterator<Item = impl Into<String>>,
+    ) -> Self {
+        self.try_default_claim(claim, values)
+            .unwrap_or_else(|e| panic!("McpToolScopes::default_claim: {e}"))
+    }
+
+    /// [`default_claim`](Self::default_claim) for values read from
+    /// configuration.
+    ///
+    /// # Errors
+    ///
+    /// [`McpScopesError::InvalidClaimRequirement`] on a blank claim name, no
+    /// values, or a blank value.
+    pub fn try_default_claim(
+        self,
+        claim: impl Into<String>,
+        values: impl IntoIterator<Item = impl Into<String>>,
+    ) -> Result<Self, McpScopesError> {
+        let clause = checked_claim(claim, values)?;
+        Ok(self.update(|rules| {
+            if !rules.default.claims.contains(&clause) {
+                rules.default.claims.push(clause);
+            }
+        }))
+    }
+
+    /// Add a claim clause a `tools/call` for the tool named `name` needs: the
+    /// verified top-level claim `claim` must hold at least one of `values`
+    /// (matched as in [`default_claim`](Self::default_claim)). Repeatable,
+    /// all-of across clauses, any-of within one; two clauses naming the same
+    /// claim are two requirements, never merged.
+    ///
+    /// This configures the tool: it then needs its own scopes (none, unless
+    /// [`tool`](Self::tool) gives some) and its own clauses — not the
+    /// [`default`](Self::default) scopes, nor the
+    /// [`default_claim`](Self::default_claim) clauses. Give a tool that should
+    /// also need the default scopes those scopes explicitly with `tool`.
+    ///
+    /// # Security
+    ///
+    /// The exact name matching of [`tool`](Self::tool)'s `# Security`
+    /// section applies, and the challenge and logging rules of
+    /// [`default_claim`](Self::default_claim)'s.
+    ///
+    /// # Panics
+    ///
+    /// On a blank claim name, no values, or a blank value; see
+    /// [`McpScopesError::InvalidClaimRequirement`].
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use oauth_resource_server::mcp::McpToolScopes;
+    ///
+    /// // `purge` needs `mcp:write` AND membership of `admins` or `ops`.
+    /// let layer = McpToolScopes::new()
+    ///     .default(["mcp:read"])
+    ///     .tool("purge", ["mcp:write"])
+    ///     .tool_claim("purge", "groups", ["admins", "ops"]);
+    /// assert_eq!(layer.scopes_for_tool("purge"), ["mcp:write"]);
+    /// let groups = ["admins".to_string(), "ops".to_string()];
+    /// assert_eq!(layer.claims_for_tool("purge"), [("groups", &groups[..])]);
+    /// ```
+    pub fn tool_claim(
+        self,
+        name: impl Into<String>,
+        claim: impl Into<String>,
+        values: impl IntoIterator<Item = impl Into<String>>,
+    ) -> Self {
+        self.try_tool_claim(name, claim, values)
+            .unwrap_or_else(|e| panic!("McpToolScopes::tool_claim: {e}"))
+    }
+
+    /// [`tool_claim`](Self::tool_claim) for values read from configuration.
+    /// The same exact name matching applies.
+    ///
+    /// # Errors
+    ///
+    /// [`McpScopesError::InvalidClaimRequirement`] on a blank claim name, no
+    /// values, or a blank value.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use oauth_resource_server::mcp::{McpScopesError, McpToolScopes};
+    ///
+    /// let refused = McpToolScopes::new().try_tool_claim("purge", "groups", [" "]);
+    /// assert!(matches!(
+    ///     refused,
+    ///     Err(McpScopesError::InvalidClaimRequirement { claim, .. }) if claim == "groups"
+    /// ));
+    /// ```
+    pub fn try_tool_claim(
+        self,
+        name: impl Into<String>,
+        claim: impl Into<String>,
+        values: impl IntoIterator<Item = impl Into<String>>,
+    ) -> Result<Self, McpScopesError> {
+        let name = name.into();
+        let clause = checked_claim(claim, values)?;
+        Ok(self.update(|rules| {
+            let i = match rules.tools.iter().position(|(tool, _)| *tool == name) {
+                Some(i) => i,
+                None => {
+                    rules.tools.push((name, Requirement::default()));
+                    rules.tools.len() - 1
+                }
+            };
+            let claims = &mut rules.tools[i].1.claims;
+            if !claims.contains(&clause) {
+                claims.push(clause);
+            }
         }))
     }
 
@@ -477,8 +739,9 @@ impl McpToolScopes {
         Ok(self.update(|rules| rules.body_limit = bytes))
     }
 
-    /// Let a static token through whatever the request requires, instead
-    /// of refusing it with 403.
+    /// Let a static token through whatever the request requires — scopes
+    /// and claim clauses alike (a static token has neither) — instead of
+    /// refusing it with 403.
     ///
     /// # Security
     ///
@@ -488,9 +751,25 @@ impl McpToolScopes {
         self.update(|rules| rules.static_bypasses = true)
     }
 
-    /// The scopes `tool` requires: its own entry, or the default.
+    /// The scopes `tool` requires: its own entry's (empty for a tool
+    /// configured by [`tool_claim`](Self::tool_claim) alone), or the default
+    /// for a tool with no entry.
     pub fn scopes_for_tool(&self, tool: &str) -> &[String] {
-        self.rules.for_tool(tool)
+        &self.rules.for_tool(tool).scopes
+    }
+
+    /// The claim clauses `tool` requires, as `(claim, accepted values)`
+    /// pairs in configuration order: its own entry's (empty for a tool
+    /// configured by [`tool`](Self::tool) alone), or the
+    /// [`default_claim`](Self::default_claim) clauses for a tool with no
+    /// entry. Every pair must hold; any one value within a pair will do.
+    pub fn claims_for_tool(&self, tool: &str) -> Vec<(&str, &[String])> {
+        self.rules
+            .for_tool(tool)
+            .claims
+            .iter()
+            .map(|clause| (clause.claim.as_str(), &clause.any_of[..]))
+            .collect()
     }
 }
 
@@ -597,7 +876,7 @@ where
         Box::pin(async move {
             let (parts, body) = request.into_parts();
             // No layer in front: refuse before reading anything.
-            if let ScopeVerdict::NoLayer = judge_scopes(&parts, &[], false) {
+            if let ScopeVerdict::NoLayer = judge_scopes(&parts, &[], &[], false) {
                 return Ok(scope_refusal(
                     &parts,
                     &TokenRejection::Missing,
@@ -624,7 +903,7 @@ where
                 return Ok(scope_refusal(
                     &parts,
                     &TokenRejection::Missing,
-                    &rules.default,
+                    &rules.default.scopes,
                     "McpToolScopes",
                 ));
             }
@@ -661,18 +940,25 @@ where
                 };
                 (rules.for_body(&bytes), ReqBody::from(bytes))
             };
-            match judge_scopes(&parts, &required, rules.static_bypasses) {
+            match judge_scopes(
+                &parts,
+                &required.scopes,
+                &required.claims,
+                rules.static_bypasses,
+            ) {
                 ScopeVerdict::Pass => inner.call(Request::from_parts(parts, body)).await,
-                ScopeVerdict::Refuse(rejection) => Ok(scope_refusal(
+                ScopeVerdict::Refuse(rejection) => Ok(scope_refusal_with_claims(
                     &parts,
                     &rejection,
-                    &required,
+                    &required.scopes,
+                    &required.claims,
                     "McpToolScopes",
                 )),
-                ScopeVerdict::NoLayer => Ok(scope_refusal(
+                ScopeVerdict::NoLayer => Ok(scope_refusal_with_claims(
                     &parts,
                     &TokenRejection::Missing,
-                    &required,
+                    &required.scopes,
+                    &required.claims,
                     "McpToolScopes",
                 )),
             }
@@ -1177,7 +1463,7 @@ mod tests {
     fn requirements_per_body() {
         let r = rules();
         let r = &r.rules;
-        let req = |json: &str| r.for_body(json.as_bytes());
+        let req = |json: &str| r.for_body(json.as_bytes()).scopes;
         assert_eq!(
             req(r#"{"method":"tools/call","params":{"name":"write_document"}}"#),
             ["mcp:write"]
@@ -1205,7 +1491,8 @@ mod tests {
         // member nobody looks at: an out-of-range number, invalid UTF-8.
         assert_eq!(req(r#"{"method":"initialize","x":1e999}"#), strictest);
         assert_eq!(
-            r.for_body(b"{\"method\":\"initialize\",\"x\":\"\xff\"}"),
+            r.for_body(b"{\"method\":\"initialize\",\"x\":\"\xff\"}")
+                .scopes,
             strictest
         );
         assert_eq!(req(r#"{"method":"initialize"} x"#), strictest);
@@ -1217,7 +1504,7 @@ mod tests {
     fn a_repeated_tool_entry_replaces_the_earlier_one() {
         let r = McpToolScopes::new().tool("t", ["a"]).tool("t", ["b"]);
         assert_eq!(r.scopes_for_tool("t"), ["b"]);
-        assert_eq!(r.rules.strictest, ["b"]);
+        assert_eq!(r.rules.strictest.scopes, ["b"]);
     }
 
     #[test]
@@ -1255,5 +1542,171 @@ mod tests {
     #[should_panic(expected = "body_limit")]
     fn a_body_limit_out_of_bounds_panics() {
         let _ = McpToolScopes::new().body_limit(MAX_BODY_LIMIT + 1);
+    }
+
+    fn clause(claim: &str, any_of: &[&str]) -> ClaimClause {
+        ClaimClause {
+            claim: claim.into(),
+            any_of: any_of.iter().map(|v| v.to_string()).collect(),
+        }
+    }
+
+    fn claim_rules() -> McpToolScopes {
+        McpToolScopes::new()
+            .default(["mcp:read"])
+            .default_claim("groups", ["staff"])
+            .tool("write_document", ["mcp:write"])
+            .tool_claim("write_document", "groups", ["editors", "admins"])
+            .tool_claim("purge", "role", ["a"])
+            .tool_claim("purge", "groups", ["admins"])
+            .tool_claim("approve", "role", ["b"])
+            .tool("search", [] as [&str; 0])
+    }
+
+    #[test]
+    fn claim_requirements_per_body() {
+        let r = claim_rules();
+        let r = &r.rules;
+        let req = |json: &str| r.for_body(json.as_bytes());
+        let call =
+            |tool: &str| format!(r#"{{"method":"tools/call","params":{{"name":"{tool}"}}}}"#);
+        // A configured tool: its own scopes and clauses, not the default's.
+        let write = req(&call("write_document"));
+        assert_eq!(write.scopes, ["mcp:write"]);
+        assert_eq!(write.claims, [clause("groups", &["editors", "admins"])]);
+        // Configured by `tool_claim` alone: no scopes, not the default's.
+        let purge = req(&call("purge"));
+        assert!(purge.scopes.is_empty());
+        assert_eq!(
+            purge.claims,
+            [clause("role", &["a"]), clause("groups", &["admins"])]
+        );
+        // `tool(.., [])` exempts from the default clauses too.
+        assert!(req(&call("search")).is_empty());
+        // Unconfigured tools and other methods: the default scopes and clauses.
+        for body in [call("other"), r#"{"method":"tools/list"}"#.to_string()] {
+            let got = req(&body);
+            assert_eq!(got.scopes, ["mcp:read"]);
+            assert_eq!(got.claims, [clause("groups", &["staff"])]);
+        }
+        assert_eq!(req("").claims, [clause("groups", &["staff"])]);
+        // A batch: the union, clauses deduplicated but never merged by name.
+        let batch = req(&format!(
+            "[{},{},{}]",
+            call("purge"),
+            call("approve"),
+            call("purge")
+        ));
+        assert!(batch.scopes.is_empty());
+        assert_eq!(
+            batch.claims,
+            [
+                clause("role", &["a"]),
+                clause("groups", &["admins"]),
+                clause("role", &["b"])
+            ]
+        );
+        // Unreadable or ambiguous: the strictest set, clauses included —
+        // `role` in {a} AND `role` in {b}, both demanded.
+        let strictest = Requirement {
+            scopes: vec!["mcp:read".into(), "mcp:write".into()],
+            claims: vec![
+                clause("groups", &["staff"]),
+                clause("groups", &["editors", "admins"]),
+                clause("role", &["a"]),
+                clause("groups", &["admins"]),
+                clause("role", &["b"]),
+            ],
+        };
+        assert_eq!(req("not json"), strictest);
+        assert_eq!(req(r#"{"method":"tools/call"}"#), strictest);
+        assert_eq!(req("  "), strictest);
+    }
+
+    #[test]
+    fn tool_and_tool_claim_compose_in_either_order() {
+        let a = McpToolScopes::new()
+            .tool_claim("t", "groups", ["x"])
+            .tool("t", ["s"]);
+        let b = McpToolScopes::new()
+            .tool("t", ["s"])
+            .tool_claim("t", "groups", ["x"]);
+        for r in [&a, &b] {
+            assert_eq!(r.scopes_for_tool("t"), ["s"]);
+            let x = ["x".to_string()];
+            assert_eq!(r.claims_for_tool("t"), [("groups", &x[..])]);
+        }
+        // Re-adding the same clause is a no-op; values are deduplicated.
+        let c = McpToolScopes::new()
+            .tool_claim("t", "groups", ["x", "x"])
+            .tool_claim("t", "groups", ["x"]);
+        assert_eq!(c.rules.for_tool("t").claims, [clause("groups", &["x"])]);
+        // Unconfigured: the default clauses; scope-only tool: none.
+        let d = McpToolScopes::new()
+            .default_claim("groups", ["staff"])
+            .tool("w", ["s"]);
+        let staff = ["staff".to_string()];
+        assert_eq!(d.claims_for_tool("nope"), [("groups", &staff[..])]);
+        assert!(d.claims_for_tool("w").is_empty());
+        assert!(d.scopes_for_tool("nope").is_empty());
+    }
+
+    #[test]
+    fn always_scoped_counts_claims() {
+        // A claim-only default, no tool: every request needs something.
+        assert!(
+            McpToolScopes::new()
+                .default_claim("g", ["x"])
+                .rules
+                .always_scoped
+        );
+        // A tool with only a clause still needs something.
+        assert!(
+            McpToolScopes::new()
+                .default_claim("g", ["x"])
+                .tool_claim("t", "g", ["y"])
+                .rules
+                .always_scoped
+        );
+        // A tool needing nothing at all makes some request free.
+        assert!(
+            !McpToolScopes::new()
+                .default_claim("g", ["x"])
+                .tool("t", [] as [&str; 0])
+                .rules
+                .always_scoped
+        );
+        assert!(!McpToolScopes::new().rules.always_scoped);
+    }
+
+    #[test]
+    fn invalid_claim_requirements_are_refused() {
+        let invalid = |r: Result<McpToolScopes, McpScopesError>, name: &str| match r {
+            Err(McpScopesError::InvalidClaimRequirement { claim, .. }) => assert_eq!(claim, name),
+            other => panic!("{other:?}"),
+        };
+        invalid(McpToolScopes::new().try_default_claim("", ["x"]), "");
+        invalid(McpToolScopes::new().try_default_claim("  ", ["x"]), "  ");
+        invalid(
+            McpToolScopes::new().try_default_claim("g", [] as [&str; 0]),
+            "g",
+        );
+        invalid(
+            McpToolScopes::new().try_tool_claim("t", "g", ["x", " "]),
+            "g",
+        );
+        invalid(McpToolScopes::new().try_tool_claim("t", "g", [""]), "g");
+        // Nothing was configured by a refused call.
+        let ok = McpToolScopes::new()
+            .try_default_claim("g", ["x"])
+            .and_then(|m| m.try_tool_claim("t", "g", ["y"]))
+            .unwrap();
+        assert_eq!(ok.rules.default.claims, [clause("g", &["x"])]);
+    }
+
+    #[test]
+    #[should_panic(expected = "McpToolScopes::tool_claim")]
+    fn an_invalid_claim_requirement_panics() {
+        let _ = McpToolScopes::new().tool_claim("t", "groups", [] as [&str; 0]);
     }
 }
