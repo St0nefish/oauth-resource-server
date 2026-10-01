@@ -1536,7 +1536,8 @@ an `InvalidToken`'s `kind()` names the check that failed).
   nothing. `McpToolScopes` classifies the body of a request under any
   method, reads at most its body limit (1 MiB by default) and refuses a
   larger body with 413; a body it cannot classify with certainty (not JSON,
-  a `tools/call` with no readable tool name, a repeated member) needs every
+  a `tools/call` with no readable tool name, a repeated member, a
+  serde_json `$serde_json::private::RawValue`/`Number` token key) needs every
   scope any tool requires, never fewer; a JSON-RPC batch needs every scope
   any of its calls needs; it never logs body content. Its claim clauses
   (`default_claim`, `tool_claim`) follow the same rules — an unclassifiable
@@ -2103,6 +2104,7 @@ needs:
 | `tools/call` for another tool, or any other method | the default |
 | a JSON-RPC batch | every scope any of its messages needs |
 | a body that is not JSON, a `tools/call` with no readable `params.name`, or a message repeating `method`, `params` or `params.name` | every scope in the configuration (default and all tools) |
+| a message with an object key `$serde_json::private::RawValue` or `$serde_json::private::Number` at any depth | every scope in the configuration: with serde_json's `raw_value` (on in any build with axum) or `arbitrary_precision` feature, `serde_json::Value` reads such an object as the JSON inside the key's string, so a dispatcher could see a different call there |
 | a body over the limit (`body_limit`, 1 MiB by default, 4 KiB to 64 MiB) | refused with 413, unread past the limit |
 | a body that fails while it is being read (the client disconnects, a transport error) | refused with a bare 400, logged at `warn` (no challenge: nothing about the credential was wrong) |
 

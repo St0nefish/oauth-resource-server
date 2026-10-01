@@ -39,6 +39,40 @@ confirmed, a fix is prepared in the private advisory, a new `0.x` version is
 published, and the advisory is disclosed once the fix is out, with credit to
 the reporter unless anonymity is requested.
 
+## Advisories
+
+Fixed vulnerabilities, newest first. Each also has an entry under
+**Security** in `CHANGELOG.md`.
+
+### `McpToolScopes` per-tool scope bypass through serde_json's `RawValue` token key (fixed in 0.3.1)
+
+- **Affected:** 0.2.0 through 0.3.0, the `mcp` feature (`McpToolScopes`)
+  only. Fixed in **0.3.1**.
+- **Conditions:** serde_json's `raw_value` feature (or, for the `Number`
+  variant, `arbitrary_precision`) is enabled in the server's build — axum
+  enables `raw_value`, so through Cargo feature unification most axum
+  servers have it — and the MCP server behind the layer parses request
+  bodies into `serde_json::Value` (or anything built on it).
+- **Impact:** with those features on, `serde_json::Value` reads an object
+  whose first key is `$serde_json::private::RawValue` as the JSON inside
+  that key's string value. A body such as
+  `{"$serde_json::private::RawValue":"{\"method\":\"tools/call\",\"params\":{\"name\":\"<tool>\"}}"}`
+  (or one wrapping a whole batch) was classified by `McpToolScopes` as an
+  ordinary non-tool-call message needing only the default scopes, while the
+  dispatcher saw a `tools/call` of `<tool>`: a caller holding the default
+  scopes could run a tool configured to need more. The same shape inside
+  `method` was misread the same way. Authentication itself, the layers'
+  own required scopes, and `RequireScopes`/`Scoped` were not affected.
+- **Fix:** a message with an object key `$serde_json::private::RawValue` or
+  `$serde_json::private::Number` anywhere in it (including in `method`,
+  `params` or any nested value) is unclassifiable and needs the strictest
+  set (the default and every tool's scopes and claim clauses). This narrows
+  accepted input — such bodies were never sent by a real MCP client — and
+  ships as a patch release under this crate's security-fix policy.
+- **Found by:** this repository's `mcp_tool_calls` fuzz target.
+- **Remediation:** upgrade to 0.3.1 (`cargo update -p oauth-resource-server`
+  on a `"0.3"` requirement; a `"0.2"` requirement must move to `"0.3"`).
+
 ## Security invariants this crate maintains
 
 These are the properties covered by the crate's own test suite and CI, and
@@ -180,7 +214,11 @@ the ones a report is most likely to concern:
 - `McpToolScopes` reads a request body under a limit enforced while it
   streams (1 MiB by default; a larger body is refused with 413 without being
   read further), gives a body it cannot classify with certainty (not JSON, no
-  readable tool name, a repeated member two parsers could read differently)
+  readable tool name, a repeated member two parsers could read differently,
+  or an object key `$serde_json::private::RawValue` or
+  `$serde_json::private::Number` at any depth, which `serde_json::Value`
+  with serde_json's `raw_value`/`arbitrary_precision` feature reads as the
+  JSON inside the key's string)
   the strictest scope set (and every claim clause in the configuration,
   never merged by claim name) rather than the default, authorizes every
   message of a JSON-RPC batch, classifies a body under any method (not only

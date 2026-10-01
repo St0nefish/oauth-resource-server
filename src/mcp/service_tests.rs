@@ -223,6 +223,29 @@ async fn an_unreadable_body_needs_the_strictest_set() {
 }
 
 #[tokio::test]
+async fn a_call_smuggled_in_a_serde_json_token_key_needs_the_strictest_set() {
+    let (_jwks, v) = validator().await;
+    let app = app(strict(&v), tool_scopes());
+    // `serde_json::Value` (with `raw_value` on, as axum turns it on) reads
+    // this as a `tools/call` of `purge`; it once passed with the default.
+    let smuggled = r#"{"$serde_json::private::RawValue":"{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"tools/call\",\"params\":{\"name\":\"purge\",\"arguments\":{}}}"}"#;
+    let seen: serde_json::Value = serde_json::from_str(smuggled).unwrap();
+    assert_eq!(seen["params"]["name"], "purge");
+    assert_eq!(
+        post(&app, Some(&token("mcp:read")), smuggled).await,
+        (
+            403,
+            Some(challenge_for("mcp:read mcp:write mcp:admin")),
+            Vec::new()
+        )
+    );
+    assert_eq!(
+        post(&app, Some(&token("mcp:read mcp:write mcp:admin")), smuggled).await,
+        served(smuggled)
+    );
+}
+
+#[tokio::test]
 async fn an_oversized_body_is_refused_unread() {
     let (_jwks, v) = validator().await;
     let app = app(strict(&v), tool_scopes().body_limit(MIN_BODY_LIMIT));

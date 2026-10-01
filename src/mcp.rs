@@ -56,6 +56,7 @@
 //! | a body whose message is anything else (`initialize`, `tools/list`, a notification, a response) | the default |
 //! | a JSON-RPC **batch** (an array) | every scope any of its messages requires: all of them must be authorized, or none is served |
 //! | a body that is not JSON, or a `tools/call` without a readable string `params.name`, or a message with a repeated `method`, `params` or `params.name` | the **strictest** set: the default and every tool's scopes together |
+//! | a message with an object key `$serde_json::private::RawValue` or `$serde_json::private::Number` at any depth (see below) | the **strictest** set |
 //! | a body larger than the [limit](McpToolScopes::body_limit) | refused with 413, unread beyond the limit |
 //! | a body that fails while it is being read (a client disconnect, a transport error) | refused with a bare 400, logged at `warn` |
 //!
@@ -123,7 +124,14 @@
 //! layer cannot classify with certainty is ever given less than the
 //! strictest set: an unreadable body, a `tools/call` with no readable tool
 //! name, and a message with a repeated member (which two JSON parsers can
-//! resolve to different values). A caller holding every scope loses nothing
+//! resolve to different values). So is a message holding one of serde_json's
+//! private token keys, `$serde_json::private::RawValue` or
+//! `$serde_json::private::Number`, anywhere inside it: with serde_json's
+//! `raw_value` (or `arbitrary_precision`) feature on in the server's build —
+//! axum turns `raw_value` on — `serde_json::Value` reads
+//! `{"$serde_json::private::RawValue":"<json>"}` as the JSON in that string,
+//! so a dispatcher parsing into `Value` would see a `tools/call` (or a whole
+//! batch) this layer saw as an ordinary object. A caller holding every scope loses nothing
 //! (the server answers a malformed body with its own error); everyone else
 //! is refused before it is parsed a second time. An over-limit body is
 //! refused rather than passed on, because it could only be passed unread.
@@ -978,8 +986,10 @@ pub(crate) enum Message {
     /// ([`UNKNOWN_TOOL`] for none). The name itself is never copied.
     ToolCall(usize),
     /// A `tools/call` with no readable string `params.name`, a message with
-    /// a repeated `method`, `params` or `params.name` member, or a batch
-    /// element that is not an object: not classified with certainty.
+    /// a repeated `method`, `params` or `params.name` member, a message with
+    /// a serde_json token key at any depth ([`RAW_VALUE_TOKEN`],
+    /// [`NUMBER_TOKEN`]), or a batch element that is not an object: not
+    /// classified with certainty.
     Ambiguous,
 }
 
@@ -1109,9 +1119,53 @@ macro_rules! accept_non_string_scalars {
     };
 }
 
+/// serde_json's private "magic" object keys. They are serde_json
+/// implementation details, not JSON: when the application's build enables
+/// serde_json's `raw_value` feature (axum does, so feature unification turns
+/// it on for most servers), `serde_json::Value` reads an object whose first
+/// key is [`RAW_VALUE_TOKEN`] as the JSON *inside that key's string value*,
+/// not as an object; with `arbitrary_precision`, an object whose first key
+/// is [`NUMBER_TOKEN`] becomes a number. So
+/// `{"$serde_json::private::RawValue":"{\"method\":\"tools/call\",…}"}` is a
+/// `tools/call` to an MCP dispatcher that parses into `Value`, while a plain
+/// JSON reading (this module's) sees one object with an unknown member. See
+/// serde_json's `raw_value` and `arbitrary_precision` features
+/// (<https://docs.rs/serde_json/latest/serde_json/value/struct.RawValue.html>,
+/// <https://github.com/serde-rs/json>); the strings are copied here because
+/// serde_json does not export them. A message holding either key at any
+/// depth is [`Message::Ambiguous`] — no real client sends one.
+const RAW_VALUE_TOKEN: &str = "$serde_json::private::RawValue";
+/// See [`RAW_VALUE_TOKEN`].
+const NUMBER_TOKEN: &str = "$serde_json::private::Number";
+
 /// Any JSON value, validated in full and then dropped: the stand-in for
 /// `IgnoredAny`, which skips a number or a string without checking it.
-struct Validate;
+/// `token_key`: whether an object anywhere inside it had a serde_json token
+/// key ([`RAW_VALUE_TOKEN`], [`NUMBER_TOKEN`]).
+struct Validate {
+    token_key: bool,
+}
+
+/// Validate every entry of `map`; whether any object in it (itself
+/// included) had a serde_json token key.
+fn validate_map<'de, A: MapAccess<'de>>(mut map: A) -> Result<bool, A::Error> {
+    let mut token_key = false;
+    while let Some(key) = map.next_key::<Key>()? {
+        token_key |= matches!(key, Key::SerdeJsonToken);
+        token_key |= map.next_value::<Validate>()?.token_key;
+    }
+    Ok(token_key)
+}
+
+/// Validate every element of `seq`; whether any object in it had a
+/// serde_json token key.
+fn validate_seq<'de, A: SeqAccess<'de>>(mut seq: A) -> Result<bool, A::Error> {
+    let mut token_key = false;
+    while let Some(element) = seq.next_element::<Validate>()? {
+        token_key |= element.token_key;
+    }
+    Ok(token_key)
+}
 
 impl<'de> Deserialize<'de> for Validate {
     fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
@@ -1121,14 +1175,16 @@ impl<'de> Deserialize<'de> for Validate {
             fn expecting(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
                 f.write_str("any JSON value")
             }
-            accept_scalars!(Validate);
-            fn visit_map<A: MapAccess<'de>>(self, mut map: A) -> Result<Validate, A::Error> {
-                while map.next_entry::<Validate, Validate>()?.is_some() {}
-                Ok(Validate)
+            accept_scalars!(Validate { token_key: false });
+            fn visit_map<A: MapAccess<'de>>(self, map: A) -> Result<Validate, A::Error> {
+                Ok(Validate {
+                    token_key: validate_map(map)?,
+                })
             }
-            fn visit_seq<A: SeqAccess<'de>>(self, mut seq: A) -> Result<Validate, A::Error> {
-                while seq.next_element::<Validate>()?.is_some() {}
-                Ok(Validate)
+            fn visit_seq<A: SeqAccess<'de>>(self, seq: A) -> Result<Validate, A::Error> {
+                Ok(Validate {
+                    token_key: validate_seq(seq)?,
+                })
             }
         }
         deserializer.deserialize_any(V)
@@ -1193,8 +1249,8 @@ impl<'de> DeserializeSeed<'de> for ElementSeed<'_> {
             fn visit_map<A: MapAccess<'de>>(self, map: A) -> Result<Message, A::Error> {
                 read_message(map, self.0)
             }
-            fn visit_seq<A: SeqAccess<'de>>(self, mut seq: A) -> Result<Message, A::Error> {
-                while seq.next_element::<Validate>()?.is_some() {}
+            fn visit_seq<A: SeqAccess<'de>>(self, seq: A) -> Result<Message, A::Error> {
+                validate_seq(seq)?;
                 Ok(Message::Ambiguous)
             }
         }
@@ -1204,11 +1260,14 @@ impl<'de> DeserializeSeed<'de> for ElementSeed<'_> {
     }
 }
 
-/// An object key, compared without allocating.
+/// An object key, compared without allocating (after JSON decoding, so an
+/// escaped spelling of a serde_json token key is still one).
 enum Key {
     Method,
     Params,
     Name,
+    /// [`RAW_VALUE_TOKEN`] or [`NUMBER_TOKEN`].
+    SerdeJsonToken,
     Other,
 }
 
@@ -1225,6 +1284,7 @@ impl<'de> Deserialize<'de> for Key {
                     "method" => Key::Method,
                     "params" => Key::Params,
                     "name" => Key::Name,
+                    RAW_VALUE_TOKEN | NUMBER_TOKEN => Key::SerdeJsonToken,
                     _ => Key::Other,
                 })
             }
@@ -1233,9 +1293,13 @@ impl<'de> Deserialize<'de> for Key {
     }
 }
 
-/// Whether `method` is the string `"tools/call"` (`Some(true)`), another
-/// string (`Some(false)`), or not a string (`None`) — compared in place.
-struct IsToolsCall(Option<bool>);
+/// Whether `method` is the string `"tools/call"` — compared in place — and
+/// whether it held a serde_json token key (a non-string `method` can only
+/// be read as `"tools/call"` through one).
+struct IsToolsCall {
+    tools_call: bool,
+    token_key: bool,
+}
 
 impl<'de> Deserialize<'de> for IsToolsCall {
     fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
@@ -1245,17 +1309,27 @@ impl<'de> Deserialize<'de> for IsToolsCall {
             fn expecting(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
                 f.write_str("any JSON value")
             }
-            accept_non_string_scalars!(IsToolsCall(None));
+            accept_non_string_scalars!(IsToolsCall {
+                tools_call: false,
+                token_key: false
+            });
             fn visit_str<E>(self, v: &str) -> Result<IsToolsCall, E> {
-                Ok(IsToolsCall(Some(v == "tools/call")))
+                Ok(IsToolsCall {
+                    tools_call: v == "tools/call",
+                    token_key: false,
+                })
             }
-            fn visit_map<A: MapAccess<'de>>(self, mut map: A) -> Result<IsToolsCall, A::Error> {
-                while map.next_entry::<Validate, Validate>()?.is_some() {}
-                Ok(IsToolsCall(None))
+            fn visit_map<A: MapAccess<'de>>(self, map: A) -> Result<IsToolsCall, A::Error> {
+                Ok(IsToolsCall {
+                    tools_call: false,
+                    token_key: validate_map(map)?,
+                })
             }
-            fn visit_seq<A: SeqAccess<'de>>(self, mut seq: A) -> Result<IsToolsCall, A::Error> {
-                while seq.next_element::<Validate>()?.is_some() {}
-                Ok(IsToolsCall(None))
+            fn visit_seq<A: SeqAccess<'de>>(self, seq: A) -> Result<IsToolsCall, A::Error> {
+                Ok(IsToolsCall {
+                    tools_call: false,
+                    token_key: validate_seq(seq)?,
+                })
             }
         }
         deserializer.deserialize_any(V)
@@ -1264,30 +1338,28 @@ impl<'de> Deserialize<'de> for IsToolsCall {
 
 /// A `params.name` value handed to the tool matcher as a borrowed `&str`:
 /// `Some(index)` for a string, `None` for anything else (validated,
-/// consumed).
+/// consumed); and whether it held a serde_json token key.
 struct NameSeed<'s>(&'s mut dyn FnMut(&str) -> usize);
 
 impl<'de> DeserializeSeed<'de> for NameSeed<'_> {
-    type Value = Option<usize>;
+    type Value = (Option<usize>, bool);
 
-    fn deserialize<D: Deserializer<'de>>(self, deserializer: D) -> Result<Option<usize>, D::Error> {
+    fn deserialize<D: Deserializer<'de>>(self, deserializer: D) -> Result<Self::Value, D::Error> {
         struct V<'s>(&'s mut dyn FnMut(&str) -> usize);
         impl<'de> Visitor<'de> for V<'_> {
-            type Value = Option<usize>;
+            type Value = (Option<usize>, bool);
             fn expecting(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
                 f.write_str("any JSON value")
             }
-            accept_non_string_scalars!(None);
-            fn visit_str<E>(self, v: &str) -> Result<Option<usize>, E> {
-                Ok(Some((self.0)(v)))
+            accept_non_string_scalars!((None, false));
+            fn visit_str<E>(self, v: &str) -> Result<Self::Value, E> {
+                Ok((Some((self.0)(v)), false))
             }
-            fn visit_map<A: MapAccess<'de>>(self, mut map: A) -> Result<Option<usize>, A::Error> {
-                while map.next_entry::<Validate, Validate>()?.is_some() {}
-                Ok(None)
+            fn visit_map<A: MapAccess<'de>>(self, map: A) -> Result<Self::Value, A::Error> {
+                Ok((None, validate_map(map)?))
             }
-            fn visit_seq<A: SeqAccess<'de>>(self, mut seq: A) -> Result<Option<usize>, A::Error> {
-                while seq.next_element::<Validate>()?.is_some() {}
-                Ok(None)
+            fn visit_seq<A: SeqAccess<'de>>(self, seq: A) -> Result<Self::Value, A::Error> {
+                Ok((None, validate_seq(seq)?))
             }
         }
         deserializer.deserialize_any(V(self.0))
@@ -1295,45 +1367,50 @@ impl<'de> DeserializeSeed<'de> for NameSeed<'_> {
 }
 
 /// What a message's `params` says about the tool: `Some(index)` only for an
-/// object with exactly one `name`, a string.
+/// object with exactly one `name`, a string; and whether it held a
+/// serde_json token key anywhere.
 struct ParamsSeed<'s>(&'s mut dyn FnMut(&str) -> usize);
 
 impl<'de> DeserializeSeed<'de> for ParamsSeed<'_> {
-    type Value = Option<usize>;
+    type Value = (Option<usize>, bool);
 
-    fn deserialize<D: Deserializer<'de>>(self, deserializer: D) -> Result<Option<usize>, D::Error> {
+    fn deserialize<D: Deserializer<'de>>(self, deserializer: D) -> Result<Self::Value, D::Error> {
         struct V<'s>(&'s mut dyn FnMut(&str) -> usize);
         impl<'de> Visitor<'de> for V<'_> {
-            type Value = Option<usize>;
+            type Value = (Option<usize>, bool);
             fn expecting(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
                 f.write_str("any JSON value")
             }
-            accept_scalars!(None);
-            fn visit_map<A: MapAccess<'de>>(self, mut map: A) -> Result<Option<usize>, A::Error> {
+            accept_scalars!((None, false));
+            fn visit_map<A: MapAccess<'de>>(self, mut map: A) -> Result<Self::Value, A::Error> {
                 let mut name: Option<Option<usize>> = None;
                 let mut repeated = false;
+                let mut token_key = false;
                 while let Some(key) = map.next_key::<Key>()? {
                     match key {
                         Key::Name if name.is_none() => {
-                            name = Some(map.next_value_seed(NameSeed(&mut *self.0))?);
+                            let (found, nested) = map.next_value_seed(NameSeed(&mut *self.0))?;
+                            name = Some(found);
+                            token_key |= nested;
                         }
                         Key::Name => {
                             repeated = true;
-                            map.next_value::<Validate>()?;
+                            token_key |= map.next_value::<Validate>()?.token_key;
                         }
-                        _ => {
-                            map.next_value::<Validate>()?;
+                        key => {
+                            token_key |= matches!(key, Key::SerdeJsonToken);
+                            token_key |= map.next_value::<Validate>()?.token_key;
                         }
                     }
                 }
-                Ok(match (repeated, name) {
+                let name = match (repeated, name) {
                     (false, Some(name)) => name,
                     _ => None,
-                })
+                };
+                Ok((name, token_key))
             }
-            fn visit_seq<A: SeqAccess<'de>>(self, mut seq: A) -> Result<Option<usize>, A::Error> {
-                while seq.next_element::<Validate>()?.is_some() {}
-                Ok(None)
+            fn visit_seq<A: SeqAccess<'de>>(self, seq: A) -> Result<Self::Value, A::Error> {
+                Ok((None, validate_seq(seq)?))
             }
         }
         deserializer.deserialize_any(V(self.0))
@@ -1342,34 +1419,42 @@ impl<'de> DeserializeSeed<'de> for ParamsSeed<'_> {
 
 /// Read one message object. `params` may come before `method`, so its tool
 /// name is matched as it streams past whatever the method turns out to be;
-/// only the index is kept.
+/// only the index is kept. A serde_json token key anywhere in the message
+/// (see [`RAW_VALUE_TOKEN`]) makes it [`Message::Ambiguous`], however the
+/// rest of it reads.
 fn read_message<'de, A: MapAccess<'de>>(
     mut map: A,
     tool: &mut dyn FnMut(&str) -> usize,
 ) -> Result<Message, A::Error> {
-    let mut method: Option<Option<bool>> = None;
+    let mut tools_call: Option<bool> = None;
     let mut params: Option<Option<usize>> = None;
     let mut repeated = false;
+    let mut token_key = false;
     while let Some(key) = map.next_key::<Key>()? {
         match key {
-            Key::Method if method.is_none() => {
-                method = Some(map.next_value::<IsToolsCall>()?.0);
+            Key::Method if tools_call.is_none() => {
+                let method = map.next_value::<IsToolsCall>()?;
+                tools_call = Some(method.tools_call);
+                token_key |= method.token_key;
             }
             Key::Params if params.is_none() => {
-                params = Some(map.next_value_seed(ParamsSeed(&mut *tool))?);
+                let (name, nested) = map.next_value_seed(ParamsSeed(&mut *tool))?;
+                params = Some(name);
+                token_key |= nested;
             }
             Key::Method | Key::Params => {
                 repeated = true;
-                map.next_value::<Validate>()?;
+                token_key |= map.next_value::<Validate>()?.token_key;
             }
-            _ => {
-                map.next_value::<Validate>()?;
+            key => {
+                token_key |= matches!(key, Key::SerdeJsonToken);
+                token_key |= map.next_value::<Validate>()?.token_key;
             }
         }
     }
-    Ok(match (repeated, method) {
+    Ok(match (repeated || token_key, tools_call) {
         (true, _) => Message::Ambiguous,
-        (false, Some(Some(true))) => match params {
+        (false, Some(true)) => match params {
             Some(Some(index)) => Message::ToolCall(index),
             _ => Message::Ambiguous,
         },
@@ -1498,6 +1583,89 @@ mod tests {
         assert_eq!(req(r#"{"method":"initialize"} x"#), strictest);
         assert_eq!(rules().scopes_for_tool("admin"), ["mcp:write", "mcp:admin"]);
         assert_eq!(rules().scopes_for_tool("nope"), ["mcp:read"]);
+    }
+
+    /// A `tools/call` of `admin` wrapped in serde_json's `RawValue` token:
+    /// `serde_json::Value` (with `raw_value` on) reads it as the call itself.
+    const SMUGGLED_CALL: &str = r#"{"$serde_json::private::RawValue":"{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"tools/call\",\"params\":{\"name\":\"admin\",\"arguments\":{}}}"}"#;
+
+    #[test]
+    fn serde_json_token_keys_need_the_strictest_set() {
+        let r = rules();
+        let r = &r.rules;
+        let strictest = ["mcp:read", "mcp:write", "mcp:admin"];
+        let ambiguous = Classified::Messages(vec![NamedMessage::Ambiguous]);
+        // What a dispatcher parsing into `Value` would see, in this build
+        // (axum enables `raw_value`): the smuggled call itself.
+        #[cfg(feature = "axum")]
+        {
+            let seen: serde_json::Value = serde_json::from_str(SMUGGLED_CALL).unwrap();
+            assert_eq!(seen["method"], "tools/call");
+            assert_eq!(seen["params"]["name"], "admin");
+        }
+        let batch = r#"{"$serde_json::private::RawValue":"[{\"method\":\"tools/list\"},{\"method\":\"tools/call\",\"params\":{\"name\":\"admin\"}}]"}"#;
+        // The fuzz crash input: the wrapped string is not even JSON.
+        let crash = "\n\n\n\n{\"$serde_json::private::RawValue\":\"{:\"\t} \n";
+        let number = r#"{"$serde_json::private::Number":"1","method":"tools/call","params":{"name":"admin"}}"#;
+        // The key spelled with an escape is still the key.
+        let escaped = r#"{"$serde_json::private::RawValue":"{}"}"#;
+        // Not the first key (serde_json only looks at the first; we look at all).
+        let later = r#"{"method":"initialize","$serde_json::private::RawValue":"{}"}"#;
+        for body in [SMUGGLED_CALL, batch, crash, number, escaped, later] {
+            assert_eq!(classify(body.as_bytes()), ambiguous, "{body:?}");
+            assert_eq!(r.for_body(body.as_bytes()).scopes, strictest, "{body:?}");
+        }
+        // In a batch element: that element is ambiguous, so the whole batch
+        // needs the strictest set.
+        let in_batch = format!(r#"[{{"method":"tools/list"}},{SMUGGLED_CALL}]"#);
+        assert_eq!(
+            classify(in_batch.as_bytes()),
+            Classified::Messages(vec![NamedMessage::NotToolCall, NamedMessage::Ambiguous])
+        );
+        assert_eq!(r.for_body(in_batch.as_bytes()).scopes, strictest);
+        // Nested at any depth: in `params` (`Value` would read `params.name`
+        // from the wrapped string; it was already ambiguous, having no
+        // name), in `method` (`Value` would read `"tools/call"`; before the
+        // token-key rule this was a `NotToolCall`), in `params.name`, and in
+        // a member nobody else reads.
+        for body in [
+            r#"{"method":"tools/call","params":{"$serde_json::private::RawValue":"{\"name\":\"admin\"}"}}"#,
+            r#"{"method":{"$serde_json::private::RawValue":"\"tools/call\""},"params":{"name":"admin"}}"#,
+            r#"{"method":"tools/call","params":{"name":{"$serde_json::private::RawValue":"\"admin\""}}}"#,
+            r#"{"method":"tools/call","params":{"name":"other","arguments":[{"$serde_json::private::Number":"1"}]}}"#,
+            r#"{"method":"tools/list","id":{"x":[{"$serde_json::private::RawValue":"1"}]}}"#,
+        ] {
+            assert_eq!(classify(body.as_bytes()), ambiguous, "{body}");
+            assert_eq!(r.for_body(body.as_bytes()).scopes, strictest, "{body}");
+        }
+        // The token string as a VALUE (not a key) is ordinary data.
+        assert_eq!(
+            req_scopes(
+                r,
+                r#"{"method":"tools/call","params":{"name":"write_document","arguments":{"x":"$serde_json::private::RawValue"}}}"#
+            ),
+            ["mcp:write"]
+        );
+        assert_eq!(
+            classify(
+                br#"{"method":"tools/call","params":{"name":"$serde_json::private::Number"}}"#
+            ),
+            Classified::Messages(vec![NamedMessage::ToolCall(
+                "$serde_json::private::Number".into()
+            )])
+        );
+        // A near miss is an ordinary key.
+        assert_eq!(
+            req_scopes(
+                r,
+                r#"{"method":"initialize","$serde_json::private::RawValu":"{}"}"#
+            ),
+            ["mcp:read"]
+        );
+    }
+
+    fn req_scopes(r: &Rules, json: &str) -> Vec<String> {
+        r.for_body(json.as_bytes()).scopes
     }
 
     #[test]
