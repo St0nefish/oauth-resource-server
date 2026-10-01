@@ -8,6 +8,40 @@ Before 1.0, a breaking change increments the minor version.
 
 ## [Unreleased]
 
+## [0.3.0] - 2026-10-01
+
+### Upgrading (0.3.0)
+
+Every change in this release is additive; no code needs to change. Cargo
+still treats `0.2` and `0.3` as incompatible, so a `"0.2"` requirement never
+picks this release up: change your requirement to `"0.3"`.
+
+### Added
+
+- `AuthorizedToken::claim_values`, `claim_values_at`, `has_claim_value` and
+  `has_claim_value_at` read a role or group claim from the verified claims
+  without hand-rolled JSON walking: a string claim is one value (not split on
+  whitespace), an array yields its string elements, and a nested claim is
+  named by path segments (`&["realm_access", "roles"]`) so dotted claim names
+  stay literal. Membership uses the same rule as `required_claims`
+  (oauth-resource-server#53).
+- `McpToolScopes` enforces per-tool claim requirements next to scopes
+  (oauth-resource-server#53): `default_claim`/`try_default_claim` and
+  `tool_claim`/`try_tool_claim` add a clause (the top-level claim must hold
+  at least one of the values, matched as `has_claim_value`; every clause must
+  hold), and `claims_for_tool` reads them back as `(claim, values)` pairs. A
+  tool configured by `tool` or `tool_claim` needs only its own scopes and
+  clauses; a batch needs the union, an unclassifiable body every clause in
+  the configuration, and clauses on the same claim are never merged. A
+  missing claim value is the same 403 as a missing scope, with a challenge
+  naming scopes only (no claim name or value enters `WWW-Authenticate`);
+  `auth.reason` stays `insufficient_scope`, and the refusal log line adds a
+  `required_claims` field with the claim names, never values. A static token
+  meets a clause only with `static_token_bypasses_scopes()`. New error
+  variant `McpScopesError::InvalidClaimRequirement` (a blank claim name, no
+  values, or a blank value). Configurations without claim clauses behave and
+  log exactly as before.
+
 ## [0.2.0] - 2026-09-29
 
 ### Breaking changes (0.2.0)
@@ -491,7 +525,6 @@ response body are byte-for-byte what 0.1 sent.
 - The scope lists in the `OAuth bearer auth accepted` (`scopes`) and
   insufficient-scope (`present`) log fields go through the same 128-character
   per-value cut as every other token-derived log field.
-
 - A loopback JWKS or discovery fetch (`http://localhost:…`, `127.0.0.0/8`,
   `::1`, allowed over plain http without `allow_insecure_http`) no longer
   goes through a proxy from `HTTP_PROXY`/`HTTPS_PROXY`/`ALL_PROXY` (or the
@@ -869,7 +902,8 @@ MSRV: Rust 1.89. License: MIT.
   resource on a non-loopback host needs `<PREFIX>ALLOW_INSECURE_HTTP=true`
   (`allow_insecure_http`).
 
-[Unreleased]: https://github.com/St0nefish/oauth-resource-server/compare/v0.2.0...HEAD
+[Unreleased]: https://github.com/St0nefish/oauth-resource-server/compare/v0.3.0...HEAD
+[0.3.0]: https://github.com/St0nefish/oauth-resource-server/compare/v0.2.0...v0.3.0
 [0.2.0]: https://github.com/St0nefish/oauth-resource-server/compare/v0.1.2...v0.2.0
 [0.1.2]: https://github.com/St0nefish/oauth-resource-server/compare/v0.1.1...v0.1.2
 [0.1.1]: https://github.com/St0nefish/oauth-resource-server/compare/v0.1.0...v0.1.1

@@ -22,7 +22,10 @@ use tracing_subscriber::layer::{Context, SubscriberExt};
 use tracing_subscriber::registry::LookupSpan;
 use tracing_subscriber::{Layer, Registry};
 
-use support::{PURGE_CALL, STATIC_LABEL, STATIC_SECRET, fixture, send, with_foreign_signature};
+use support::{
+    PRESENTED_GROUP, PROMOTE_CALL, PROMOTE_GROUP, PURGE_CALL, STATIC_LABEL, STATIC_SECRET, fixture,
+    send, with_foreign_signature,
+};
 
 type Fields = BTreeMap<String, String>;
 
@@ -362,6 +365,46 @@ async fn auth_outcomes_carry_stable_fields_and_spans_bound_the_header() {
     assert!(!format!("{events:?}").contains("purge"), "{events:#?}");
     capture.take_spans();
 
+    // 9b. `McpToolScopes`: a `tools/call` whose claim requirement the token
+    //     misses. The same stable fields; the claim NAME is logged, neither
+    //     the configured value nor the one the token carries.
+    let ungrouped = f
+        .authority
+        .token()
+        .claim("groups", [PRESENTED_GROUP])
+        .sign();
+    presented.push(ungrouped.clone());
+    assert_eq!(
+        send(app, Method::POST, "/mcp", Some(&ungrouped), PROMOTE_CALL).await,
+        403
+    );
+    let events = capture.take_events();
+    let refusal = events
+        .iter()
+        .find(|e| e.fields.get("auth.outcome").map(String::as_str) == Some("rejected"))
+        .expect("the denial is logged");
+    assert_eq!(refusal.fields["what"], "McpToolScopes");
+    assert_eq!(refusal.fields["required_claims"], r#"["groups"]"#);
+    assert_auth(
+        refusal,
+        Level::INFO,
+        "The credential lacks the scopes or claim values this route requires",
+        &[
+            ("auth.mechanism", "oauth"),
+            ("auth.outcome", "rejected"),
+            ("auth.reason", "insufficient_scope"),
+            ("auth.status", "403"),
+        ],
+    );
+    let shown = format!("{events:?}");
+    for value in [PROMOTE_GROUP, PRESENTED_GROUP, "promote"] {
+        assert!(
+            !shown.contains(value),
+            "{value} reached the log: {events:#?}"
+        );
+    }
+    capture.take_spans();
+
     // 10. A hostile `kid`: 5 KB of control characters and ANSI escapes,
     //     bounded and escaped in both validation spans.
     let kid = support::hostile_kid();
@@ -443,6 +486,9 @@ async fn auth_outcomes_carry_stable_fields_and_spans_bound_the_header() {
         assert!(!rendered.contains(signature), "a signature reached the log");
     }
     assert!(!rendered.contains(&kid), "the raw kid reached the log");
+    for value in [PROMOTE_GROUP, PRESENTED_GROUP] {
+        assert!(!rendered.contains(value), "a claim value reached the log");
+    }
 }
 
 struct SinkWriter(Arc<Mutex<Vec<u8>>>);

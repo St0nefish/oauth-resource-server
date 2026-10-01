@@ -21,8 +21,9 @@ use crate::jwks::{
 };
 use crate::observe::record_field;
 use crate::token::{
-    AuthorizedToken, InvalidTokenKind, MAX_TOKEN_BYTES, TokenRejection, check_typ, client_id_of,
-    extract_principal, extract_scopes, for_log, for_log_field, missing_scopes, numeric_date_secs,
+    AuthorizedToken, InvalidTokenKind, MAX_TOKEN_BYTES, TokenRejection, check_typ, claim_matches,
+    client_id_of, extract_principal, extract_scopes, for_log, for_log_field, missing_scopes,
+    numeric_date_secs,
 };
 
 /// The span around one validation (`oauth_rs.validate`, or
@@ -1593,15 +1594,6 @@ fn decode_error_kind(kind: &jsonwebtoken::errors::ErrorKind, token: &str) -> Inv
         // refusal: the kind only labels it.
         _ => InvalidTokenKind::Other,
     }
-}
-
-/// Whether a token's claim satisfies a `required_claims` value: equal to it
-/// (JSON equality), or an array with an element equal to it. `required` is a
-/// string, number or boolean (`resolve` refuses anything else); a hand-edited
-/// `null`, array or object is matched by the same rule, never widened.
-fn claim_matches(actual: &Value, required: &Value) -> bool {
-    actual == required
-        || matches!(actual, Value::Array(items) if items.iter().any(|item| item == required))
 }
 
 /// Whether `nbf` is a NumericDate jsonwebtoken actually checks: a non-negative

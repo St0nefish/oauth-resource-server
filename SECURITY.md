@@ -170,13 +170,20 @@ the ones a report is most likely to concern:
   refusal path, with a challenge that is always a valid header value (a
   caller-supplied `error_description` is reduced to RFC 6750's character
   set, never escaped in); a route-level check with no authentication layer in
-  front answers 500, never access;
+  front answers 500, never access; `McpToolScopes`' claim clauses
+  (`default_claim`, `tool_claim`: a verified top-level claim holding at least
+  one listed value, every clause required) are judged in the same place, on
+  the same credential, and refused with the same 403 — its challenge naming
+  scopes only, so no claim name or value ever enters `WWW-Authenticate`, and
+  its log line naming the claims, never a configured or presented value; a
+  static token meets a clause only with `static_token_bypasses_scopes`;
 - `McpToolScopes` reads a request body under a limit enforced while it
   streams (1 MiB by default; a larger body is refused with 413 without being
   read further), gives a body it cannot classify with certainty (not JSON, no
   readable tool name, a repeated member two parsers could read differently)
-  the strictest scope set rather than the default, authorizes every message
-  of a JSON-RPC batch, classifies a body under any method (not only
+  the strictest scope set (and every claim clause in the configuration,
+  never merged by claim name) rather than the default, authorizes every
+  message of a JSON-RPC batch, classifies a body under any method (not only
   `POST`, and never trusting a size hint of zero), refuses a request with
   no credential with the layer's 401 whenever what it needs is not empty
   (before reading its body when every request needs a scope),
