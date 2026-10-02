@@ -114,7 +114,38 @@ concurrency:
   cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
 jobs:
+  # Cheap, GitHub-hosted gate: `code` is 'false' only when every changed file is
+  # Claude Code configuration (`.claude/**`, `CLAUDE.md`, `.claude-plugin/**`),
+  # in which case the heavy jobs below are skipped. A path filter on the
+  # trigger is not used because a workflow it skips never reports `ci-pass`,
+  # which would leave the required check pending. Fails closed: any error
+  # listing the changed files, or 300+ files, counts as a code change.
+  changes:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    outputs:
+      code: ${{ steps.filter.outputs.code }}
+    steps:
+      - name: Detect non-Claude-config changes
+        id: filter
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPO: ${{ github.repository }}
+          BASE: ${{ github.event_name == 'pull_request' && github.event.pull_request.base.sha || github.event.before }}
+          HEAD: ${{ github.event_name == 'pull_request' && github.event.pull_request.head.sha || github.sha }}
+        run: |
+          code=true
+          if files=$(gh api "repos/${REPO}/compare/${BASE}...${HEAD}" --jq '.files | if length >= 300 then empty else .[].filename end' 2>/dev/null) && [[ -n "$files" ]]; then
+            if ! grep -qvE '^(\.claude/|\.claude-plugin/|CLAUDE\.md$)' <<<"$files"; then
+              code=false
+            fi
+          fi
+          echo "code=${code}" >> "$GITHUB_OUTPUT"
+          echo "code changes: ${code}"
+
   checks:
+    needs: changes
+    if: needs.changes.outputs.code == 'true'
     runs-on: [self-hosted, linux, x64]
     timeout-minutes: 60
     steps:
@@ -249,6 +280,8 @@ jobs:
         run: cargo publish --dry-run
 
   msrv:
+    needs: changes
+    if: needs.changes.outputs.code == 'true'
     runs-on: [self-hosted, linux, x64]
     timeout-minutes: 30
     steps:
@@ -300,6 +333,8 @@ jobs:
         run: cargo "+${MSRV}" build --all-features --locked
 
   semver:
+    needs: changes
+    if: needs.changes.outputs.code == 'true'
     runs-on: [self-hosted, linux, x64]
     timeout-minutes: 30
     steps:
@@ -348,6 +383,8 @@ jobs:
         run: cargo +1.93 semver-checks check-release --all-features
 
   feature-powerset:
+    needs: changes
+    if: needs.changes.outputs.code == 'true'
     runs-on: [self-hosted, linux, x64]
     timeout-minutes: 30
     steps:
@@ -416,6 +453,8 @@ jobs:
             --group-features metrics,testing
 
   minimal-versions:
+    needs: changes
+    if: needs.changes.outputs.code == 'true'
     runs-on: [self-hosted, linux, x64]
     timeout-minutes: 30
     steps:
@@ -488,7 +527,7 @@ jobs:
         run: cargo build --all-features
 
   ci-pass:
-    needs: [checks, msrv, semver, feature-powerset, minimal-versions]
+    needs: [changes, checks, msrv, semver, feature-powerset, minimal-versions]
     if: always()
     runs-on: ubuntu-latest
     timeout-minutes: 5
@@ -499,16 +538,25 @@ jobs:
       # would silently defeat it. `if: always()` above forces this job to run
       # regardless of upstream outcome, and the explicit result check below
       # is what actually fails it. No upstream job is ever legitimately
-      # skipped, so anything but `success` (failure, cancelled, skipped)
-      # fails the gate.
+      # skipped except when `changes` found only Claude Code config files,
+      # where all five are skipped together and the gate passes; otherwise
+      # anything but `success` (failure, cancelled, skipped) fails the gate.
       - name: Require every upstream job to have succeeded
         env:
+          CHANGES: ${{ needs.changes.result }}
+          CODE: ${{ needs.changes.outputs.code }}
           CHECKS: ${{ needs.checks.result }}
           MSRV: ${{ needs.msrv.result }}
           SEMVER: ${{ needs.semver.result }}
           POWERSET: ${{ needs.feature-powerset.result }}
           MINVERS: ${{ needs.minimal-versions.result }}
         run: |
+          if [[ "$CHANGES" == "success" && "$CODE" == "false" \
+                && "$CHECKS" == "skipped" && "$MSRV" == "skipped" && "$SEMVER" == "skipped" \
+                && "$POWERSET" == "skipped" && "$MINVERS" == "skipped" ]]; then
+            echo "only Claude Code config changed; heavy jobs skipped"
+            exit 0
+          fi
           if [[ "$CHECKS" != "success" || "$MSRV" != "success" || "$SEMVER" != "success" \
                 || "$POWERSET" != "success" || "$MINVERS" != "success" ]]; then
             echo "::error::one or more required jobs did not succeed (checks=${CHECKS}, msrv=${MSRV}, semver=${SEMVER}, feature-powerset=${POWERSET}, minimal-versions=${MINVERS})"
