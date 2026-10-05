@@ -517,8 +517,8 @@ module each one lives in; keep that true.
   (`is_log_safe_label`), so a label is always log-safe. Each secret is held in
   `zeroize::Zeroizing`, as are the builders' private `static_token` fields,
   `merged`'s dropped duplicate and the `env` loaders' intermediate copies
-  (`env::secret_zeroizing`, behind `secret_from_lookup`, whose `String` return
-  type is unchanged). `StaticTokenDecision`'s public `String` payload and
+  (`env::secret_zeroizing`, behind `secret_from_lookup`, which returns a plain
+  `String`). `StaticTokenDecision`'s public `String` payload and
   caller-owned strings are not wiped, and the docs say so.
 - **Secrets never reach a log or a `Debug` impl.**
   - `AuthLayer`, `AuthLayerBuilder`, `HttpAuthLayer`, `HttpAuthLayerBuilder`,
@@ -862,7 +862,7 @@ binding, refresh scheduling, and the public `KeySetStatus`/`RefreshError`/
   `has_claim_value` and the validator's `required_claims` (a parity test pins
   it).
 - `TokenRejection` is the 401-vs-403 split RFC 6750 requires.
-- `InvalidToken` keeps the older `Invalid(String)` call sites compiling
+- `InvalidToken` keeps `Invalid(String)`-style call sites compiling
   (`From<String>`, `Deref<Target = str>`, `PartialEq` with string types).
   Equality, between two `InvalidToken`s too, is **detail-only**; in-crate tests
   that mean the kind use `token::assert_invalid`, and a `Hash` impl, if ever
@@ -1089,8 +1089,8 @@ matrix entry in `.github/workflows/fuzz.yml`.
 
 ## Testing conventions
 
-- **Unit tests** live in a `#[cfg(test)] mod tests` at the bottom of each
-  `src/` file (some modules have extra child test modules, e.g.
+- **Unit tests** live in a `#[cfg(test)] mod tests` at the bottom of most
+  `src/` files (some modules have extra child test modules, e.g.
   `axum::scope_tests`, `mcp::service_tests`). They can reach crate-private
   items and use `testing` (compiled under `cfg(test)`).
 - **Integration tests** (`tests/`) use only the public API. A test that needs

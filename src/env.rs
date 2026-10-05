@@ -173,7 +173,7 @@ pub const MAX_SECRET_FILE_BYTES: usize = 64 * 1024;
 /// `err.get_ref().and_then(|e| e.downcast_ref::<FileRefused>())`; the
 /// `io::ErrorKind` alone does not identify it, since opening a file can fail
 /// with `InvalidInput` too.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
 #[non_exhaustive]
 pub enum FileRefused {
     /// The path is not a regular file: a directory, a FIFO, a device.
@@ -1550,7 +1550,9 @@ mod tests {
     fn config_value_file_failures_are_the_same_variants_as_secret_from_lookup() {
         let vars = HashMap::from([("FOO_FILE", "/run/secrets/foo")]);
         let big = "x".repeat(MAX_SECRET_FILE_BYTES + 1);
-        let refused = |why| move |_: &str| Err(io::Error::new(io::ErrorKind::InvalidInput, why));
+        let refused = |why: FileRefused| {
+            move |_: &str| Err(io::Error::new(io::ErrorKind::InvalidInput, why.clone()))
+        };
         let readers: Vec<(&str, BoxedReader)> = vec![
             (
                 "unreadable",
@@ -1623,7 +1625,7 @@ mod tests {
             assert_eq!(err.kind(), io::ErrorKind::InvalidInput);
             err.get_ref()
                 .and_then(|e| e.downcast_ref::<FileRefused>())
-                .copied()
+                .cloned()
         };
 
         let dir = std::env::temp_dir();
