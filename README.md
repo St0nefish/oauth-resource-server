@@ -1443,6 +1443,15 @@ oversized or not-a-regular `_FILE`, and refuse a variable set together with
 its `_FILE`. See
 [Rotating a static API key](#rotating-a-static-api-key-with-zero-downtime).
 
+A value that is not a secret, such as a URL, is read with
+`config_value_from_env(var)`: the same `<VAR>` or `<VAR>_FILE`, but a `<VAR>`
+that is set is returned exactly as set, empty or untrimmed, so replacing a
+plain `std::env::var` read with it changes no value. A blank `<VAR>` next to a
+`_FILE` yields to the file; a non-blank one is the same both-set error. The
+real, bounded file reader behind all of these is public as
+`read_secret_file`, to pass to a `_lookup` function when an application
+supplies its own variable lookup.
+
 ## Security model
 
 ### What is checked, in order

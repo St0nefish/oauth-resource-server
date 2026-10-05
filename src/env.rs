@@ -3,7 +3,9 @@
 //!
 //! [`secret_from_env`] reads one value, accepting either `VAR` directly or a
 //! path in `VAR_FILE` (the shape Docker Compose `secrets:` mounts use).
-//! [`static_tokens_from_env`] reads a static API key and, during a rotation,
+//! [`config_value_from_env`] is the same shape for a value that is not a
+//! secret (a URL, say), where a set-but-empty `VAR` is a value rather than an
+//! absence. [`static_tokens_from_env`] reads a static API key and, during a rotation,
 //! its replacement from `<VAR>_NEXT`, into a [`StaticTokens`] set.
 //! [`oauth_config_from_env`] builds a whole [`OAuthConfig`] the same way, one
 //! field per `<PREFIX><FIELD>` variable, and [`OAuthConfig::resolve`]s it.
@@ -175,11 +177,37 @@ enum FileRefused {
     TooLarge,
 }
 
-/// The file reader every `_env` function uses: a regular file only (checked
-/// on the path before opening — opening a FIFO blocks until a writer comes —
-/// and again on the open file), at most [`MAX_SECRET_FILE_BYTES`] + 1 bytes
-/// of it, UTF-8. The bytes read are wiped once copied into the `String`.
-fn read_secret_file(path: &str) -> io::Result<String> {
+/// The file reader every `_env` function uses, public so an application that
+/// calls a `_lookup` function with its own variable lookup can pass the same
+/// one: a regular file only (checked on the path before opening — opening a
+/// FIFO blocks until a writer comes — and again on the open file), at most
+/// [`MAX_SECRET_FILE_BYTES`] + 1 bytes of it, UTF-8. The bytes read are wiped
+/// once copied into the `String`.
+///
+/// The refusals (not a regular file, over the limit) travel inside the
+/// returned `io::Error`; the `_lookup` functions turn them into
+/// [`EnvError::NotAFile`] and [`EnvError::FileTooLarge`]. Called on its own it
+/// returns the raw contents, untrimmed, and an over-limit file is an error
+/// rather than a truncated read.
+///
+/// # Errors
+///
+/// An `io::Error` when the path cannot be opened or read, is not a regular
+/// file, is over [`MAX_SECRET_FILE_BYTES`], or does not hold UTF-8.
+///
+/// # Examples
+///
+/// ```
+/// use oauth_resource_server::env::{config_value_from_lookup, read_secret_file};
+///
+/// // Application-supplied variables, the real (bounded) file reader.
+/// let lookup = |_: &str| None;
+/// assert_eq!(
+///     config_value_from_lookup("MYAPP_BASE_URL", lookup, read_secret_file).unwrap(),
+///     None
+/// );
+/// ```
+pub fn read_secret_file(path: &str) -> io::Result<String> {
     let refused = |why| io::Error::new(io::ErrorKind::InvalidInput, why);
     if !std::fs::metadata(path)?.is_file() {
         return Err(refused(FileRefused::NotAFile));
@@ -350,26 +378,144 @@ fn secret_zeroizing(
             path,
         }),
         (Some(v), None) => Ok(Some(Zeroizing::new(v.trim().to_string()))),
-        (None, Some(path)) => {
-            let raw = Zeroizing::new(
-                read_file(&path).map_err(|source| file_error(var, path.clone(), source))?,
-            );
-            // An injected reader is held to the same cap as the real one.
-            if raw.len() > MAX_SECRET_FILE_BYTES {
-                return Err(EnvError::FileTooLarge {
-                    var: var.to_string(),
-                    path,
-                });
-            }
-            let value = Zeroizing::new(raw.trim().to_string());
-            if value.is_empty() {
-                return Err(EnvError::EmptyFile {
-                    var: var.to_string(),
-                    path,
-                });
-            }
-            Ok(Some(value))
+        (None, Some(path)) => Ok(Some(read_file_value(var, path, read_file)?)),
+        (None, None) => Ok(None),
+    }
+}
+
+/// The trimmed contents of the file `<var>_FILE` names, in a `Zeroizing`
+/// buffer. An empty file (after trimming) is [`EnvError::EmptyFile`]; an
+/// injected reader is held to the same size cap as the real one.
+fn read_file_value(
+    var: &str,
+    path: String,
+    read_file: impl Fn(&str) -> io::Result<String>,
+) -> Result<Zeroizing<String>, EnvError> {
+    let raw =
+        Zeroizing::new(read_file(&path).map_err(|source| file_error(var, path.clone(), source))?);
+    if raw.len() > MAX_SECRET_FILE_BYTES {
+        return Err(EnvError::FileTooLarge {
+            var: var.to_string(),
+            path,
+        });
+    }
+    let value = Zeroizing::new(raw.trim().to_string());
+    if value.is_empty() {
+        return Err(EnvError::EmptyFile {
+            var: var.to_string(),
+            path,
+        });
+    }
+    Ok(value)
+}
+
+/// Read a configuration value from `var`, falling back to the file named by
+/// `<var>_FILE` — [`secret_from_env`]'s `VAR` / `VAR_FILE` shape for a value
+/// that is not necessarily a secret, such as a URL, where an empty value can
+/// be intentional.
+///
+/// It differs from [`secret_from_env`] in one respect: `VAR` is returned
+/// exactly as set, empty and untrimmed included, so an application moving
+/// from plain `std::env::var` to this keeps every value it read before. The
+/// rest is the same:
+///
+/// | `<var>` | `<var>_FILE` | Result |
+/// |---|---|---|
+/// | unset | unset (or blank) | `Ok(None)` |
+/// | set, any value | unset (or blank) | `Ok(Some(value))`, as set |
+/// | blank | set | the file's contents, trimmed (a blank `VAR` alongside a `_FILE` is how a templated environment leaves one unset) |
+/// | non-blank | set | [`EnvError::BothSet`] |
+/// | unset or blank | set | a file that is empty after trimming is [`EnvError::EmptyFile`] |
+///
+/// This is [`config_value_from_lookup`] wired to the real process environment
+/// and filesystem ([`read_secret_file`]); use that directly to test callers
+/// without mutating either. A variable whose value is not valid Unicode reads
+/// as unset.
+///
+/// # Errors
+///
+/// As [`secret_from_env`], except that a blank `var` is never an error and
+/// never [`EnvError::BothSet`].
+///
+/// # Security
+///
+/// Meant for values that are safe to see: only a value read from a *file* is
+/// wiped on drop here, so keep a secret in [`secret_from_env`]. No error
+/// includes a value: errors name the variable and the file path only.
+///
+/// # Examples
+///
+/// ```no_run
+/// use oauth_resource_server::env::config_value_from_env;
+///
+/// // MYAPP_BASE_URL=..., or MYAPP_BASE_URL_FILE=/run/secrets/base_url
+/// match config_value_from_env("MYAPP_BASE_URL") {
+///     Ok(Some(url)) => println!("base url: {url}"),
+///     Ok(None) => println!("no base url"),
+///     Err(e) => eprintln!("MYAPP_BASE_URL: {e}"),
+/// }
+/// ```
+pub fn config_value_from_env(var: &str) -> Result<Option<String>, EnvError> {
+    config_value_from_lookup(var, |v| std::env::var(v).ok(), read_secret_file)
+}
+
+/// [`config_value_from_env`] with the variable lookup and file reader
+/// injected, as [`secret_from_lookup`] takes them, so tests never call the
+/// `unsafe` `std::env::set_var`.
+///
+/// # Errors
+///
+/// As [`config_value_from_env`].
+///
+/// # Examples
+///
+/// ```
+/// use std::collections::HashMap;
+/// use std::io;
+///
+/// use oauth_resource_server::env::{EnvError, config_value_from_lookup};
+///
+/// let vars = HashMap::from([("MYAPP_EMPTY", ""), ("MYAPP_URL_FILE", "/run/secrets/url")]);
+/// let lookup = |name: &str| vars.get(name).map(|v| v.to_string());
+/// let read_file = |path: &str| match path {
+///     "/run/secrets/url" => Ok("https://example.test\n".to_string()),
+///     _ => Err(io::Error::from(io::ErrorKind::NotFound)),
+/// };
+///
+/// // The file form, trimmed.
+/// let url = config_value_from_lookup("MYAPP_URL", &lookup, &read_file).unwrap();
+/// assert_eq!(url.as_deref(), Some("https://example.test"));
+///
+/// // A set-but-empty variable is a value, not an absence.
+/// let empty = config_value_from_lookup("MYAPP_EMPTY", &lookup, &read_file).unwrap();
+/// assert_eq!(empty.as_deref(), Some(""));
+///
+/// // Unset entirely.
+/// assert_eq!(config_value_from_lookup("MYAPP_OTHER", &lookup, &read_file).unwrap(), None);
+///
+/// // A non-blank value and a file both set: an error, not a silent preference.
+/// let both = HashMap::from([("K", "a"), ("K_FILE", "/x")]);
+/// let err = config_value_from_lookup("K", |n| both.get(n).map(|v| v.to_string()), &read_file);
+/// assert!(matches!(err, Err(EnvError::BothSet { .. })));
+/// ```
+pub fn config_value_from_lookup(
+    var: &str,
+    lookup: impl Fn(&str) -> Option<String>,
+    read_file: impl Fn(&str) -> io::Result<String>,
+) -> Result<Option<String>, EnvError> {
+    let direct = lookup(var);
+    let path = lookup(&format!("{var}_FILE")).filter(|s| !s.trim().is_empty());
+
+    match (direct, path) {
+        (Some(v), Some(path)) if !v.trim().is_empty() => Err(EnvError::BothSet {
+            var: var.to_string(),
+            path,
+        }),
+        (_, Some(path)) => {
+            let mut value = read_file_value(var, path, read_file)?;
+            Ok(Some(std::mem::take(&mut *value)))
         }
+        (Some(v), None) => Ok(Some(v)),
         (None, None) => Ok(None),
     }
 }
@@ -1294,6 +1440,122 @@ mod tests {
             secret_from_env("OAUTH_RESOURCE_SERVER_ENV_RS_TEST_UNSET_VAR_9f3c").unwrap(),
             None
         );
+    }
+
+    // ── config_value_from_lookup / config_value_from_env ───────────────────
+
+    #[test]
+    fn config_value_absent_is_none() {
+        let vars = HashMap::new();
+        let files = HashMap::new();
+        assert_eq!(
+            config_value_from_lookup("FOO", lookup_from(&vars), files_from(&files)).unwrap(),
+            None
+        );
+    }
+
+    #[test]
+    fn config_value_direct_is_returned_as_set() {
+        // Empty and untrimmed values survive: a plain `std::env::var` read
+        // would have returned them.
+        for value in ["bar", "", "   ", "  bar  "] {
+            let vars = HashMap::from([("FOO", value)]);
+            let files = HashMap::new();
+            assert_eq!(
+                config_value_from_lookup("FOO", lookup_from(&vars), files_from(&files)).unwrap(),
+                Some(value.to_string()),
+                "{value:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn config_value_file_is_read_and_trimmed() {
+        let vars = HashMap::from([("FOO_FILE", "/run/secrets/foo")]);
+        let files = HashMap::from([("/run/secrets/foo", "bar\n")]);
+        assert_eq!(
+            config_value_from_lookup("FOO", lookup_from(&vars), files_from(&files)).unwrap(),
+            Some("bar".to_string())
+        );
+    }
+
+    #[test]
+    fn config_value_blank_file_variable_is_unset() {
+        let vars = HashMap::from([("FOO_FILE", "  ")]);
+        let files = HashMap::new();
+        assert_eq!(
+            config_value_from_lookup("FOO", lookup_from(&vars), files_from(&files)).unwrap(),
+            None
+        );
+    }
+
+    #[test]
+    fn config_value_blank_direct_yields_to_a_file() {
+        for blank in ["", "  "] {
+            let vars = HashMap::from([("FOO", blank), ("FOO_FILE", "/run/secrets/foo")]);
+            let files = HashMap::from([("/run/secrets/foo", "bar\n")]);
+            assert_eq!(
+                config_value_from_lookup("FOO", lookup_from(&vars), files_from(&files)).unwrap(),
+                Some("bar".to_string()),
+                "{blank:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn config_value_both_set_is_an_error_naming_var_and_path_only() {
+        let vars = HashMap::from([("FOO", SENTINEL), ("FOO_FILE", "/run/secrets/foo")]);
+        let files = HashMap::from([("/run/secrets/foo", SENTINEL)]);
+        let err =
+            config_value_from_lookup("FOO", lookup_from(&vars), files_from(&files)).unwrap_err();
+        assert!(matches!(err, EnvError::BothSet { .. }));
+        let text = err.to_string();
+        assert!(text.contains("FOO_FILE"), "{text}");
+        assert!(text.contains("/run/secrets/foo"), "{text}");
+        assert_no_leak(&err);
+    }
+
+    #[test]
+    fn config_value_file_failures_match_secret_from_lookup() {
+        let vars = HashMap::from([("FOO_FILE", "/run/secrets/foo")]);
+
+        let files = HashMap::new();
+        let err =
+            config_value_from_lookup("FOO", lookup_from(&vars), files_from(&files)).unwrap_err();
+        assert!(matches!(err, EnvError::ReadFailed { .. }), "{err:?}");
+
+        let files = HashMap::from([("/run/secrets/foo", " \n")]);
+        let err =
+            config_value_from_lookup("FOO", lookup_from(&vars), files_from(&files)).unwrap_err();
+        assert!(matches!(err, EnvError::EmptyFile { .. }), "{err:?}");
+
+        let big = "x".repeat(MAX_SECRET_FILE_BYTES + 1);
+        let err = config_value_from_lookup("FOO", lookup_from(&vars), |_: &str| Ok(big.clone()))
+            .unwrap_err();
+        assert!(matches!(err, EnvError::FileTooLarge { .. }), "{err:?}");
+    }
+
+    #[test]
+    fn config_value_from_env_wraps_the_real_environment() {
+        assert_eq!(
+            config_value_from_env("OAUTH_RESOURCE_SERVER_ENV_RS_TEST_UNSET_VAR_9f3c").unwrap(),
+            None
+        );
+    }
+
+    #[test]
+    fn the_public_reader_refuses_a_directory_and_an_oversized_file() {
+        let dir = std::env::temp_dir();
+        let err = read_secret_file(dir.to_str().unwrap()).unwrap_err();
+        let err = file_error("FOO", "d".to_string(), err);
+        assert!(matches!(err, EnvError::NotAFile { .. }), "{err:?}");
+
+        let path = dir.join(format!("ors-env-big-{}.txt", std::process::id()));
+        std::fs::write(&path, "x".repeat(MAX_SECRET_FILE_BYTES + 1)).unwrap();
+        let result = read_secret_file(path.to_str().unwrap());
+        std::fs::remove_file(&path).unwrap();
+        let err = file_error("FOO", "f".to_string(), result.unwrap_err());
+        assert!(matches!(err, EnvError::FileTooLarge { .. }), "{err:?}");
     }
 
     // ── oauth_config_from_lookup ─────────────────────────────────────────────
