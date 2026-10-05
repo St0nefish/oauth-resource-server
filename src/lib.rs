@@ -29,7 +29,7 @@
 | [`static_token_policy`], [`StaticTokenDecision`] | The startup decision about a static API key alongside OAuth. |
 | [`axum::AuthLayer`], [`axum::require_auth`], [`axum::metadata_router`] | The axum integration (feature `axum`), including extractors for [`Credential`], [`AuthorizedToken`] and [`StaticTokenMatch`], and the per-handler scope extractor [`axum::Scoped`]. |
 | [`http_layer::HttpAuthLayer`], [`http_layer::HttpAuthLayerBuilder`], [`http_layer::RequireScopes`] | A `tower` layer for any `http::Request<B>` service, whatever its body types (feature `tower`, implied by `axum`), and the per-route scope layer both layers share. |
-| [`env::oauth_config_from_env`], [`env::secret_from_env`], [`env::static_tokens_from_env`] | Configuration from environment variables (feature `env`), including a current and a next static key for rotation. |"
+| [`env::oauth_config_from_env`], [`env::secret_from_env`], [`env::config_value_from_env`], [`env::static_tokens_from_env`] | Configuration from environment variables (feature `env`), including a current and a next static key for rotation. |"
 )]
 #![cfg_attr(
     all(feature = "serde", feature = "env", feature = "axum", feature = "mcp"),

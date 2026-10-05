@@ -8,6 +8,28 @@ Before 1.0, a breaking change increments the minor version.
 
 ## [Unreleased]
 
+## [0.4.0] - 2026-10-05
+
+Additive only; the minor bump follows this crate's convention of shipping new
+public items in a new `0.x`.
+
+### Added
+
+- `env` feature: `config_value_from_env` / `config_value_from_lookup`, the
+  `VAR` / `VAR_FILE` shape of `secret_from_env` for a value that is not a
+  secret. A set `VAR` is returned exactly as set (empty and untrimmed
+  included) instead of a blank one reading as unset, so an application
+  replacing a plain `std::env::var` read with it keeps every value it read.
+  A blank `VAR` beside a `VAR_FILE` yields to the file; a non-blank one is
+  `EnvError::BothSet`; file errors are the same as `secret_from_env`'s.
+- `env::read_secret_file` is now public: the bounded reader every `_env`
+  function uses (regular file only, at most `MAX_SECRET_FILE_BYTES`), for
+  passing to a `_lookup` function when the application supplies its own
+  variable lookup instead of copying the checks. Its refusals (not a regular
+  file, over the limit) are an `io::Error` of kind `InvalidInput` wrapping the
+  new public `#[non_exhaustive]` `env::FileRefused`, which a direct caller
+  recovers with `downcast_ref`.
+
 ## [0.3.1] - 2026-10-01
 
 ### Security
@@ -926,7 +948,8 @@ MSRV: Rust 1.89. License: MIT.
   resource on a non-loopback host needs `<PREFIX>ALLOW_INSECURE_HTTP=true`
   (`allow_insecure_http`).
 
-[Unreleased]: https://github.com/St0nefish/oauth-resource-server/compare/v0.3.1...HEAD
+[Unreleased]: https://github.com/St0nefish/oauth-resource-server/compare/v0.4.0...HEAD
+[0.4.0]: https://github.com/St0nefish/oauth-resource-server/compare/v0.3.1...v0.4.0
 [0.3.1]: https://github.com/St0nefish/oauth-resource-server/compare/v0.3.0...v0.3.1
 [0.3.0]: https://github.com/St0nefish/oauth-resource-server/compare/v0.2.0...v0.3.0
 [0.2.0]: https://github.com/St0nefish/oauth-resource-server/compare/v0.1.2...v0.2.0
