@@ -167,12 +167,19 @@ impl<'de> serde::Deserialize<'de> for Pairs {
 pub const MAX_SECRET_FILE_BYTES: usize = 64 * 1024;
 
 /// Why [`read_secret_file`] refused a file before or while reading it,
-/// carried inside the `io::Error` so the `_lookup` functions' reader
-/// signature stays `Fn(&str) -> io::Result<String>`.
-#[derive(Debug, thiserror::Error)]
-enum FileRefused {
+/// carried inside its `io::Error` (kind [`io::ErrorKind::InvalidInput`]) so
+/// the `_lookup` functions' reader signature stays
+/// `Fn(&str) -> io::Result<String>`. Recover it with
+/// `err.get_ref().and_then(|e| e.downcast_ref::<FileRefused>())`; the
+/// `io::ErrorKind` alone does not identify it, since opening a file can fail
+/// with `InvalidInput` too.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
+#[non_exhaustive]
+pub enum FileRefused {
+    /// The path is not a regular file: a directory, a FIFO, a device.
     #[error("not a regular file")]
     NotAFile,
+    /// The file is over [`MAX_SECRET_FILE_BYTES`].
     #[error("over the size limit")]
     TooLarge,
 }
@@ -185,15 +192,27 @@ enum FileRefused {
 /// once copied into the `String`.
 ///
 /// The refusals (not a regular file, over the limit) travel inside the
-/// returned `io::Error`; the `_lookup` functions turn them into
-/// [`EnvError::NotAFile`] and [`EnvError::FileTooLarge`]. Called on its own it
-/// returns the raw contents, untrimmed, and an over-limit file is an error
-/// rather than a truncated read.
+/// returned `io::Error` as a [`FileRefused`]; the `_lookup` functions turn
+/// them into [`EnvError::NotAFile`] and [`EnvError::FileTooLarge`]. Called on
+/// its own it returns the raw contents, untrimmed, and an over-limit file is
+/// an error rather than a truncated read.
 ///
 /// # Errors
 ///
 /// An `io::Error` when the path cannot be opened or read, is not a regular
-/// file, is over [`MAX_SECRET_FILE_BYTES`], or does not hold UTF-8.
+/// file or is over [`MAX_SECRET_FILE_BYTES`] (a [`FileRefused`] inside, kind
+/// `InvalidInput`), or does not hold UTF-8 (kind `InvalidData`).
+///
+/// # Security
+///
+/// The returned `String` is a plain, unwiped copy of the file's contents: the
+/// caller owns it and, for a secret, decides how long it lives (only this
+/// function's own intermediate buffer is wiped). The not-a-regular-file check
+/// before opening is best-effort against a path swapped for a FIFO between
+/// the check and the open, which would block there; the second check, on the
+/// open file, still refuses reading anything but a regular file. Both suit a
+/// startup-time read of an operator-controlled path such as a secrets mount,
+/// not a path an untrusted party can rewrite.
 ///
 /// # Examples
 ///
@@ -416,8 +435,9 @@ fn read_file_value(
 ///
 /// It differs from [`secret_from_env`] in one respect: `VAR` is returned
 /// exactly as set, empty and untrimmed included, so an application moving
-/// from plain `std::env::var` to this keeps every value it read before. The
-/// rest is the same:
+/// from plain `std::env::var` to this keeps every value it read before (while
+/// no `<var>_FILE` is set; one beside it is what this adds). The rest is the
+/// same:
 ///
 /// | `<var>` | `<var>_FILE` | Result |
 /// |---|---|---|
@@ -426,6 +446,9 @@ fn read_file_value(
 /// | blank | set | the file's contents, trimmed (a blank `VAR` alongside a `_FILE` is how a templated environment leaves one unset) |
 /// | non-blank | set | [`EnvError::BothSet`] |
 /// | unset or blank | set | a file that is empty after trimming is [`EnvError::EmptyFile`] |
+///
+/// The file is read only when `<var>_FILE` is set (non-blank) and `var` is
+/// blank or unset, never on [`EnvError::BothSet`].
 ///
 /// This is [`config_value_from_lookup`] wired to the real process environment
 /// and filesystem ([`read_secret_file`]); use that directly to test callers
@@ -439,9 +462,12 @@ fn read_file_value(
 ///
 /// # Security
 ///
-/// Meant for values that are safe to see: only a value read from a *file* is
-/// wiped on drop here, so keep a secret in [`secret_from_env`]. No error
-/// includes a value: errors name the variable and the file path only.
+/// Meant for values that are safe to see; keep a secret in
+/// [`secret_from_env`]. Unlike it, a `VAR` value is held in a plain `String`
+/// and one discarded on [`EnvError::BothSet`] is not wiped, and the file path
+/// wipes only its intermediate copies: the returned `String` is the caller's,
+/// as with [`secret_from_env`]. No error includes a value: errors name the
+/// variable and the file path only.
 ///
 /// # Examples
 ///
@@ -1515,24 +1541,71 @@ mod tests {
         assert_no_leak(&err);
     }
 
+    type BoxedReader = Box<dyn Fn(&str) -> io::Result<String>>;
+    /// Variables, the expected value (`None`: an error or absent), and how
+    /// many file reads are expected.
+    type ReadCase<'a> = (&'a [(&'a str, &'a str)], Option<&'a str>, usize);
+
     #[test]
-    fn config_value_file_failures_match_secret_from_lookup() {
+    fn config_value_file_failures_are_the_same_variants_as_secret_from_lookup() {
         let vars = HashMap::from([("FOO_FILE", "/run/secrets/foo")]);
-
-        let files = HashMap::new();
-        let err =
-            config_value_from_lookup("FOO", lookup_from(&vars), files_from(&files)).unwrap_err();
-        assert!(matches!(err, EnvError::ReadFailed { .. }), "{err:?}");
-
-        let files = HashMap::from([("/run/secrets/foo", " \n")]);
-        let err =
-            config_value_from_lookup("FOO", lookup_from(&vars), files_from(&files)).unwrap_err();
-        assert!(matches!(err, EnvError::EmptyFile { .. }), "{err:?}");
-
         let big = "x".repeat(MAX_SECRET_FILE_BYTES + 1);
-        let err = config_value_from_lookup("FOO", lookup_from(&vars), |_: &str| Ok(big.clone()))
-            .unwrap_err();
-        assert!(matches!(err, EnvError::FileTooLarge { .. }), "{err:?}");
+        let refused = |why| move |_: &str| Err(io::Error::new(io::ErrorKind::InvalidInput, why));
+        let readers: Vec<(&str, BoxedReader)> = vec![
+            (
+                "unreadable",
+                Box::new(|_: &str| Err(io::Error::from(io::ErrorKind::NotFound))),
+            ),
+            ("empty", Box::new(|_: &str| Ok(" \n".to_string()))),
+            ("oversized", Box::new(move |_: &str| Ok(big.clone()))),
+            ("not a file", Box::new(refused(FileRefused::NotAFile))),
+            ("too large", Box::new(refused(FileRefused::TooLarge))),
+        ];
+        for (name, reader) in &readers {
+            let config = config_value_from_lookup("FOO", lookup_from(&vars), reader).unwrap_err();
+            let secret = secret_from_lookup("FOO", lookup_from(&vars), reader).unwrap_err();
+            assert_eq!(
+                std::mem::discriminant(&config),
+                std::mem::discriminant(&secret),
+                "{name}: {config:?} vs {secret:?}"
+            );
+            assert_eq!(config.to_string(), secret.to_string(), "{name}");
+        }
+    }
+
+    #[test]
+    fn config_value_file_is_read_only_when_var_is_blank_and_the_file_variable_is_set() {
+        let reads = Cell::new(0);
+        let reader = |_: &str| {
+            reads.set(reads.get() + 1);
+            Ok("from-file".to_string())
+        };
+        let cases: [ReadCase; 5] = [
+            // Both set: an error before any read.
+            (&[("FOO", "x"), ("FOO_FILE", "/f")], None, 0),
+            // A set value beside a blank file variable: the value, no read.
+            (&[("FOO", "x"), ("FOO_FILE", "  ")], Some("x"), 0),
+            // A set-but-empty value beside a blank file variable: still the value.
+            (&[("FOO", ""), ("FOO_FILE", "")], Some(""), 0),
+            // Nothing: no read.
+            (&[], None, 0),
+            // A blank value beside a file variable: the file, read once.
+            (&[("FOO", ""), ("FOO_FILE", "/f")], Some("from-file"), 1),
+        ];
+        for (vars, want, want_reads) in cases {
+            reads.set(0);
+            let vars: HashMap<&str, &str> = vars.iter().copied().collect();
+            let got =
+                config_value_from_lookup("FOO", |k| vars.get(k).map(|v| v.to_string()), reader);
+            match want {
+                Some(want) => assert_eq!(got.unwrap().as_deref(), Some(want), "{vars:?}"),
+                None => assert!(
+                    matches!(&got, Err(EnvError::BothSet { .. }) | Ok(None)),
+                    "{vars:?}: {got:?}"
+                ),
+            }
+            assert_eq!(reads.get(), want_reads, "{vars:?}");
+        }
     }
 
     #[test]
@@ -1545,17 +1618,27 @@ mod tests {
 
     #[test]
     fn the_public_reader_refuses_a_directory_and_an_oversized_file() {
+        // A direct caller recovers the refusal by downcasting the io::Error.
+        let refusal = |err: io::Error| {
+            assert_eq!(err.kind(), io::ErrorKind::InvalidInput);
+            err.get_ref()
+                .and_then(|e| e.downcast_ref::<FileRefused>())
+                .copied()
+        };
+
         let dir = std::env::temp_dir();
         let err = read_secret_file(dir.to_str().unwrap()).unwrap_err();
-        let err = file_error("FOO", "d".to_string(), err);
-        assert!(matches!(err, EnvError::NotAFile { .. }), "{err:?}");
+        assert_eq!(refusal(err), Some(FileRefused::NotAFile));
 
-        let path = dir.join(format!("ors-env-big-{}.txt", std::process::id()));
+        let path = temp_path("public-reader-big");
         std::fs::write(&path, "x".repeat(MAX_SECRET_FILE_BYTES + 1)).unwrap();
         let result = read_secret_file(path.to_str().unwrap());
         std::fs::remove_file(&path).unwrap();
-        let err = file_error("FOO", "f".to_string(), result.unwrap_err());
-        assert!(matches!(err, EnvError::FileTooLarge { .. }), "{err:?}");
+        assert_eq!(refusal(result.unwrap_err()), Some(FileRefused::TooLarge));
+
+        // A missing file is an ordinary I/O error, not a refusal.
+        let missing = read_secret_file(temp_path("public-reader-missing").to_str().unwrap());
+        assert_eq!(missing.unwrap_err().kind(), io::ErrorKind::NotFound);
     }
 
     // ── oauth_config_from_lookup ─────────────────────────────────────────────

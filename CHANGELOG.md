@@ -25,7 +25,10 @@ public items in a new `0.x`.
 - `env::read_secret_file` is now public: the bounded reader every `_env`
   function uses (regular file only, at most `MAX_SECRET_FILE_BYTES`), for
   passing to a `_lookup` function when the application supplies its own
-  variable lookup instead of copying the checks.
+  variable lookup instead of copying the checks. Its refusals (not a regular
+  file, over the limit) are an `io::Error` of kind `InvalidInput` wrapping the
+  new public `#[non_exhaustive]` `env::FileRefused`, which a direct caller
+  recovers with `downcast_ref`.
 
 ## [0.3.1] - 2026-10-01
 

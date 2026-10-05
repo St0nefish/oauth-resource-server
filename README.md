@@ -1446,7 +1446,7 @@ its `_FILE`. See
 A value that is not a secret, such as a URL, is read with
 `config_value_from_env(var)`: the same `<VAR>` or `<VAR>_FILE`, but a `<VAR>`
 that is set is returned exactly as set, empty or untrimmed, so replacing a
-plain `std::env::var` read with it changes no value. A blank `<VAR>` next to a
+plain `std::env::var` read with it changes no value (while no `_FILE` is set). A blank `<VAR>` next to a
 `_FILE` yields to the file; a non-blank one is the same both-set error. The
 real, bounded file reader behind all of these is public as
 `read_secret_file`, to pass to a `_lookup` function when an application
@@ -1668,10 +1668,11 @@ an `InvalidToken`'s `kind()` names the check that failed).
   have the candidate's length (each comparison ends early on a length
   mismatch, as with one token); keys of one fixed length reveal nothing by it.
   A `StaticTokens` set, the layer builders' single static token and the
-  `env` loaders' intermediate copies are wiped (`zeroize`) when dropped.
-  Strings your code passes in or keeps, `secret_from_env`'s returned
-  `String`, a `StaticTokenDecision`'s payload and the process environment
-  are not.
+  `env` loaders' intermediate copies are wiped (`zeroize`) when dropped
+  (`config_value_from_env`, for values that are not secrets, wipes only the
+  file path's intermediates). Strings your code passes in or keeps,
+  `secret_from_env`'s returned `String`, a `StaticTokenDecision`'s payload and
+  the process environment are not.
 - **Configuration is validated at startup,** all of it at once, so a broken
   deployment refuses to start rather than answering 401 to everyone.
 
