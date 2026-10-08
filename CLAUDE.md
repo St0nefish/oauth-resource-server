@@ -1262,7 +1262,7 @@ treat them as always-in-effect policy:
 
 - `master` takes no direct pushes; a repository **ruleset** requires only the
   `ci-pass` status check (never individual jobs), does **not** require branches
-  to be up to date, allows squash merges only, and auto-deletes merged branches.
+  to be up to date, allows merge commits only, and auto-deletes merged branches.
 - Workflow runs for a fork PR need a maintainer's approval for every external
   contributor, because the heavy jobs run on a self-hosted runner. That gate
   covers forks only: Dependabot's PRs come from branches of this repository, so
@@ -1321,7 +1321,7 @@ The flow and the constraints the workflow files cannot express on their own
   `publish = false`) outside `Cargo.toml`'s `include` list; `Cargo.toml`'s
   `[lints.rust] unexpected_cfgs` declares the `fuzzing` cfg so clippy stays
   clean.
-- `auto-merge.yml` arms squash auto-merge on every PR opened by `St0nefish`, so
+- `auto-merge.yml` arms merge-commit auto-merge on every PR opened by `St0nefish`, so
   the owner's PRs land as soon as `ci-pass` is green — that is the intended
   flow. It must use the App token: a merge made with `GITHUB_TOKEN` starts no
   workflow runs, so the post-merge CI (and the release) would never fire. Other

@@ -149,7 +149,7 @@ This repository follows a simple trunk-based flow on `master`:
    first, so expect a short wait before checks start. `ci-pass` is the one
    required status check.
 3. Once `ci-pass` is green and the change has been reviewed, a maintainer
-   squash-merges it. The branch is deleted after merge. (The maintainer's
+   merge-commits it. The branch is deleted after merge. (The maintainer's
    own PRs merge automatically once `ci-pass` is green.)
 
 You don't need to keep your branch up to date with `master` — CI re-runs on
