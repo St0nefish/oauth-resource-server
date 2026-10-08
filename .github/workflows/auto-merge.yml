@@ -1,6 +1,6 @@
 name: Auto-merge
 
-# Arms GitHub's auto-merge (squash) on the owner's PRs, so they land as soon
+# Arms GitHub's auto-merge (merge commit) on the owner's PRs, so they land as soon
 # as `ci-pass` is green. The ruleset still enforces `ci-pass`; this only saves
 # the manual click.
 #
@@ -17,7 +17,7 @@ name: Auto-merge
 # the App rewrite what CI runs). A PR that changes a file under
 # `.github/workflows/` still auto-merges when its branch already contains
 # master's version of those files (#34). When master has changed a workflow
-# file the PR also touches since the branch was cut, the squash merge would
+# file the PR also touches since the branch was cut, the merge commit would
 # write workflow content that is not in the PR, and GitHub refuses to let an
 # App enable auto-merge without `workflows` (#27). This job then fails; merge
 # `master` into the branch and push, or merge by hand once `ci-pass` is green.
@@ -55,7 +55,7 @@ jobs:
           # change a workflow file cannot be auto-merged — see the header.
 
       - name: Enable auto-merge
-        run: gh pr merge "$PR_NUMBER" --auto --squash --repo "$REPO"
+        run: gh pr merge "$PR_NUMBER" --auto --merge --repo "$REPO"
         env:
           GH_TOKEN: ${{ steps.app-token.outputs.token }}
           PR_NUMBER: ${{ github.event.pull_request.number }}
