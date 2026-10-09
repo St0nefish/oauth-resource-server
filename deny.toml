@@ -1,6 +1,6 @@
 # cargo-deny configuration, run by the `cargo deny check` step in
-# .github/workflows/ci.yml's `checks` job (and repeated in release.yml's
-# `verify`). Covers the four checks: advisories, licenses, bans and sources.
+# .github/workflows/checks.yml's `audit` job. Covers the four checks:
+# advisories, licenses, bans and sources.
 #
 # The graph is every feature of every target: a consumer can enable any of the
 # additive TLS backends, `axum` and the rest, so a licence or advisory in any

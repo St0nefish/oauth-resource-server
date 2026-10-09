@@ -261,8 +261,8 @@ See `CLAUDE.md` for the full list and the module each one lives in.
 CI checks more than the invariants above, so a regression in them is caught
 before a release rather than reported after it:
 
-- **API compatibility.** `cargo semver-checks` compares every pull request,
-  and every release commit, with the latest release on crates.io, so an
+- **API compatibility.** `cargo semver-checks` compares every pull request
+  (merged onto `master`, before it lands) with the latest release on crates.io, so an
   accidental breaking change to this crate's own API surface fails CI instead
   of reaching a consumer on a compatible-version range. It cannot see a major
   bump of a dependency whose types appear in the public API (`serde`,
