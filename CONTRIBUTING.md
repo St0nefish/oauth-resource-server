@@ -32,7 +32,7 @@ cargo publish --dry-run
 ```
 
 `cargo publish --dry-run` refuses a working tree with uncommitted changes;
-pass `--allow-dirty` when running it locally mid-change (`ci.yml` runs it
+pass `--allow-dirty` when running it locally mid-change (CI runs it
 against a clean checkout, so it never needs the flag there). `cargo audit`
 and `cargo deny check` need `cargo-audit` and `cargo-deny` installed
 (`cargo install --locked cargo-audit cargo-deny`, or `cargo binstall`).
@@ -40,8 +40,8 @@ and `cargo deny check` need `cargo-audit` and `cargo-deny` installed
 not on its allowlist, a git or non-crates.io source, or a yanked or
 vulnerable crate fails it; two versions of one crate is only a warning.
 
-This list isn't quite everything CI runs. Four more jobs run alongside it,
-and CI will catch them regardless if you skip them locally:
+This list isn't quite everything CI runs. Four more jobs run in the slow tier
+(`ci-slow`), and CI will catch them regardless if you skip them locally:
 
 ```sh
 # msrv: the pinned MSRV toolchain, reading rust-version from Cargo.toml
@@ -53,7 +53,7 @@ cargo "+1.89" build --all-features --locked
 cargo +1.93 semver-checks check-release --all-features
 
 # feature-powerset: every feature combination builds (needs cargo-hack;
-# `metrics` is toggled together with `testing`, see ci.yml)
+# `metrics` is toggled together with `testing`, see checks.yml)
 cargo hack check --feature-powerset --no-dev-deps \
   --mutually-exclusive-features rustls-tls,native-tls,rustls-tls-native-roots \
   --at-least-one-of rustls-tls,native-tls,rustls-tls-native-roots \
@@ -68,10 +68,11 @@ cargo update -p time
 cargo build --all-features
 ```
 
-`semver` compares against the newest release on crates.io, so a PR that
-deliberately breaks the public API must bump `version` in `Cargo.toml` by a
-`0.x` minor in the same PR (see the semver policy in `CLAUDE.md`); that bump
-is what marks the break as intended. If `minimal-versions` fails, raise the
+`semver` compares against the newest release on crates.io. `master`'s
+`Cargo.toml` always names the *next* release, one patch above the last one,
+so a PR that deliberately breaks the public API must also bump the `0.x`
+minor (`cargo release version minor --execute --no-confirm`; see the semver
+policy in `CLAUDE.md`); that bump is what marks the break as intended. If `minimal-versions` fails, raise the
 named lower bound in `Cargo.toml` to a release that builds and say in the
 comment above `[dependencies]` whether it is a compile floor or only what the
 resolver needs.
@@ -144,36 +145,33 @@ This repository follows a simple trunk-based flow on `master`:
 
 1. Branch from `master` (or fork), make your change, and make sure the check
    suite above passes locally.
-2. Open a PR against `master`. `ci.yml` runs on the project's self-hosted
-   runner; for a PR from a fork, a maintainer approves the workflow run
-   first, so expect a short wait before checks start. `ci-pass` is the one
-   required status check.
-3. Once `ci-pass` is green and the change has been reviewed, a maintainer
-   merge-commits it. The branch is deleted after merge. (The maintainer's
-   own PRs merge automatically once `ci-pass` is green.)
+2. Open a PR against `master`. Two checks are required:
+   - **`ci-fast`** runs on every push to the PR, on GitHub-hosted runners:
+     workflow lint, then — when the PR touches code — fmt, clippy, unit
+     tests, the doc build, `cargo audit`/`cargo deny` and the publish dry run.
+     For a PR from a fork, a maintainer approves the workflow run first.
+   - **`ci-slow`** runs once a maintainer arms the PR for auto-merge (the
+     approval to run its code on the project's self-hosted runner): the
+     integration tests, `msrv`, `semver`, `feature-powerset` and
+     `minimal-versions`, on your branch merged onto the current `master`.
+3. When both are green, GitHub merge-commits the PR and deletes the branch.
+   (The maintainer's own PRs are armed when they open.)
 
-You don't need to keep your branch up to date with `master` — CI re-runs on
-`master` after every merge. Rebase only if GitHub reports a conflict.
+You don't need to keep your branch up to date with `master` — `ci-slow`
+tests the merge onto the current `master`, and `master` re-checks any merge
+whose combination nobody tested. Rebase or merge `master` only if GitHub
+reports a conflict.
 
-An ordinary merge publishes nothing. **A merged PR that changes `version` in
-`Cargo.toml` is the release** (bump-is-release): the bump PR changes
-`Cargo.toml` and `Cargo.lock` (`cargo release version minor --execute
---no-confirm`, or by hand) — unless a breaking PR already did, which
-`semver` requires — and moves `CHANGELOG.md`'s `[Unreleased]` entries under
-a matching `## [X.Y.Z]` section. Once that commit's post-merge CI run passes
-on `master`, its `release-on-bump` job creates GitHub release `vX.Y.Z` at
-the bump commit, which runs `release.yml`: it verifies the tagged commit,
-publishes it to crates.io, and sets the release notes from `CHANGELOG.md`.
-A bump with no non-empty `CHANGELOG.md` section fails `release-on-bump`
-instead of creating a release, and a pre-release version (`X.Y.Z-rc.N`) is
-never released automatically — the maintainer publishes one by hand.
-Publishing uses crates.io trusted publishing, bound to this repository's
-`release` GitHub environment, which only `v*` release tags can deploy to;
-only repository admins and the project's CI GitHub App can create those
-tags, only a release from the maintainer or that App starts a publish, and
-no crates.io token is stored anywhere in the repository.
-Contributors don't bump the version or push tags — put your entry under
-`CHANGELOG.md`'s `[Unreleased]` section. See
+A merge publishes nothing. **Releases are made by the maintainer by hand**:
+`gh release create vX.Y.Z --target <commit> --title vX.Y.Z --generate-notes`
+on a merged commit whose `Cargo.toml` names `X.Y.Z`. That runs `release.yml`,
+which checks the release, publishes the crate to crates.io through trusted
+publishing (bound to this repository's `release` environment, which only
+`v*` tags can deploy to; only repository admins can create those tags, and
+no crates.io token is stored anywhere), and then opens a PR rolling `master`
+to the next patch version. Contributors don't bump the version or push tags
+(unless a deliberate breaking change needs the minor bump above) — put your
+entry under `CHANGELOG.md`'s `[Unreleased]` section. See
 `.github/workflows/release.yml`'s header comment for the details.
 
 ## Reporting a security issue

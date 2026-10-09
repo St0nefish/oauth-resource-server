@@ -1,5 +1,5 @@
 # cargo-audit configuration (run by the `cargo audit` step in
-# .github/workflows/ci.yml's `checks` job).
+# .github/workflows/checks.yml's `audit` job).
 #
 # No advisories are ignored yet — this crate's dependency tree is new and
 # small. Add an entry here only for an advisory that is a genuine false

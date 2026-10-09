@@ -2,7 +2,7 @@
 
 [![crates.io](https://img.shields.io/crates/v/oauth-resource-server.svg)](https://crates.io/crates/oauth-resource-server)
 [![docs.rs](https://img.shields.io/docsrs/oauth-resource-server)](https://docs.rs/oauth-resource-server)
-[![CI](https://github.com/St0nefish/oauth-resource-server/actions/workflows/ci.yml/badge.svg?branch=master)](https://github.com/St0nefish/oauth-resource-server/actions/workflows/ci.yml)
+[![CI](https://github.com/St0nefish/oauth-resource-server/actions/workflows/master.yml/badge.svg?branch=master)](https://github.com/St0nefish/oauth-resource-server/actions/workflows/master.yml)
 [![license: MIT](https://img.shields.io/crates/l/oauth-resource-server.svg)](https://github.com/St0nefish/oauth-resource-server/blob/master/LICENSE)
 [![MSRV 1.89](https://img.shields.io/badge/MSRV-1.89-blue.svg)](#msrv-and-semver-policy)
 

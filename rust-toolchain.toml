@@ -2,12 +2,14 @@
 #
 # rustup honors this file automatically for every `cargo`/`rustc` invocation
 # anywhere under this directory tree, so local dev needs nothing extra once
-# rustup is installed. `.github/workflows/ci.yml` and `release.yml` read
-# `channel` out of this file and install exactly that toolchain, rather than
-# naming a version separately, so the toolchain CI compiles with cannot
-# silently drift from the one declared here. The `msrv` job in `ci.yml`
-# installs `rust-version` from Cargo.toml explicitly instead, precisely so it
-# stops tracking this file if the two are ever allowed to diverge.
+# rustup is installed. The workflows under `.github/workflows/` read `channel`
+# out of this file and install exactly that toolchain, rather than naming a
+# version separately, so the toolchain CI compiles with cannot silently drift
+# from the one declared here (`ci-fast`'s lint runs
+# `.github/scripts/check-rust-pin.sh`, which fails on a version hard-coded
+# anywhere else). The `msrv` job in `checks.yml` installs `rust-version` from
+# Cargo.toml explicitly instead, precisely so it stops tracking this file if
+# the two are ever allowed to diverge.
 #
 # MSRV: see `rust-version` in Cargo.toml, which makes a plain `cargo build`
 # under a too-old toolchain fail fast with a clear "package requires rustc X but

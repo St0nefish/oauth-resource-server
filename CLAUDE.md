@@ -1131,13 +1131,14 @@ matrix entry in `.github/workflows/fuzz.yml`.
 - The `semver` job's toolchain and its pinned `cargo-semver-checks` version move
   together (the tool needs a recent rustc for the rustdoc JSON format; a
   floating `stable` would break every PR when the format changes). Both live in
-  `ci.yml` and `release.yml`.
+  `checks.yml` (`SEMVER_TOOLCHAIN` and the `semver` job).
 - `cargo publish --dry-run` refuses a dirty tree; pass `--allow-dirty` locally.
 - The minimal-versions recipe rewrites `Cargo.toml`/`Cargo.lock`: run it in a
   throwaway copy.
-- A PR touching only `CLAUDE.md`/`.claude/`/`.claude-plugin/` skips every heavy
-  CI job (`ci.yml`'s `changes` job) — nothing compiles, so do not rely on CI to
-  validate code snippets edited here.
+- A PR touching no code path (`.github/scripts/code-paths.sh`: e.g. only
+  `CLAUDE.md`, `.claude/`, `CHANGELOG.md`) runs no cargo job — nothing compiles,
+  so do not rely on CI to validate code snippets edited here. `README.md` is a
+  code path: it is the crate-level rustdoc, so its examples are doctests.
 
 ## Security review checklist
 
@@ -1242,8 +1243,8 @@ Apply to any change touching `src/validator.rs`, `src/jwks.rs`,
   - `cargo-semver-checks` does not flag a tuple variant's payload type changing
     (e.g. `Invalid(String)` → `Invalid(SomeType)`), so a green job never proves
     that kind of change compatible — review it by hand.
-  - It compares against the newest crates.io release. Once a version bump has
-    merged and until that version is published, the job sees a new minor and
+  - It compares against the newest crates.io release. Once a minor bump has
+    merged and until that version is released, the job sees a new minor and
     reports no break at all: diff any further `pub` change in that window by
     hand against the last published release, and keep breaking changes out of
     a release whose CHANGELOG promises an additive one.
@@ -1255,163 +1256,168 @@ Apply to any change touching `src/validator.rs`, `src/jwks.rs`,
 
 ## Workflow
 
-**pr-manual-release** (CI-gated PRs; an ordinary merge ships nothing, and a
-merged version bump is the release — bump-is-release) on GitHub, `master` as the
-default branch. These repository settings live on GitHub, not in this tree;
+**pr-manual-release** (KB `dev/tools/repo-workflow-patterns.md`, spec
+`dev/tools/merge-train-pattern.md`, copied from `St0nefish/template-pr-manual-release`)
+on GitHub, `master` as the default branch: CI-gated merge-commit PRs, a merge
+ships nothing, and **a release is a manual act by the owner** — no version change
+ever creates one. These repository settings live on GitHub, not in this tree;
 treat them as always-in-effect policy:
 
-- `master` takes no direct pushes; a repository **ruleset** requires only the
-  `ci-pass` status check (never individual jobs), does **not** require branches
-  to be up to date, allows merge commits only, and auto-deletes merged branches.
-- Workflow runs for a fork PR need a maintainer's approval for every external
-  contributor, because the heavy jobs run on a self-hosted runner. That gate
-  covers forks only: Dependabot's PRs come from branches of this repository, so
-  they run there without approval and a dependency bump executes new upstream
-  build scripts, proc macros and tests on it. That is accepted even though the
-  runner mounts the host docker socket: nothing secret lives on that runner (CI
-  jobs hold only a read-only token), and neither the job that can mint a
-  crates.io token nor `release-on-bump` (which holds a `contents: write` App
-  token) ever runs there.
+- Ruleset `master protection`: no direct pushes, no deletion or force-push, PRs
+  with 0 approvals, **merge commits only** (squash and rebase disabled), required
+  checks exactly **`ci-fast`** and **`ci-slow`** (both pinned to GitHub Actions,
+  integration 15368), **not** required to be up to date; merged branches are
+  deleted. Read history with `git log --first-parent`.
 - A GitHub App (`stonefish-ci`, bot login `st0nefish-ci[bot]`): Client ID in the
-  `APP_CLIENT_ID` repo variable, private key in the `APP_PRIVATE_KEY` repo
-  secret; used by `auto-merge.yml` and `release-on-bump`. It deliberately lacks
-  the `workflows` permission: a PR changing a file under `.github/workflows/`
-  still auto-merges when its branch contains master's current version of those
-  files; when master changed one since the branch was cut, auto-merge fails and
-  the PR is refreshed from `master` or merged by hand once `ci-pass` is green.
-- A GitHub environment `release`, whose deployment policy admits only `v*`
-  tags; `release.yml`'s `publish` runs in it and crates.io trusted publishing
-  is bound to it.
-- A tag ruleset on `refs/tags/v*`: only repository admins (the owner) and the
-  App (a bypass actor) may create, move or delete a release tag. `GITHUB_TOKEN`
-  cannot, so the only workflow that may ever create a tag is `release-on-bump`,
-  with the App token, through `gh release create`.
+  `APP_CLIENT_ID` repo variable, private key in the `APP_PRIVATE_KEY` repo secret;
+  used by `auto-merge.yml` (arming) and `release.yml`'s `roll`. It deliberately
+  lacks the `workflows` permission: a PR changing a file under
+  `.github/workflows/` still arms when its branch contains master's current
+  version of those files; when master changed one since the branch was cut,
+  arming fails — merge `master` into the branch, push, and re-arm.
+- Environment `release`, whose deployment policy admits only `v*` tags;
+  `release.yml`'s `publish` runs in it and crates.io trusted publishing is bound
+  to it.
+- Ruleset `release tags` on `refs/tags/v*`: creation, update, deletion and
+  force-push restricted; the only bypass is the repository admin role (the
+  owner). Neither `GITHUB_TOKEN` nor the App can create a release tag.
 - Every action in `.github/workflows/` is pinned to a full commit SHA with its
   release in a trailing comment (`dtolnay/rust-toolchain`, which has no
   releases, to a commit of its `master` branch). Keep it that way.
 
-The flow and the constraints the workflow files cannot express on their own
-(read the header comments of `ci.yml`, `release.yml`, `fuzz.yml` and
-`auto-merge.yml` before editing them):
+```text
+PR opened ───────────► ci-fast   (ci-fast.yml, GitHub-hosted: lint; fast tier when code changed)
+auto-merge armed ────► ci-slow   (slow-trigger.yml -> master's slow.yml: waits for ci-fast,
+                                  merges head onto master, slow tier on the self-hosted
+                                  runner, posts the ci-slow status naming the merge's tree)
+both green ──────────► GitHub merges (merge commit, as the App that armed it)
+push to master ──────► master.yml: tree tested -> `verified`; untested tree (another PR
+                                  landed first, or the gate was bypassed) -> both tiers on
+                                  the commit first (fallback); docs-only -> inherits the
+                                  parent's `verified`; version-only -> nothing
+owner: gh release create vX.Y.Z --target <full sha> --title vX.Y.Z --generate-notes
+release: published ──► release.yml: check -> publish (crates.io) + notes -> roll PR (next patch)
+```
 
-- Work on a branch, open a PR against `master`. `ci.yml` runs the heavy jobs
-  `checks`, `msrv`, `semver`, `feature-powerset` and `minimal-versions` on the
-  self-hosted runner and fans them into `ci-pass` (GitHub-hosted). A cheap
-  `changes` job skips all heavy jobs when only Claude Code config changed.
-- **Adding a CI job**: add it to `ci-pass`'s `needs:` **and** its explicit
-  result check (and to the skip condition), and to `release-on-bump`'s `needs:`.
-  `ci-pass` uses `if: always()` plus that explicit check because a skipped
-  required check counts as passing — see the comment at the top of `ci.yml`.
-- **Keep `release.yml` in step**: its `verify`, `msrv` and `semver` jobs repeat
-  `ci.yml`'s `checks`, `msrv` and `semver` step for step. `feature-powerset` and
-  `minimal-versions` are deliberately not repeated at release (they ran on
-  master's post-merge CI); `semver` is, because it depends on crates.io and on
-  the release's version bump.
-- `semver` compares against the newest crates.io release, so while
-  `Cargo.toml`'s `version` equals it, any breaking change fails CI. A deliberate
-  breaking change carries its `version` bump in the same PR; that bump is what
-  tells the check it is intended.
-- `minimal-versions` is why some dependency requirements in `Cargo.toml` are not
-  bare majors; the comment above `[dependencies]` says which are compile floors
-  and which only let the resolver work. A new dependency or bound that
-  regresses fails this job.
+Read the header comments of the workflow files before editing them. The
+constraints they cannot express on their own:
+
+- **Tiers** live in `checks.yml`, the one definition of "this tree passes":
+  - fast (`ci-fast`, GitHub-hosted, every PR author): `unit` (fmt, the clippy
+    feature matrix, lib unit tests, the `-D warnings` doc build), `audit`
+    (`cargo audit`, `cargo deny check`), `publish-dry-run` (`cargo package
+    --list`, `cargo publish --dry-run`).
+  - slow (`ci-slow`, self-hosted): `integration` (all test targets and
+    doctests, all/default features, doctests without axum, examples), `msrv`,
+    `semver`, `feature-powerset`, `minimal-versions`.
+  - **Adding a job**: put it in `checks.yml` under the right tier's `if:`. The
+    fan-in (`ci-fast`'s job, `slow.yml`'s `report`) reads the reusable
+    workflow's result, so nothing else changes.
+- **Code paths** are one list, `.github/scripts/code-paths.sh`: `src/`, `tests/`,
+  `examples/`, `Cargo.toml`, `Cargo.lock`, `rust-toolchain.toml`, `deny.toml`,
+  `.cargo/`, `README.md` (the crate-level rustdoc, so its examples are
+  doctests), `.github/workflows/`, `.github/scripts/`. Any other Markdown never
+  counts; a change that only moves the crate's own version (the roll PR, a hand
+  minor bump) is not code. A no-code PR gets both checks green without building.
+- **Self-hosted runner**: an ephemeral container on a host whose docker socket
+  it mounts. Only the slow tier runs there, and only for an **armed** PR or a
+  master commit. The owner's PRs are armed on open by `auto-merge.yml`; a
+  contributor's or Dependabot's PR gets `ci-fast` only until the owner arms it
+  (`gh pr merge <n> --auto --merge`) — arming is the approval to run its code
+  (build scripts, proc macros, tests) on that host. No job there holds a write
+  credential.
+- **`ci-slow` is a commit status, not a job**: a skipped required job counts as
+  passing, and only master's copy of `slow.yml` can post it, so a PR cannot
+  edit how it is slow-tested. A red `ci-fast` makes `ci-slow` fail without
+  building. Re-test a head (flaky failure, or `ci-fast` re-run green after
+  `ci-slow` failed on it): `gh workflow run slow.yml --ref master -f pr=<n>`.
+- **Not serialized**: `ci-slow` tests the merge onto master *as of the test*. If
+  another PR lands first, `master.yml` runs both tiers on the untested merge
+  commit (the fallback) before posting `verified`. Re-process a master commit
+  whose run failed or was cancelled:
+  `gh workflow run master.yml --ref master -f sha=<commit>`.
 - `fuzz.yml` runs each target for a bounded time after a merge to `master`
   touching `src/`, `fuzz/` or the manifests, and on demand — never on a PR or a
   schedule, never self-hosted. `fuzz/` is its own package (empty `[workspace]`,
   `publish = false`) outside `Cargo.toml`'s `include` list; `Cargo.toml`'s
   `[lints.rust] unexpected_cfgs` declares the `fuzzing` cfg so clippy stays
   clean.
-- `auto-merge.yml` arms merge-commit auto-merge on every PR opened by `St0nefish`, so
-  the owner's PRs land as soon as `ci-pass` is green — that is the intended
-  flow. It must use the App token: a merge made with `GITHUB_TOKEN` starts no
-  workflow runs, so the post-merge CI (and the release) would never fire. Other
-  contributors' PRs are merged by hand after review; a fork PR never receives
-  the App credentials.
-- `ci.yml` also runs on every push to `master` — the post-merge re-check that
-  catches two PRs each green against an older `master`; there is deliberately
-  no separate `post-merge.yml`. Its concurrency group is per commit and never
-  cancelled: a shared group lets GitHub replace a pending run, and a bump commit
-  whose run vanished would never be released. That push run's
-  `release-on-bump` job (push only, after all heavy jobs, not in `ci-pass`,
-  GitHub-hosted) is where a release starts.
+- `semver` compares against the newest crates.io release, and `master`'s
+  `Cargo.toml` names the next patch, so any breaking change fails CI. A
+  deliberate breaking change carries its minor bump (`cargo release version
+  minor --execute --no-confirm`) in the same PR; that bump is what tells the
+  check it is intended.
+- `minimal-versions` is why some dependency requirements in `Cargo.toml` are not
+  bare majors; the comment above `[dependencies]` says which are compile floors
+  and which only let the resolver work. A new dependency or bound that
+  regresses fails this job.
 - Don't rebase an open PR just because `master` moved; refresh a branch only to
   resolve a real conflict.
 
 ## Release process
 
-- **A merged version bump is the release; any other merge publishes nothing.**
-  `ci.yml`'s `release-on-bump` runs `.github/scripts/release-on-bump.sh`, which
-  creates release `vX.Y.Z` at the bump commit with the App token only when the
-  commit changed the `[package] version`, the version is stable (pre-releases
-  stay owner-published by hand), no such tag exists and it would be the highest
-  stable `v*` tag. It **fails**, creating nothing, on a non-semver version, a
-  missing token, or a bump whose `CHANGELOG.md` has no non-empty `## [X.Y.Z]`
-  section — never create a release `check` will refuse. The script header lists
-  every rule; `DRY_RUN=1` runs the checks and prints the command. The job's
-  `if:` pins `github.repository`, so a fork's push runs never try to release.
-- `release.yml` triggers on `release: published` and nothing else. A release
-  created with an App installation token starts workflow runs; one created with
-  `GITHUB_TOKEN` starts none.
-- **The tradeoff, accepted deliberately:** release authority is "can get a
-  version bump merged to `master`" — the owner, plus anything that can act as
-  the App — not "is the owner". What the App can release is constrained by
-  `check`, not by who it is. `check` (GitHub-hosted, read-only) fails closed
-  unless the sender is in `RELEASE_SENDERS`, the release is not a draft, a
-  pre-release comes from the owner only, the tag is `v<Cargo.toml version>` at
-  that commit, the commit is on `master` (a mistake check, not a security
-  boundary: the run uses the workflow file at the tagged commit), a stable tag
-  is the highest stable `v*` tag (`.github/scripts/require-highest-tag.sh`, so a
-  backport release of an older minor line is refused), crates.io does not have
-  the version, and `CHANGELOG.md` has the section. The workflow file is the
-  source of truth for each check.
-- **Job placement is a security property**:
-  - `verify`, `msrv`, `semver` run on the self-hosted runner with read-only
-    permissions and no OIDC.
-  - `publish` is GitHub-hosted, in the `release` environment, the only job with
-    `id-token: write`; it runs nothing but checkout, toolchain, the
-    highest-tag re-check (plain git/coreutils, placed before authentication so
-    a refusal never mints a token), `rust-lang/crates-io-auth-action` (a
-    short-lived OIDC-exchanged token; no long-lived crates.io token is ever
-    stored) and `cargo publish`, with no restored cache.
-  - Keep build scripts, proc macros, dev-dependencies and build tooling out of
-    the job that can mint the token, and keep that job — and `release-on-bump`
-    — off the self-hosted runner, which mounts its host's Docker socket and runs
-    unreviewed Dependabot code.
-  - `release-notes` (`contents: write` with `GITHUB_TOKEN`) replaces the notes
-    with the CHANGELOG section. No job in `release.yml` creates or moves a tag.
+- **The version lives in `Cargo.toml` only, and on `master` it always names the
+  NEXT release.** Releases are cut by the owner by hand:
+
+  ```bash
+  gh release create vX.Y.Z --target <full master sha> --title vX.Y.Z --generate-notes
+  ```
+
+  `X.Y.Z` is `Cargo.toml`'s version at that commit. Target the full SHA, never
+  `master` (anything merged meanwhile would ride along). A commit is releasable
+  when it carries `master.yml`'s `verified` status: every code merge, and a
+  docs-only commit on top of one (it inherits). A version-only commit (the roll
+  PR, a hand bump) is not — release a commit with tested code under that
+  version.
+- `release.yml` triggers on `release: published` only, runs the tagged commit's
+  copy, and never builds or re-tests. `check` (GitHub-hosted, read-only) fails
+  closed unless the sender is in `RELEASE_SENDERS` (`St0nefish` only), the
+  release is neither draft nor prerelease, the tag is `v<Cargo.toml version>` at
+  the tagged commit, the commit is on `master` (a mistake check, not a security
+  boundary), the tag is the highest stable `v*` tag
+  (`.github/scripts/require-highest-tag.sh`), crates.io does not have the
+  version, and the commit has `verified`. Then `publish` and `notes`, then
+  `roll`.
+- **`publish`** is GitHub-hosted, in the `release` environment, the only job
+  with `id-token: write`; it runs nothing but checkout, toolchain, the
+  highest-tag re-check (plain git/coreutils, before authentication so a refusal
+  never mints a token), `rust-lang/crates-io-auth-action` (a short-lived
+  OIDC-exchanged token; no long-lived crates.io token is ever stored) and
+  `cargo publish --no-verify` (`ci-fast`'s `cargo publish --dry-run` already
+  built the package from this tree), with no restored cache. Keep build
+  scripts, proc macros, dev-dependencies and build tooling out of it, and keep
+  it off the self-hosted runner.
 - `release.yml` must keep its filename, and `publish` must keep
   `environment: release`: crates.io trusted publishing is registered for this
   repository + `release.yml` + environment `release`. That environment's policy
-  (only `v*` tags), the tag ruleset (only admins and the App create `v*` tags)
-  and the sender check together limit minting a publish token to a release
-  created by the owner or the App.
-- **To cut a release**: open a PR that bumps `version` in `Cargo.toml` and
-  `Cargo.lock` (`cargo release version minor --execute --no-confirm`, or
-  `patch`/`major`/`X.Y.Z`, or a hand edit of both) — unless a breaking PR
-  already bumped it — and moves `CHANGELOG.md`'s `[Unreleased]` entries under
-  `## [X.Y.Z] - <date>` (plus the link references at the bottom). Merge it.
-  That is the whole release.
-- **Manual fallback** (a pre-release, or a bump whose `release-on-bump` could
-  not create the release — re-run that job first if the failure was transient),
-  as the owner, under exactly the same `check`:
-  `gh release create vX.Y.Z --target <full sha of the bump commit> --title vX.Y.Z --generate-notes`
-  (add `--prerelease` for `X.Y.Z-pre`). Target the bump commit's full SHA, not
-  `master`: anything merged after the bump would ride along without a
-  CHANGELOG entry.
-- A bump with no CHANGELOG section fails `release-on-bump` and creates nothing.
-  Merge a fix adding the section (its version is unchanged, so nothing is
-  released for it), then release that fix commit with the manual fallback.
-- A transient failure (crates.io outage, runner hiccup) is re-run with "re-run
-  failed jobs": `publish` skips the upload and succeeds if an earlier attempt
-  already made it, and `release-notes` writes the same notes again. Runs are
-  grouped per release tag and never cancelled.
-- A genuine `verify`/`msrv`/`semver` failure cannot be fixed by a re-run. Merge
-  the fix, then as the owner delete the release and its tag
-  (`gh release delete vX.Y.Z --cleanup-tag`) and create the release by hand at
-  the fix commit, or merge a fresh bump. Nothing was uploaded: `publish` needs
-  all of them.
-- There is no deploy-hold switch: nothing publishes until a version bump
-  merges, so batching changes is only a matter of when to merge the bump.
+  (only `v*` tags), the tag ruleset (only the owner creates `v*` tags) and the
+  sender check together limit minting a publish token to a release the owner
+  created.
+- **Notes**: platform-generated by default (`--generate-notes`). `notes` fills
+  only an empty body, from `CHANGELOG.md`'s `[Unreleased]` section (or GitHub's
+  generated notes if that is empty); a body the owner wrote is left alone.
+- **The roll PR**: after `publish` and `notes` succeed, `roll` (as the App) runs
+  `.github/scripts/roll.sh`: on branch `release/roll-vX.Y.(Z+1)`, `cargo release
+  version patch` (Cargo.toml + Cargo.lock), `CHANGELOG.md`'s `[Unreleased]`
+  entries dated `## [X.Y.Z] - <date>` under a fresh `[Unreleased]` with the
+  compare links at the bottom moved along; PR `release: roll version to
+  X.Y.(Z+1)` opened and armed. It is version-only, so it runs no slow tier and
+  lands in minutes. Skipped when master's version already moved; reused when it
+  already exists. A roll PR made obsolete by a hand minor bump is closed with a
+  comment by `master.yml`'s `rolls` job.
+- **Bumps**: patch is automatic (the roll PR). Minor (breaking under the semver
+  policy) is done by hand in the PR that makes the change.
+- **CHANGELOG**: contributors add entries under `[Unreleased]`; nobody dates a
+  section by hand any more — the roll PR does it after the release.
+- **Recovery**: a transient failure (crates.io outage, runner hiccup) is re-run
+  with "re-run failed jobs" on the release's run: `publish` skips the upload and
+  succeeds if an earlier attempt already made it. A genuinely broken commit
+  cannot be fixed by a re-run: as the owner delete the release and its tag
+  (`gh release delete vX.Y.Z --cleanup-tag`), merge the fix (master still holds
+  `X.Y.Z`, since `roll` runs only after `publish`), and release again. A
+  published crates.io version is permanent.
+- There is no deploy-hold switch: nothing publishes until the owner creates a
+  release, so batching changes is only a matter of when to release.
 - **Repo setup**: private vulnerability reporting must be enabled —
   `gh api -X PUT repos/St0nefish/oauth-resource-server/private-vulnerability-reporting`
   (Settings → Code security → Private vulnerability reporting). It is off by
@@ -1425,8 +1431,9 @@ The flow and the constraints the workflow files cannot express on their own
 
 ## Build & test
 
-The `checks` job, which you should run in full before opening a PR (same list
-as `CONTRIBUTING.md`; the authoritative copy is `ci.yml`):
+The fast tier plus the integration tests, which you should run in full before
+opening a PR (same list as `CONTRIBUTING.md`; the authoritative copy is
+`.github/workflows/checks.yml`):
 
 ```bash
 cargo fmt --all -- --check
@@ -1454,8 +1461,8 @@ The other CI jobs — slower or needing extra tools; CI runs them regardless:
 # channel while the two are in lockstep, so a plain build already covers it)
 cargo +<rust-version> build --all-features --locked
 
-# semver: needs cargo-semver-checks and the toolchain ci.yml's `semver` job pins
-# (both versions are in ci.yml); compares against the latest crates.io release
+# semver: needs cargo-semver-checks and the toolchain checks.yml's `semver` job
+# pins (both versions are in checks.yml); compares against the latest crates.io release
 cargo +<semver toolchain> semver-checks check-release --all-features
 
 # feature-powerset: needs cargo-hack; ~160 `cargo check` builds, several minutes
@@ -1466,7 +1473,7 @@ cargo hack check --feature-powerset --no-dev-deps \
 
 # minimal-versions: needs cargo-hack and nightly. Rewrites Cargo.toml and
 # Cargo.lock, so run it in a throwaway copy of the tree. `time` is lifted
-# because a transitive floor no longer compiles (see the step in ci.yml).
+# because a transitive floor no longer compiles (see the step in checks.yml).
 cargo hack --remove-dev-deps
 cargo +nightly update -Z direct-minimal-versions
 cargo update -p time
