@@ -1256,6 +1256,20 @@ Apply to any change touching `src/validator.rs`, `src/jwks.rs`,
 
 ## Workflow
 
+**At a glance.** Pattern `pr-manual-release` (KB `dev/tools/repo-workflow-patterns.md`;
+detailed spec `dev/tools/merge-train-pattern.md`). Crate-only: no image, no deploy.
+
+- PR open -> `ci-fast`; armed (auto-merge enabled) -> `ci-slow` once `ci-fast` passes
+  -> merge commit. Never push to master; no squash/rebase.
+- A master merge produces a `verified` commit status (no image tags).
+- Release is MANUAL and owner-only: `gh release create vX.Y.Z --target <verified
+  master sha> --title vX.Y.Z --generate-notes`. The tag must equal `Cargo.toml`'s version.
+- `release.yml` never builds: it publishes to crates.io (trusted publishing, environment
+  `release`), then opens and arms a roll PR bumping to the next patch. Master's
+  `Cargo.toml` always holds the NEXT version; a minor/major bump is made by hand in
+  the PR that warrants it.
+- Only a commit with a `verified` success status can be released.
+
 **pr-manual-release** (KB `dev/tools/repo-workflow-patterns.md`, spec
 `dev/tools/merge-train-pattern.md`, copied from `St0nefish/template-pr-manual-release`)
 on GitHub, `master` as the default branch: CI-gated merge-commit PRs, a merge
