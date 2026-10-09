@@ -115,7 +115,7 @@ jobs:
           echo "version=$version" >> "$GITHUB_OUTPUT"
 
       - name: Install Rust toolchain
-        uses: dtolnay/rust-toolchain@02cb101ec7c40f2c49e1d9714d64511d8e1b74de # master, 2026-09-12
+        uses: dtolnay/rust-toolchain@e2a55d2ffb04f378e9626c28d38b36d230d1e12f # master, 2026-09-12
         with:
           toolchain: ${{ steps.rust_version.outputs.version }}
           components: clippy, rustfmt
@@ -194,7 +194,7 @@ jobs:
 
       - name: Install Rust toolchain
         # cargo is the entry point for both tools; rust-toolchain.toml selects this one.
-        uses: dtolnay/rust-toolchain@02cb101ec7c40f2c49e1d9714d64511d8e1b74de # master, 2026-09-12
+        uses: dtolnay/rust-toolchain@e2a55d2ffb04f378e9626c28d38b36d230d1e12f # master, 2026-09-12
         with:
           toolchain: ${{ steps.rust_version.outputs.version }}
           components: clippy, rustfmt
@@ -243,7 +243,7 @@ jobs:
           echo "version=$version" >> "$GITHUB_OUTPUT"
 
       - name: Install Rust toolchain
-        uses: dtolnay/rust-toolchain@02cb101ec7c40f2c49e1d9714d64511d8e1b74de # master, 2026-09-12
+        uses: dtolnay/rust-toolchain@e2a55d2ffb04f378e9626c28d38b36d230d1e12f # master, 2026-09-12
         with:
           toolchain: ${{ steps.rust_version.outputs.version }}
           components: clippy, rustfmt
@@ -300,7 +300,7 @@ jobs:
           echo "version=$version" >> "$GITHUB_OUTPUT"
 
       - name: Install Rust toolchain
-        uses: dtolnay/rust-toolchain@02cb101ec7c40f2c49e1d9714d64511d8e1b74de # master, 2026-09-12
+        uses: dtolnay/rust-toolchain@e2a55d2ffb04f378e9626c28d38b36d230d1e12f # master, 2026-09-12
         with:
           toolchain: ${{ steps.rust_version.outputs.version }}
           components: clippy, rustfmt
@@ -364,7 +364,7 @@ jobs:
           echo "version=$version" >> "$GITHUB_OUTPUT"
 
       - name: Install MSRV toolchain
-        uses: dtolnay/rust-toolchain@02cb101ec7c40f2c49e1d9714d64511d8e1b74de # master, 2026-09-12
+        uses: dtolnay/rust-toolchain@e2a55d2ffb04f378e9626c28d38b36d230d1e12f # master, 2026-09-12
         with:
           toolchain: ${{ steps.msrv.outputs.version }}
 
@@ -409,7 +409,7 @@ jobs:
             pkg-config libssl-dev
 
       - name: Install the cargo-semver-checks toolchain
-        uses: dtolnay/rust-toolchain@02cb101ec7c40f2c49e1d9714d64511d8e1b74de # master, 2026-09-12
+        uses: dtolnay/rust-toolchain@e2a55d2ffb04f378e9626c28d38b36d230d1e12f # master, 2026-09-12
         with:
           toolchain: ${{ env.SEMVER_TOOLCHAIN }}
 
@@ -466,7 +466,7 @@ jobs:
           echo "version=$version" >> "$GITHUB_OUTPUT"
 
       - name: Install Rust toolchain
-        uses: dtolnay/rust-toolchain@02cb101ec7c40f2c49e1d9714d64511d8e1b74de # master, 2026-09-12
+        uses: dtolnay/rust-toolchain@e2a55d2ffb04f378e9626c28d38b36d230d1e12f # master, 2026-09-12
         with:
           toolchain: ${{ steps.rust_version.outputs.version }}
 
@@ -532,14 +532,14 @@ jobs:
           echo "version=$version" >> "$GITHUB_OUTPUT"
 
       - name: Install Rust toolchain
-        uses: dtolnay/rust-toolchain@02cb101ec7c40f2c49e1d9714d64511d8e1b74de # master, 2026-09-12
+        uses: dtolnay/rust-toolchain@e2a55d2ffb04f378e9626c28d38b36d230d1e12f # master, 2026-09-12
         with:
           toolchain: ${{ steps.rust_version.outputs.version }}
 
       - name: Install nightly toolchain
         # Only for `cargo update -Z direct-minimal-versions`, which is nightly-only. The
         # build below uses the pinned toolchain.
-        uses: dtolnay/rust-toolchain@02cb101ec7c40f2c49e1d9714d64511d8e1b74de # master, 2026-09-12
+        uses: dtolnay/rust-toolchain@e2a55d2ffb04f378e9626c28d38b36d230d1e12f # master, 2026-09-12
         with:
           toolchain: nightly
 
