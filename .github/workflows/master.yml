@@ -1,0 +1,223 @@
+name: Master
+
+# Runs on every master commit and proves its tree was tested; a merge ships nothing (no
+# tag, no crates.io publish — the owner releases by hand, release.yml). This crate ships
+# no image, so the `verified` status is the only record of a tested tree.
+#
+#   prepare   classify the commit:
+#     tested    a code change whose exact tree passed `ci-slow` (the PR head's ci-slow
+#               status names this commit's tree) — nothing re-runs
+#     fallback  a code change whose tree nobody tested (another PR landed between this
+#               PR's ci-slow and its merge, or a merge bypassed the gate): run both tiers
+#               on the commit first
+#     inherit   no code path changed and the version is the parent's (docs): the commit
+#               inherits its first parent's `verified`, so master's tip stays releasable
+#     none      no code path changed but the version moved (the roll PR, a hand bump):
+#               nothing — that version names code nobody tested under it yet
+#   fallback  checks.yml, both tiers, on the commit                     (fallback only)
+#   verified  commit status `verified` = this tree was tested (tested, fallback passed,
+#             or inherited from a verified parent). release.yml requires it.
+#   rolls     closes roll PRs this commit made obsolete (a hand minor/major bump landed)
+#
+# Re-process one commit (a failed or cancelled run): gh workflow run master.yml --ref master -f sha=<commit>
+
+on:
+  push:
+    branches: [master]
+  workflow_dispatch:
+    inputs:
+      sha:
+        description: "Master commit to (re)process (default: master's tip)"
+        type: string
+        required: false
+        default: ""
+
+# Per commit, never cancelled: a cancelled run leaves a commit with nothing to release.
+concurrency:
+  group: master-${{ inputs.sha || github.sha }}
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+
+jobs:
+  prepare:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      contents: read
+      statuses: read
+    outputs:
+      commit: ${{ steps.plan.outputs.commit }}
+      parent: ${{ steps.plan.outputs.parent }}
+      tree: ${{ steps.plan.outputs.tree }}
+      mode: ${{ steps.plan.outputs.mode }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ inputs.sha || github.sha }}
+          fetch-depth: 0
+          persist-credentials: false
+
+      # fetch-depth: 0 fetched every branch, master included.
+      - name: Refuse a commit that is not on master
+        run: |
+          status=0
+          git merge-base --is-ancestor HEAD origin/master || status=$?
+          case "$status" in
+            0) ;;
+            1) echo "::error::$(git rev-parse HEAD) is not on master."; exit 1 ;;
+            *) echo "::error::git merge-base failed (exit ${status})."; exit 1 ;;
+          esac
+
+      - name: Read crate metadata
+        id: meta
+        run: .github/scripts/crate-meta.sh
+
+      - name: Classify the commit
+        id: plan
+        env:
+          GH_TOKEN: ${{ github.token }}
+          CANONICAL: ${{ steps.meta.outputs.canonical }}
+        run: |
+          # shellcheck source=/dev/null
+          . .github/scripts/status-lib.sh
+          out() { echo "$1=$2" | tee -a "$GITHUB_OUTPUT"; }
+          out commit "$(git rev-parse HEAD)"
+          tree=$(git rev-parse 'HEAD^{tree}')
+          out tree "$tree"
+          parent=$(git rev-parse --verify --quiet 'HEAD^1' || true)
+          out parent "$parent"
+          if [[ "$CANONICAL" != true ]]; then
+            echo "::warning::not the canonical repository; nothing is proven here."
+            out mode none
+            exit 0
+          fi
+          if [[ -z "$parent" ]]; then
+            code=true
+          elif ! code=$(.github/scripts/code-paths.sh HEAD^1 HEAD); then
+            code=true
+          fi
+
+          if [[ "$code" == true ]]; then
+            # The PR head is the merge commit's second parent; its ci-slow names the tree.
+            head=$(git rev-parse --verify --quiet 'HEAD^2' || true)
+            if [[ -n "$head" ]] && tested_tree "$head" "$tree"; then
+              echo "tree ${tree} passed ci-slow on PR head ${head}."
+              out mode tested
+            else
+              echo "::warning::tree ${tree} was not tested before the merge (master moved after ci-slow, or the gate was bypassed); running both tiers on the commit."
+              out mode fallback
+            fi
+          else
+            ver() { git show "${1}:Cargo.toml" | awk '
+              /^\[/ { in_package = ($0 == "[package]") }
+              in_package && /^version *=/ { sub(/^version *= *"/, ""); sub(/".*$/, ""); print; exit }'; }
+            if [[ "$(ver HEAD)" == "$(ver HEAD^1)" ]]; then
+              echo "no code path changed and the version is unchanged: inheriting ${parent}'s verified status."
+              out mode inherit
+            else
+              echo "the version moved without a code change: nothing to prove for this commit."
+              out mode none
+            fi
+          fi
+
+  fallback:
+    needs: [prepare]
+    if: needs.prepare.outputs.mode == 'fallback'
+    uses: ./.github/workflows/checks.yml
+    with:
+      ref: ${{ needs.prepare.outputs.commit }}
+      fast: true
+      slow: true
+
+  verified:
+    needs: [prepare, fallback]
+    if: >-
+      !cancelled() && needs.prepare.result == 'success' && needs.prepare.outputs.mode != 'none'
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    permissions:
+      contents: read
+      statuses: write
+      actions: read
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          sparse-checkout: .github/scripts
+          persist-credentials: false
+
+      - name: Post the verified status
+        env:
+          GH_TOKEN: ${{ github.token }}
+          MODE: ${{ needs.prepare.outputs.mode }}
+          FALLBACK: ${{ needs.fallback.result }}
+          COMMIT: ${{ needs.prepare.outputs.commit }}
+          PARENT: ${{ needs.prepare.outputs.parent }}
+          TREE: ${{ needs.prepare.outputs.tree }}
+        run: |
+          # shellcheck source=/dev/null
+          . .github/scripts/status-lib.sh
+          case "$MODE" in
+            tested) post_status "$COMMIT" verified success "tree ${TREE} passed ci-slow before the merge" ;;
+            fallback)
+              if [[ "$FALLBACK" == success ]]; then
+                post_status "$COMMIT" verified success "tree ${TREE} passed both tiers after the merge"
+              else
+                post_status "$COMMIT" verified failure "post-merge tests: ${FALLBACK}"
+                exit 1
+              fi
+              ;;
+            inherit)
+              # Wait (bounded) for the parent's own run to post its status.
+              deadline=$((SECONDS + 1200))
+              while :; do
+                st=$(latest_status "$PARENT" verified)
+                if [[ "$st" == success* ]]; then
+                  post_status "$COMMIT" verified success "no code change; inherits ${PARENT:0:7}"
+                  break
+                fi
+                running=$(gh run list --repo "$GITHUB_REPOSITORY" --workflow master.yml --commit "$PARENT" \
+                  --json status --jq '[.[] | select(.status != "completed")] | length')
+                if [[ "$running" == 0 || $SECONDS -ge $deadline ]]; then
+                  echo "::notice::parent ${PARENT} is not verified (${st:-no status}); ${COMMIT} has nothing to inherit."
+                  break
+                fi
+                sleep 20
+              done
+              ;;
+          esac
+
+  rolls:
+    needs: [prepare]
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    permissions:
+      contents: write # --delete-branch
+      pull-requests: write
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ needs.prepare.outputs.commit }}
+          persist-credentials: false
+
+      # A roll PR (release/roll-v<next>) is obsolete once master's version reaches
+      # <next> some other way — typically a hand minor/major bump, which also makes the
+      # roll conflict. Close it rather than leave it red.
+      - name: Close obsolete roll PRs
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          current=$(awk '
+            /^\[/ { in_package = ($0 == "[package]") }
+            in_package && /^version *=/ { sub(/^version *= *"/, ""); sub(/".*$/, ""); print; exit }' Cargo.toml)
+          gh pr list --repo "$GITHUB_REPOSITORY" --base master --state open --json number,headRefName \
+            --jq '.[] | select(.headRefName | startswith("release/roll-v")) | "\(.number) \(.headRefName)"' |
+            while read -r num ref; do
+              target=${ref#release/roll-v}
+              if [[ "$(printf '%s\n' "$target" "$current" | sort -V | tail -n1)" == "$current" ]]; then
+                echo "closing #${num}: master is at ${current}, the roll targets ${target}"
+                gh pr close "$num" --repo "$GITHUB_REPOSITORY" --delete-branch \
+                  --comment "Closed automatically: master's version is already ${current}, so rolling to ${target} is obsolete (a version bump landed by hand)."
+              fi
+            done

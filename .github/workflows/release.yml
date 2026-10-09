@@ -1,135 +1,74 @@
 name: Release
 
-# Publishes to crates.io when a GitHub release is published — and only then.
-# pr-manual-release with bump-is-release: a merged PR that changes Cargo.toml's
-# `[package] version` IS the release. ci.yml's `release-on-bump` job, on that
-# commit's post-merge run and only once all five heavy jobs passed there,
-# creates release `vX.Y.Z` at the bump commit with the auto-merge App's token
-# (`.github/scripts/release-on-bump.sh`); that published release starts this
-# workflow. An ordinary merge runs CI and nothing else.
+# Publishes to crates.io when the owner publishes a GitHub release — and only then. A
+# release is the owner's act, never a side effect of a merge or a version change
+# (pr-manual-release):
+#   gh release create vX.Y.Z --target <full master sha> --title vX.Y.Z --generate-notes
+# X.Y.Z is Cargo.toml's version at that commit (on master, always the NEXT release: the
+# roll PR moves it one patch past every release). Pass the full sha: `master` as a target
+# would carry along any PR merged in the meantime.
 #
-# Cutting a release:
-#   1. On a branch, bump `version` in Cargo.toml and Cargo.lock
-#      (`cargo release version minor --execute --no-confirm`, or patch/major/
-#      X.Y.Z, or by hand) and move CHANGELOG.md's `[Unreleased]` entries under
-#      a matching `## [X.Y.Z] - <date>` heading, with its link reference at
-#      the bottom. Open a PR and let it merge. That is all: `release-on-bump`
-#      creates the release. It refuses (fails, creating nothing) a bump with
-#      no non-empty CHANGELOG section, since `check` below would refuse it.
-#   2. Manual fallback — a pre-release (`release-on-bump` creates stable
-#      releases only), or a bump whose `release-on-bump` could not create the
-#      release — the owner, under exactly the same `check`:
-#        gh release create vX.Y.Z --target <full sha of the bump commit> \
-#          --title vX.Y.Z --generate-notes     # add --prerelease for X.Y.Z-pre
-#      Target the bump commit's SHA, not `master`: with `--target master`,
-#      anything merged after the bump would ride along into the release
-#      without a CHANGELOG entry. The notes given there are replaced by the
-#      CHANGELOG section once the crate is published.
+# Runs from the TAGGED commit's copy of this file and its scripts. It never builds or
+# re-tests: the tree was tested before the merge (`ci-slow`) or right after it
+# (master.yml's fallback), which master.yml records as the commit's `verified` status.
 #
-# Only the owner or the App can cause a publish:
-#   - a tag ruleset on `refs/tags/v*` lets only repository admins and the
-#     auto-merge App (a bypass actor) create, move or delete a `v*` tag, so
-#     GITHUB_TOKEN cannot make one;
-#   - the `release` environment admits only `v*` tags, so `publish` cannot run
-#     from a branch;
-#   - `check` fails unless the release's sender is in RELEASE_SENDERS (the
-#     owner and the App's bot login). A release created with GITHUB_TOKEN
-#     starts no workflow run at all; one created with an App installation
-#     token does, which is what `release-on-bump` relies on.
-# The tradeoff: release authority is now "can get a version bump merged to
-# master" — the owner, plus anything that can act as the App — not "is the
-# owner". What the App can release is constrained by `check` (a stable,
-# non-draft release whose tag matches Cargo.toml at a master commit, above
-# every existing stable tag, with a CHANGELOG section, unpublished on
-# crates.io), not by who it is. A pre-release is accepted from the owner only.
-# Nothing in this workflow ever creates or edits a tag.
+#   check    GitHub-hosted, read-only; fails closed unless: the sender is in
+#            RELEASE_SENDERS (the owner only); not a draft or prerelease; the tag is
+#            vX.Y.Z == Cargo.toml's version at the tagged commit, which is this run's
+#            commit and on master; the tag is the highest stable v* tag; crates.io does
+#            not have the version yet (a re-run may find its own upload); the commit
+#            carries master.yml's `verified` status (waiting, bounded, for a master.yml
+#            run still in progress). A docs-only commit inherits its parent's
+#            `verified`; a version-only commit (the roll PR, a hand bump) has none, so
+#            releasing it fails — release a commit with tested code under that version.
+#   publish  the only job with `id-token: write`, GitHub-hosted, in the `release`
+#            environment: re-checks crates.io and the highest-tag rule, then
+#            crates-io-auth-action and `cargo publish --no-verify` (ci-fast's
+#            `cargo publish --dry-run` already built the package from this tree).
+#   notes    an empty release body gets CHANGELOG.md's `[Unreleased]` section, or else
+#            GitHub's generated notes; a body the owner wrote (or --generate-notes
+#            filled) is left alone
+#   roll     only after everything shipped, as the App: opens and arms the PR moving
+#            master's version to the next patch (cargo release version patch, plus
+#            CHANGELOG.md's `[Unreleased]` dated as the release), unless master's version
+#            already moved. It lands like any PR, without running the slow tier.
 #
-# If `verify`, `msrv` or `semver` fails because the tagged commit is genuinely broken,
-# "re-run failed jobs" cannot help — it re-runs the same commit. Merge the
-# fix, then, as the owner, delete the release and its tag
-# (`gh release delete vX.Y.Z --cleanup-tag`) and create the release by hand
-# at the fix commit (its version is unchanged, so `release-on-bump` will not),
-# or merge a fresh bump. Nothing was uploaded, since `publish` needs all
-# three jobs.
+# Only the owner can cause a publish:
+#   - the `release tags` ruleset on `refs/tags/v*` lets only repository admins (the
+#     owner) create, move or delete a `v*` tag; GITHUB_TOKEN and the App cannot;
+#   - the `release` environment admits only `v*` tags, so `publish` cannot run from a
+#     branch;
+#   - `check` refuses a release whose sender is not in RELEASE_SENDERS;
+#   - crates.io trusted publishing is registered for this repository + `release.yml` +
+#     environment `release`. So this file must keep its name and `publish` must keep
+#     `environment: release`. No crates.io token is stored anywhere:
+#     rust-lang/crates-io-auth-action exchanges the job's OIDC token for a publish token
+#     valid for that one run.
+# The ancestry-to-master check is a mistake catcher, not a boundary: the run uses the
+# workflow file at the tagged commit.
 #
-# A prerelease (owner-published only) is otherwise handled like any other
-# release: a version such as `0.2.0-rc.1` is published to crates.io, where
-# Cargo never picks a pre-release version unless a consumer asks for it
-# explicitly. The highest-tag rule below applies to stable tags only.
+# `publish` runs on a GitHub-hosted runner, never the self-hosted one (which mounts its
+# host's docker socket and runs the slow tier), and runs as little code as possible: no
+# dev-dependency, test or tooling install, no restored cache.
 #
-#   check    GitHub-hosted, read-only. Checks out the tagged commit and
-#            fails closed unless: the release's sender is in RELEASE_SENDERS;
-#            it is not a draft; it is a pre-release (or its tag carries a
-#            pre-release suffix) only if the sender is the owner; the
-#            release's tag is `v<version>` for the Cargo.toml version at
-#            that commit and GITHUB_REF is that tag; that commit is an
-#            ancestor of `master`; a stable tag is the highest stable `v*`
-#            tag on origin (`.github/scripts/require-highest-tag.sh`), so a
-#            release can never land below an existing one; crates.io answers
-#            404 for that version (200 fails the
-#            first attempt, since the release is for a version that is
-#            already published; any other answer always fails, so it never
-#            publishes on an uncertain answer); and CHANGELOG.md has a
-#            non-empty section for it (the release notes,
-#            `.github/scripts/changelog-section.sh`, the same extraction
-#            `release-on-bump` checks before creating the release).
-#   verify   Self-hosted, read-only, no OIDC permission: the same steps as
-#   msrv     ci.yml's `checks` and `msrv` jobs, on the tagged commit.
-#   semver   ci.yml's `semver` job on the tagged commit. (ci.yml's
-#            `feature-powerset` and `minimal-versions` are not repeated: they
-#            ran on master's post-merge CI and are not re-verified at
-#            release. `semver` depends on what is on crates.io and on this
-#            release's version bump, so it is.)
-#   publish  The only job with `id-token: write`, in the `release`
-#            environment. Re-checks crates.io, then does nothing but
-#            checkout, toolchain, the highest-tag re-check (a plain
-#            git/coreutils script from the tagged commit, no build tooling,
-#            run just before the token is minted so a release published
-#            meanwhile is seen), crates.io authentication and
-#            `cargo publish`.
-#   release-notes
-#            `contents: write` with GITHUB_TOKEN. Replaces the release's
-#            notes with the version's CHANGELOG section (`gh release edit`).
-#            It never creates or moves a tag.
+# Recovery: a transient failure (crates.io outage, runner hiccup) -> "re-run failed jobs"
+# on the release's run; every job is idempotent (`publish` skips the upload when an
+# earlier attempt of this run made it). A genuinely broken commit: as the owner
+# `gh release delete vX.Y.Z --cleanup-tag`, merge the fix (master still holds X.Y.Z,
+# since `roll` runs only after `publish`), release again. 0.1.0 was published manually
+# with a personal token, because crates.io only lets a trusted publisher be attached to a
+# crate that already exists.
 #
-# `publish` runs on a GitHub-hosted runner, not the self-hosted one. The
-# self-hosted runner has its host's Docker daemon socket mounted and runs
-# code nobody has reviewed yet (Dependabot's PRs run there without approval,
-# executing new upstream build scripts), so a job that can mint a crates.io
-# token must not share that host. `verify` and `msrv` hold no such
-# permission, so they stay self-hosted.
-#
-# 0.1.0 was published manually with a personal API token, because crates.io
-# only lets a trusted publisher be attached to a crate that already exists.
-# Trusted publishing is configured on crates.io for this repository, this
-# workflow file (`release.yml`) and the GitHub environment `release`, whose
-# deployment policy admits only `v*` tags. So this file must keep its name
-# and `publish` must keep `environment: release`: that environment policy,
-# together with the tag ruleset and the sender check, is what stops anything
-# but a release created by the owner or the App from minting a publish
-# token. No crates.io token
-# is stored in this repository: `rust-lang/crates-io-auth-action` exchanges
-# the job's OIDC token for a publish token valid for that one run.
-#
-# Re-running is done with "re-run failed jobs" on the release's run; there is
-# no manual trigger. Every stage is safe to repeat: `publish` re-checks
-# crates.io and, on a re-run, skips the upload and succeeds if an earlier
-# attempt already made it, so `release-notes` still runs; `release-notes`
-# only ever overwrites the notes with the same text.
-#
-# Every action is pinned to a full commit SHA, with the release it
-# corresponds to in a trailing comment (dtolnay/rust-toolchain publishes no
-# releases, so it is pinned to a commit of its `master` branch).
+# Every action is pinned to a full commit SHA, with the release it corresponds to in a
+# trailing comment (dtolnay/rust-toolchain publishes no releases, so it is pinned to a
+# commit of its `master` branch).
 
 on:
   release:
     types: [published]
 
-# Never cancel a release run: an upload to crates.io cannot be taken back, so
-# a run must always reach its release notes. The group is keyed by the
-# release's tag, so re-runs of one release serialize with each other, while a
-# newer release gets a group of its own and can never replace an older
-# release's pending run (which a single shared group would allow).
+# One run per tag, never cancelled: an upload to crates.io cannot be taken back, so a run
+# must always reach its notes and roll. A newer release gets a group of its own.
 concurrency:
   group: release-${{ github.event.release.tag_name }}
   cancel-in-progress: false
@@ -138,29 +77,24 @@ permissions:
   contents: read
 
 env:
-  # The only identities whose published release may run this workflow
-  # (space-separated logins): the owner, by hand, and the auto-merge App's
-  # bot, from ci.yml's `release-on-bump`.
-  RELEASE_SENDERS: "St0nefish st0nefish-ci[bot]"
-  # The one sender that may publish a pre-release (the App never creates one).
-  PRERELEASE_SENDER: "St0nefish"
+  # Logins whose published release may ship (space-separated). The owner only: no bot
+  # creates releases.
+  RELEASE_SENDERS: "St0nefish"
 
 jobs:
   check:
     runs-on: ubuntu-latest
-    timeout-minutes: 15
+    timeout-minutes: 30
+    permissions:
+      contents: read
+      statuses: read
+      actions: read
     outputs:
-      version: ${{ steps.version.outputs.version }}
-      tag: ${{ steps.version.outputs.tag }}
-      stable: ${{ steps.sender.outputs.stable }}
+      crate: ${{ steps.meta.outputs.crate }}
+      version: ${{ steps.meta.outputs.version }}
+      tag: ${{ steps.meta.outputs.tag }}
     steps:
-      - name: Require a non-draft release from an allowed sender
-        # A GitHub App installation token with `contents: write` can publish
-        # a release and, unlike GITHUB_TOKEN, that starts workflow runs, so
-        # the sender is checked against an explicit list. The App creates
-        # stable releases only; a pre-release (flagged as one, or a tag with a
-        # suffix) is accepted from the owner alone.
-        id: sender
+      - name: Require a stable, non-draft release from an allowed sender
         env:
           SENDER: ${{ github.event.sender.login }}
           DRAFT: ${{ github.event.release.draft }}
@@ -171,411 +105,162 @@ jobs:
           for s in ${RELEASE_SENDERS}; do
             if [[ -n "$SENDER" && "$SENDER" == "$s" ]]; then allowed=true; fi
           done
-          if [[ "$allowed" != "true" ]]; then
+          if [[ "$allowed" != true ]]; then
             echo "::error::this release was published by '${SENDER}', not one of: ${RELEASE_SENDERS}."
             exit 1
           fi
-          if [[ "$DRAFT" != "false" ]]; then
-            echo "::error::a draft release is never shipped (draft=${DRAFT})."
+          if [[ "$DRAFT" != false || "$PRERELEASE" != false ]]; then
+            echo "::error::draft/prerelease releases are not shipped (draft=${DRAFT}, prerelease=${PRERELEASE})."
             exit 1
           fi
-          if [[ ! "$TAG" =~ ^v[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z.-]+)?$ ]]; then
-            echo "::error::release tag '${TAG}' is not of the form vX.Y.Z[-pre]"
+          if [[ ! "$TAG" =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+            echo "::error::release tag '${TAG}' is not vX.Y.Z."
             exit 1
           fi
           if [[ "$GITHUB_REF" != "refs/tags/${TAG}" ]]; then
             echo "::error::GITHUB_REF is ${GITHUB_REF}, expected refs/tags/${TAG}"
             exit 1
           fi
-          if [[ "$PRERELEASE" != "false" || ! "$TAG" =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
-            if [[ "$SENDER" != "$PRERELEASE_SENDER" ]]; then
-              echo "::error::'${SENDER}' published a pre-release (prerelease=${PRERELEASE}, tag ${TAG}); only ${PRERELEASE_SENDER} may."
-              exit 1
-            fi
-            echo "stable=false" >> "$GITHUB_OUTPUT"
-          else
-            echo "stable=true" >> "$GITHUB_OUTPUT"
-          fi
 
+      # Public repository: the guards below fetch and `git ls-remote` without credentials.
       - name: Checkout the tagged commit
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           ref: ${{ github.sha }}
-          # Full history, so the ancestry check below has the commits it needs.
           fetch-depth: 0
           persist-credentials: false
 
-      - name: Match the release tag to the tagged commit's Cargo.toml version
-        id: version
+      - name: Read crate metadata at the tagged commit
+        id: meta
+        run: |
+          .github/scripts/crate-meta.sh
+          grep -qx 'canonical=true' "$GITHUB_OUTPUT" || { echo "::error::not the canonical repository; nothing is published from here."; exit 1; }
+
+      - name: Require tag == Cargo.toml version
+        env:
+          TAG: ${{ github.event.release.tag_name }}
+          CARGO_TAG: ${{ steps.meta.outputs.tag }}
+        run: |
+          if [[ "$TAG" != "$CARGO_TAG" ]]; then
+            echo "::error::release tag ${TAG} does not match Cargo.toml's version (${CARGO_TAG}) at ${GITHUB_SHA}."
+            exit 1
+          fi
+          echo "${TAG} == Cargo.toml's version at ${GITHUB_SHA}"
+
+      - name: Require the tag at this run's commit, on master
         env:
           TAG: ${{ github.event.release.tag_name }}
         run: |
-          semver='[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z.-]+)?'
-          if [[ ! "$TAG" =~ ^v${semver}$ ]]; then
-            echo "::error::release tag '${TAG}' is not of the form vX.Y.Z[-pre]"
-            exit 1
-          fi
-
-          # For a release event GITHUB_SHA is the commit the tag named when
-          # the release was published. Confirm the tag still names it and
-          # that this checkout is that commit, rather than trust either
-          # (GITHUB_REF was matched to the tag in the first step).
-          git fetch --no-tags origin "+refs/tags/${TAG}:refs/tags/${TAG}"
+          git fetch --quiet --no-tags origin "+refs/tags/${TAG}:refs/tags/${TAG}" "+refs/heads/master:refs/remotes/origin/master"
           tag_commit=$(git rev-parse "refs/tags/${TAG}^{commit}")
-          head_commit=$(git rev-parse HEAD)
-          if [[ "$tag_commit" != "$GITHUB_SHA" || "$head_commit" != "$GITHUB_SHA" ]]; then
-            echo "::error::tag ${TAG} is at ${tag_commit} and the checkout at ${head_commit}, but the release event names ${GITHUB_SHA}"
+          if [[ "$tag_commit" != "$GITHUB_SHA" || "$(git rev-parse HEAD)" != "$GITHUB_SHA" ]]; then
+            echo "::error::tag ${TAG} is at ${tag_commit}, the checkout at $(git rev-parse HEAD), the event names ${GITHUB_SHA}."
             exit 1
           fi
-
-          # The `version` key of the `[package]` table, without needing a
-          # Rust toolchain on this runner.
-          version=$(awk '
-            /^\[/ { in_package = ($0 == "[package]") }
-            in_package && /^version *=/ { sub(/^version *= *"/, ""); sub(/".*$/, ""); print; exit }
-          ' Cargo.toml)
-          if [[ ! "$version" =~ ^${semver}$ ]]; then
-            echo "::error::could not read a valid version from Cargo.toml at ${GITHUB_SHA} (got '${version}')"
-            exit 1
-          fi
-          if [[ "$TAG" != "v${version}" ]]; then
-            echo "::error::release tag ${TAG} does not match Cargo.toml's version ${version} at ${GITHUB_SHA}. Bump the version in a merged PR first, then release that commit."
-            exit 1
-          fi
-          echo "version=$version" >> "$GITHUB_OUTPUT"
-          echo "tag=$TAG" >> "$GITHUB_OUTPUT"
-
-      - name: Require the tagged commit to be on master
-        run: |
-          # Fetch master explicitly and fail closed: a failed fetch or a
-          # commit master does not contain both stop the release.
-          #
-          # This catches mistakes; it is not a security boundary. The run
-          # uses the workflow file as it exists at the tagged commit, so a
-          # tag on an unmerged commit could carry a copy of this file
-          # without the check. The boundary is the `v*` tag ruleset (admins
-          # and the App only), the `release` environment's `v*`-only
-          # deployment policy, and the sender check at the top of this job.
-          git fetch --no-tags origin "+refs/heads/master:refs/remotes/origin/master"
           status=0
           git merge-base --is-ancestor "$GITHUB_SHA" origin/master || status=$?
           case "$status" in
-            0)
-              echo "${GITHUB_SHA} is on master"
-              ;;
-            1)
-              echo "::error::${GITHUB_SHA} is not an ancestor of master. Release only a commit that has merged to master."
-              exit 1
-              ;;
-            *)
-              echo "::error::git merge-base failed (exit ${status}); cannot tell whether ${GITHUB_SHA} is on master."
-              exit 1
-              ;;
+            0) echo "${GITHUB_SHA} is on master" ;;
+            1) echo "::error::${GITHUB_SHA} is not on master. Release only a merged commit."; exit 1 ;;
+            *) echo "::error::git merge-base failed (exit ${status})."; exit 1 ;;
           esac
 
-      - name: Require a stable tag to be the highest stable release tag
-        # A release can never land below an existing one: an older bump
-        # commit's CI re-run, or a release created by hand at an old commit.
-        # The tag itself already exists, so it must BE the highest. Stable
-        # tags only; an owner-published pre-release is not compared.
-        if: steps.sender.outputs.stable == 'true'
+      - name: Require the highest stable release tag
         env:
-          TAG: ${{ steps.version.outputs.tag }}
+          TAG: ${{ github.event.release.tag_name }}
         run: .github/scripts/require-highest-tag.sh "$TAG"
 
       - name: Require the version to be unpublished on crates.io
         env:
-          VERSION: ${{ steps.version.outputs.version }}
+          CRATE: ${{ steps.meta.outputs.crate }}
+          VERSION: ${{ steps.meta.outputs.version }}
         run: |
-          url="https://crates.io/api/v1/crates/oauth-resource-server/${VERSION}"
-          # crates.io refuses API requests without a descriptive User-Agent.
-          # `--retry` covers timeouts and 408/429/5xx; a 404 is an answer,
-          # not an error, so it is never retried.
+          url="https://crates.io/api/v1/crates/${CRATE}/${VERSION}"
+          # crates.io refuses API requests without a descriptive User-Agent. `--retry`
+          # covers timeouts and 408/429/5xx; a 404 is an answer, never retried.
           code=$(curl -sS -o /dev/null -w '%{http_code}' \
             --retry 3 --retry-delay 5 --max-time 30 \
-            -A "oauth-resource-server release workflow (https://github.com/${GITHUB_REPOSITORY})" \
+            -A "${CRATE} release workflow (https://github.com/${GITHUB_REPOSITORY})" \
             "$url") || code="curl exit $?"
           case "$code" in
-            404)
-              echo "oauth-resource-server ${VERSION} is not on crates.io yet — publishing it."
-              ;;
+            404) echo "${CRATE} ${VERSION} is not on crates.io yet." ;;
             200)
-              # On a re-run, an earlier attempt of this run may be what
-              # uploaded it; `publish` then skips the upload and succeeds.
-              if [ "${GITHUB_RUN_ATTEMPT}" -gt 1 ]; then
-                echo "::notice::oauth-resource-server ${VERSION} is already on crates.io; this is a re-run, so continuing (publish will skip the upload)."
+              # On a re-run, an earlier attempt of this run may be what uploaded it;
+              # `publish` then skips the upload and succeeds.
+              if [[ "${GITHUB_RUN_ATTEMPT}" -gt 1 ]]; then
+                echo "::notice::${CRATE} ${VERSION} is already on crates.io; this is a re-run, so continuing (publish skips the upload)."
               else
-                echo "::error::oauth-resource-server ${VERSION} is already on crates.io. This release is for a published version; bump the version and release that instead."
+                echo "::error::${CRATE} ${VERSION} is already on crates.io. Versions are permanent; release the next version instead."
                 exit 1
               fi
               ;;
             *)
-              echo "::error::crates.io answered ${code} for ${url}; expected 404 (not yet published). Not publishing on an uncertain answer — re-run once crates.io is healthy."
+              echo "::error::crates.io answered ${code} for ${url}; expected 404. Not publishing on an uncertain answer — re-run once crates.io is healthy."
               exit 1
               ;;
           esac
 
-      - name: Require a non-empty CHANGELOG section for the version
-        # The same extraction `release-notes` uses (and `release-on-bump`
-        # checks before creating a release), so a missing or empty section
-        # fails here, before anything is uploaded.
+      - name: Require the verified status
         env:
-          VERSION: ${{ steps.version.outputs.version }}
-        run: .github/scripts/changelog-section.sh "$VERSION" CHANGELOG.md
-
-  # `verify` and `msrv` repeat ci.yml's `checks` and `msrv` jobs step for step
-  # on the exact commit about to be published. They run every build script,
-  # proc macro and dev-dependency the crate has, so they get no OIDC
-  # permission — see `publish`.
-  verify:
-    needs: check
-    runs-on: [self-hosted, linux, x64]
-    timeout-minutes: 60
-    steps:
-      - name: Checkout the tagged commit
-        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-        with:
-          ref: ${{ github.sha }}
-          persist-credentials: false
-
-      - name: Install system dependencies
-        # The `native-tls` feature builds against OpenSSL.
+          GH_TOKEN: ${{ github.token }}
         run: |
-          sudo apt-get update && sudo apt-get install -y --no-install-recommends \
-            pkg-config libssl-dev
+          # shellcheck source=/dev/null
+          . .github/scripts/status-lib.sh
+          deadline=$((SECONDS + 1200))
+          while :; do
+            st=$(latest_status "$GITHUB_SHA" verified)
+            if [[ "$st" == success* ]]; then
+              echo "verified: ${st#success }"
+              exit 0
+            fi
+            running=$(gh run list --repo "$GITHUB_REPOSITORY" --workflow master.yml --commit "$GITHUB_SHA" \
+              --json status --jq '[.[] | select(.status != "completed")] | length')
+            if [[ "$running" == 0 || $SECONDS -ge $deadline ]]; then
+              echo "::error::${GITHUB_SHA} has no 'verified' success (${st:-no status}): its tree was never proven tested. A version-only commit (the roll PR, a hand bump) has none; release a commit with tested code."
+              exit 1
+            fi
+            sleep 20
+          done
 
-      - name: Read pinned Rust toolchain version
-        # Same as ci.yml: rust-toolchain.toml's `channel` is the one source.
-        id: rust_version
-        run: |
-          version=$(grep -m1 '^channel' rust-toolchain.toml | sed -E 's/channel *= *"([^"]+)"/\1/')
-          if [[ -z "$version" ]]; then
-            echo "::error::could not parse channel from rust-toolchain.toml"
-            exit 1
-          fi
-          echo "version=$version" >> "$GITHUB_OUTPUT"
-
-      - name: Install Rust toolchain
-        uses: dtolnay/rust-toolchain@02cb101ec7c40f2c49e1d9714d64511d8e1b74de # master, 2026-09-12
-        with:
-          toolchain: ${{ steps.rust_version.outputs.version }}
-          components: clippy, rustfmt
-
-      - name: Cache cargo registry and build artifacts
-        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
-        with:
-          path: |
-            ~/.cargo/registry
-            ~/.cargo/git
-            target
-          key: cargo-checks-${{ steps.rust_version.outputs.version }}-${{ hashFiles('Cargo.lock') }}
-          restore-keys: cargo-checks-${{ steps.rust_version.outputs.version }}-
-
-      - name: Format check
-        run: cargo fmt --all -- --check
-
-      - name: Clippy (all features)
-        run: cargo clippy --all-targets --all-features -- -D warnings
-
-      - name: Clippy (default features)
-        run: cargo clippy --all-targets -- -D warnings
-
-      - name: Clippy (native-tls only)
-        run: cargo clippy --all-targets --no-default-features --features native-tls -- -D warnings
-
-      - name: Clippy (rustls-tls-native-roots only)
-        run: cargo clippy --all-targets --no-default-features --features rustls-tls-native-roots -- -D warnings
-
-      - name: Clippy (tower without axum)
-        run: cargo clippy --all-targets --no-default-features --features rustls-tls,tower -- -D warnings
-
-      - name: Clippy (metrics and mcp without axum)
-        run: cargo clippy --all-targets --no-default-features --features rustls-tls,metrics,mcp -- -D warnings
-
-      - name: Tests (all features)
-        run: cargo test --all-features
-
-      - name: Tests (default features)
-        run: cargo test
-
-      - name: Doctests (tower and mcp without axum)
-        # `--all-features` compiles every doc example with `axum` on, so an
-        # example in the `tower` or `mcp` docs that reaches for
-        # `oauth_resource_server::axum` passes there and fails for a consumer
-        # who enabled only `mcp`. This is that subset, doctests only.
-        run: cargo test --doc --no-default-features --features rustls-tls,mcp
-
-      - name: Build examples (all features)
-        run: cargo build --examples --all-features
-
-      - name: Build docs (-D warnings)
-        env:
-          RUSTDOCFLAGS: -D warnings
-        run: cargo doc --no-deps --all-features
-
-      - name: Install cargo-audit
-        uses: taiki-e/install-action@4cef1412cce204788f482e778a0b9187f9626a29 # v2.87.21
-        with:
-          tool: cargo-audit
-
-      - name: Audit dependencies
-        run: cargo audit
-
-      - name: Install cargo-deny
-        uses: taiki-e/install-action@4cef1412cce204788f482e778a0b9187f9626a29 # v2.87.21
-        with:
-          tool: cargo-deny
-
-      - name: Check licenses, bans, sources and advisories
-        run: cargo deny check
-
-      - name: cargo package --list
-        run: cargo package --list
-
-      - name: cargo publish --dry-run
-        run: cargo publish --dry-run
-
-  msrv:
-    needs: check
-    runs-on: [self-hosted, linux, x64]
-    timeout-minutes: 30
-    steps:
-      - name: Checkout the tagged commit
-        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-        with:
-          ref: ${{ github.sha }}
-          persist-credentials: false
-
-      - name: Install system dependencies
-        # `--all-features` below includes `native-tls` (OpenSSL).
-        run: |
-          sudo apt-get update && sudo apt-get install -y --no-install-recommends \
-            pkg-config libssl-dev
-
-      - name: Read MSRV from Cargo.toml
-        id: msrv
-        run: |
-          version=$(grep -m1 '^rust-version' Cargo.toml | sed -E 's/^rust-version *= *"([^"]+)".*/\1/')
-          if [[ -z "$version" ]]; then
-            echo "::error::could not resolve rust-version from Cargo.toml"
-            exit 1
-          fi
-          echo "version=$version" >> "$GITHUB_OUTPUT"
-
-      - name: Install MSRV toolchain
-        uses: dtolnay/rust-toolchain@02cb101ec7c40f2c49e1d9714d64511d8e1b74de # master, 2026-09-12
-        with:
-          toolchain: ${{ steps.msrv.outputs.version }}
-
-      - name: Cache cargo registry and build artifacts
-        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
-        with:
-          path: |
-            ~/.cargo/registry
-            ~/.cargo/git
-            target
-          key: cargo-msrv-${{ steps.msrv.outputs.version }}-${{ hashFiles('Cargo.lock') }}
-          restore-keys: cargo-msrv-${{ steps.msrv.outputs.version }}-
-
-      - name: Build on MSRV (all features)
-        env:
-          MSRV: ${{ steps.msrv.outputs.version }}
-        run: cargo "+${MSRV}" build --all-features --locked
-
-  # cargo-semver-checks against the newest version on crates.io, on the exact
-  # commit about to be published. `check` has just confirmed this version is
-  # not on crates.io yet, so the baseline is the previous release and the
-  # bumped `Cargo.toml` version is what allows a breaking change: a breaking
-  # change under a patch bump (or an unbumped version) fails here, before
-  # anything is uploaded. Repeats ci.yml's `semver` job step for step.
-  semver:
-    needs: check
-    runs-on: [self-hosted, linux, x64]
-    timeout-minutes: 30
-    steps:
-      - name: Checkout the tagged commit
-        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-        with:
-          ref: ${{ github.sha }}
-          persist-credentials: false
-
-      - name: Install system dependencies
-        # `--all-features` below includes `native-tls` (OpenSSL).
-        run: |
-          sudo apt-get update && sudo apt-get install -y --no-install-recommends \
-            pkg-config libssl-dev
-
-      - name: Install Rust 1.93 toolchain (for cargo-semver-checks)
-        # Not rust-toolchain.toml's pin: see ci.yml's `semver` job. This
-        # toolchain and the `tool:` version below move together.
-        uses: dtolnay/rust-toolchain@02cb101ec7c40f2c49e1d9714d64511d8e1b74de # master, 2026-09-12
-        with:
-          toolchain: "1.93"
-
-      - name: Cache cargo registry and build artifacts
-        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
-        with:
-          path: |
-            ~/.cargo/registry
-            ~/.cargo/git
-            target
-          key: cargo-semver-${{ hashFiles('Cargo.lock') }}
-          restore-keys: cargo-semver-
-
-      - name: Install cargo-semver-checks
-        uses: taiki-e/install-action@4cef1412cce204788f482e778a0b9187f9626a29 # v2.87.21
-        with:
-          tool: cargo-semver-checks@0.50.0
-
-      - name: Check for breaking changes against the latest crates.io release
-        run: cargo +1.93 semver-checks check-release --all-features
-
-  # The only job that can mint a crates.io token. Any step in a job with
-  # `id-token: write` can request the OIDC token crates-io-auth-action
-  # exchanges, so this job runs as little code as possible: no
-  # dev-dependency, test or tooling install, and no restored cache (a cached
-  # `target/` is build output this job did not produce). `cargo publish`'s
-  # own verification build still runs the normal dependencies' build
-  # scripts. GitHub-hosted, and in the `release` environment — see the header.
+  # The only job that can mint a crates.io token: any step in a job with `id-token: write`
+  # can request the OIDC token crates-io-auth-action exchanges, so it runs only checkout,
+  # the toolchain, the plain git/coreutils highest-tag re-check, the auth action and
+  # `cargo publish --no-verify` (no build, so no build script or proc macro runs here).
   publish:
-    needs: [check, verify, msrv, semver]
+    needs: [check]
     runs-on: ubuntu-latest
     timeout-minutes: 30
     environment: release
     permissions:
       contents: read
       id-token: write
+    env:
+      CRATE: ${{ needs.check.outputs.crate }}
+      VERSION: ${{ needs.check.outputs.version }}
+      TAG: ${{ needs.check.outputs.tag }}
     steps:
       - name: Is this version still unpublished?
-        # Makes a re-run safe: if an earlier attempt of this run already
-        # uploaded the crate, skip the upload and succeed, so
-        # `release-notes` still runs. Same 200/404/anything-else rule as
-        # `check`.
+        # Makes a re-run safe: an earlier attempt of this run that already uploaded the
+        # crate makes this skip the upload and succeed.
         id: recheck
-        env:
-          VERSION: ${{ needs.check.outputs.version }}
         run: |
-          url="https://crates.io/api/v1/crates/oauth-resource-server/${VERSION}"
+          url="https://crates.io/api/v1/crates/${CRATE}/${VERSION}"
           code=$(curl -sS -o /dev/null -w '%{http_code}' \
             --retry 3 --retry-delay 5 --max-time 30 \
-            -A "oauth-resource-server release workflow (https://github.com/${GITHUB_REPOSITORY})" \
+            -A "${CRATE} release workflow (https://github.com/${GITHUB_REPOSITORY})" \
             "$url") || code="curl exit $?"
           case "$code" in
             200)
-              # Only a re-run may find its own upload. On the first attempt a
-              # 200 means someone else published this version between `check`
-              # and now, and claiming this release's commit for it would be
-              # wrong.
-              if [ "${GITHUB_RUN_ATTEMPT}" -le 1 ]; then
-                echo "::error::oauth-resource-server ${VERSION} appeared on crates.io after the check job ran, from outside this run. Not attributing an upload this workflow did not make to this release."
+              # Only a re-run may find its own upload. On the first attempt a 200 means
+              # someone else published this version since `check` ran.
+              if [[ "${GITHUB_RUN_ATTEMPT}" -le 1 ]]; then
+                echo "::error::${CRATE} ${VERSION} appeared on crates.io after check ran, from outside this run."
                 exit 1
               fi
               echo "upload=false" >> "$GITHUB_OUTPUT"
-              echo "::notice::oauth-resource-server ${VERSION} is already on crates.io (an earlier attempt of this run uploaded it) — skipping the upload."
+              echo "::notice::${CRATE} ${VERSION} is already on crates.io (an earlier attempt of this run uploaded it); skipping the upload."
               ;;
-            404)
-              echo "upload=true" >> "$GITHUB_OUTPUT"
-              ;;
+            404) echo "upload=true" >> "$GITHUB_OUTPUT" ;;
             *)
               echo "::error::crates.io answered ${code} for ${url}; expected 200 or 404. Not publishing on an uncertain answer."
               exit 1
@@ -594,10 +279,7 @@ jobs:
         id: rust_version
         run: |
           version=$(grep -m1 '^channel' rust-toolchain.toml | sed -E 's/channel *= *"([^"]+)"/\1/')
-          if [[ -z "$version" ]]; then
-            echo "::error::could not parse channel from rust-toolchain.toml"
-            exit 1
-          fi
+          [[ -n "$version" ]] || { echo "::error::could not parse channel from rust-toolchain.toml"; exit 1; }
           echo "version=$version" >> "$GITHUB_OUTPUT"
 
       - name: Install Rust toolchain
@@ -605,20 +287,15 @@ jobs:
         uses: dtolnay/rust-toolchain@02cb101ec7c40f2c49e1d9714d64511d8e1b74de # master, 2026-09-12
         with:
           toolchain: ${{ steps.rust_version.outputs.version }}
-          # Unused here, but rust-toolchain.toml lists them, and a toolchain
-          # missing a listed component would leave rustup to fill it in.
+          # Unused here, but rust-toolchain.toml lists them, and a toolchain missing a
+          # listed component would leave rustup to fill it in.
           components: clippy, rustfmt
 
-      - name: Require a stable tag to still be the highest stable release tag
-        # `check`'s guard again, immediately before the token is minted and
-        # the crate uploaded, so a release published since `check` ran is
-        # seen. A plain git/coreutils script from the tagged commit (the one
-        # `check` ran): no build tooling, no dependency, nothing it can pull
-        # in. Before authentication rather than between it and the upload,
-        # so a refusal never mints a token at all.
-        if: steps.recheck.outputs.upload == 'true' && needs.check.outputs.stable == 'true'
-        env:
-          TAG: ${{ needs.check.outputs.tag }}
+      - name: Require the highest stable release tag (again)
+        # `check`'s guard again, immediately before the token is minted, so a release
+        # published since `check` ran is seen. Before authentication, so a refusal never
+        # mints a token.
+        if: steps.recheck.outputs.upload == 'true'
         run: .github/scripts/require-highest-tag.sh "$TAG"
 
       - name: Authenticate with crates.io
@@ -630,43 +307,79 @@ jobs:
         if: steps.recheck.outputs.upload == 'true'
         env:
           CARGO_REGISTRY_TOKEN: ${{ steps.auth.outputs.token }}
-          VERSION: ${{ needs.check.outputs.version }}
         run: |
-          cargo publish
-          echo "### Published oauth-resource-server ${VERSION} to crates.io" >> "$GITHUB_STEP_SUMMARY"
+          cargo publish --no-verify --locked
+          echo "### Published ${CRATE} ${VERSION} to crates.io" >> "$GITHUB_STEP_SUMMARY"
 
-  # Sets the release's notes to the CHANGELOG section once the crate is on
-  # crates.io, replacing whatever placeholder `release-on-bump` (or the
-  # owner) created it with. Edits the existing release only — never creates
-  # a release or a tag (the tag ruleset would refuse GITHUB_TOKEN anyway).
-  # Re-running it writes the same notes again.
-  release-notes:
-    needs: [check, publish]
+  notes:
+    needs: [check]
     runs-on: ubuntu-latest
-    timeout-minutes: 15
+    timeout-minutes: 10
     permissions:
       contents: write
     steps:
-      - name: Checkout the tagged commit
-        # Only CHANGELOG.md is read; the release is edited through the API,
-        # so the checkout needs no stored credentials.
-        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           ref: ${{ github.sha }}
+          fetch-depth: 0
           persist-credentials: false
 
-      - name: Replace the release notes with the CHANGELOG section
+      # Edits the existing release only; never creates a release or a tag (the tag
+      # ruleset would refuse GITHUB_TOKEN anyway).
+      - name: Fill empty release notes
         env:
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GH_TOKEN: ${{ github.token }}
           TAG: ${{ needs.check.outputs.tag }}
-          VERSION: ${{ needs.check.outputs.version }}
-        run: |
-          # The `## [X.Y.Z]` section, up to the next version heading or the
-          # link-reference block at the end of the file. `check` already ran
-          # this same extraction and required it to be non-empty.
-          .github/scripts/changelog-section.sh "$VERSION" CHANGELOG.md > "${RUNNER_TEMP}/release-notes.md"
+        run: .github/scripts/release-notes.sh "$TAG"
 
-          gh release edit "$TAG" \
-            --repo "$GITHUB_REPOSITORY" \
-            --notes-file "${RUNNER_TEMP}/release-notes.md"
-          echo "### Set the ${TAG} release notes from CHANGELOG.md" >> "$GITHUB_STEP_SUMMARY"
+  roll:
+    needs: [check, publish, notes]
+    # Only after everything shipped: until then master keeps X.Y.Z, so a failed release is
+    # fixed and re-released under the same version.
+    if: ${{ !cancelled() && needs.check.result == 'success' && !contains(needs.*.result, 'failure') && !contains(needs.*.result, 'cancelled') && !contains(needs.*.result, 'skipped') }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      # The App, never GITHUB_TOKEN: a PR or arming made with GITHUB_TOKEN starts no
+      # workflow, so the roll PR would never get ci-fast or ci-slow.
+      - name: Generate App token
+        id: app-token
+        uses: actions/create-github-app-token@bcd2ba49218906704ab6c1aa796996da409d3eb1 # v3.2.0
+        with:
+          client-id: ${{ vars.APP_CLIENT_ID }}
+          private-key: ${{ secrets.APP_PRIVATE_KEY }}
+          permission-contents: write
+          permission-pull-requests: write
+
+      # Master's copy of roll.sh; the App token stays in the checkout so the push is the
+      # App's.
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: master
+          fetch-depth: 0
+          token: ${{ steps.app-token.outputs.token }}
+
+      - name: Read pinned Rust toolchain version
+        id: rust_version
+        run: |
+          version=$(grep -m1 '^channel' rust-toolchain.toml | sed -E 's/channel *= *"([^"]+)"/\1/')
+          [[ -n "$version" ]] || { echo "::error::could not parse channel from rust-toolchain.toml"; exit 1; }
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@02cb101ec7c40f2c49e1d9714d64511d8e1b74de # master, 2026-09-12
+        with:
+          toolchain: ${{ steps.rust_version.outputs.version }}
+          components: clippy, rustfmt
+
+      - name: Install cargo-release
+        uses: taiki-e/install-action@4cef1412cce204788f482e778a0b9187f9626a29 # v2.87.21
+        with:
+          tool: cargo-release
+
+      - name: Open and arm the roll PR
+        env:
+          GH_TOKEN: ${{ steps.app-token.outputs.token }}
+          APP_SLUG: ${{ steps.app-token.outputs.app-slug }}
+          RELEASED: ${{ needs.check.outputs.version }}
+        run: .github/scripts/roll.sh "$RELEASED"

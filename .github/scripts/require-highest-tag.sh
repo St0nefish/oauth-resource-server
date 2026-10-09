@@ -1,15 +1,10 @@
 #!/usr/bin/env bash
-# Fails unless TAG is the highest stable v<x.y.z> tag on origin, so a release can never be
-# published below one that already exists (an older bump commit's CI re-run, a release
-# created by hand at an old commit). `git ls-remote` lists every tag in one answer (no API
-# pagination to hide the true highest); an empty or failed listing fails closed.
-#
-# Only stable tags are judged: a pre-release tag (v0.4.0-rc.1) is refused here, so call
-# this for stable tags only.
-#
-# Usage: require-highest-tag.sh <tag>
-# Needs: a checkout whose `origin` is readable, plus git and coreutils — no build tooling,
-#   so it may run in release.yml's `publish` job.
+# Fails unless TAG is the highest stable v<x.y.z> tag on origin, so a release can never
+# be published below one that already exists. `git ls-remote` lists every tag in one
+# answer (no API pagination to hide the true highest); an empty or failed listing fails
+# closed. Plain git and coreutils, no build tooling: release.yml's `publish` job runs it
+# before minting the crates.io token.
+# Usage: require-highest-tag.sh <tag>   Needs: a checkout whose `origin` is readable.
 set -euo pipefail
 shopt -s inherit_errexit
 
