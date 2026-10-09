@@ -1,42 +1,37 @@
 name: Auto-merge
 
-# Arms GitHub's auto-merge (merge commit) on the owner's PRs, so they land as soon
-# as `ci-pass` is green. The ruleset still enforces `ci-pass`; this only saves
-# the manual click.
+# Arms GitHub's auto-merge (merge commit) on the owner's PRs when they open. Arming is
+# what starts `ci-slow` (slow-trigger.yml listens for `auto_merge_enabled`); both
+# required checks green -> GitHub merges. Arming a contributor's or Dependabot's PR by
+# hand (`gh pr merge <n> --auto --merge`) is the approval to run the slow tier on it.
 #
-# The merge must be enabled with a GitHub App token, never GITHUB_TOKEN:
-# GitHub starts no new workflow runs for events GITHUB_TOKEN causes, so a
-# merge made with it would trigger neither the post-merge CI run on `master`
-# (ci.yml's `push` trigger) nor `release.yml`. The App's Client ID is the
-# `APP_CLIENT_ID` repo variable and its key the `APP_PRIVATE_KEY` repo secret;
-# the token is narrowed to the two permissions merging needs. GitHub withholds
-# both from a run triggered by a fork's PR, so this job only works for PRs
-# from branches of this repository — which is the intent.
+# Armed with the GitHub App's token, never GITHUB_TOKEN: GitHub starts no workflow for an
+# event GITHUB_TOKEN causes, so neither slow-trigger.yml (auto_merge_enabled) nor
+# master.yml (the merge's push) would run. The App's Client ID is the `APP_CLIENT_ID`
+# repo variable and its key the `APP_PRIVATE_KEY` repo secret; GitHub withholds both from
+# fork PRs, so only same-repo branches can auto-merge.
 #
-# The App deliberately does not hold the `workflows` permission (it would let
-# the App rewrite what CI runs). A PR that changes a file under
-# `.github/workflows/` still auto-merges when its branch already contains
-# master's version of those files (#34). When master has changed a workflow
-# file the PR also touches since the branch was cut, the merge commit would
-# write workflow content that is not in the PR, and GitHub refuses to let an
-# App enable auto-merge without `workflows` (#27). This job then fails; merge
-# `master` into the branch and push, or merge by hand once `ci-pass` is green.
+# The App deliberately does not hold the `workflows` permission (it would let the App
+# rewrite what CI runs). A PR that changes a file under `.github/workflows/` still arms
+# when its branch already contains master's version of those files (#34). When master
+# has changed a workflow file the PR also touches since the branch was cut, GitHub
+# refuses to let the App enable auto-merge (#27): this job fails; merge `master` into the
+# branch and push, then re-arm (`gh pr merge <n> --auto --merge` as the owner).
 #
-# Actions are pinned to full commit SHAs, release in the trailing comment.
+# Not a required check, so gating it by author is safe. Actions are pinned to full commit
+# SHAs, release in the trailing comment.
 
 on:
   pull_request:
     branches: [master]
-    types: [opened, synchronize, reopened]
+    types: [opened, reopened, ready_for_review]
 
 permissions:
   contents: read
 
 jobs:
   auto-merge:
-    # Only the owner's PRs auto-merge. Other contributors' PRs still run CI
-    # and can be merged manually after review, but must never land unattended.
-    if: github.event.pull_request.user.login == 'St0nefish'
+    if: github.event.pull_request.user.login == 'St0nefish' && !github.event.pull_request.draft
     runs-on: ubuntu-latest
     timeout-minutes: 10
     steps:
@@ -44,15 +39,11 @@ jobs:
         id: app-token
         uses: actions/create-github-app-token@bcd2ba49218906704ab6c1aa796996da409d3eb1 # v3.2.0
         with:
-          # The App's Client ID (`Iv…`), not its numeric app id: v3
-          # deprecates `app-id` in favor of `client-id`.
+          # The App's Client ID (`Iv…`): v3 deprecates `app-id` in favor of `client-id`.
           client-id: ${{ vars.APP_CLIENT_ID }}
           private-key: ${{ secrets.APP_PRIVATE_KEY }}
           permission-contents: write
           permission-pull-requests: write
-          # No `workflows` permission: the installation does not grant it (asking
-          # for it fails token creation with a 422). Without it, some PRs that
-          # change a workflow file cannot be auto-merged — see the header.
 
       - name: Enable auto-merge
         run: gh pr merge "$PR_NUMBER" --auto --merge --repo "$REPO"

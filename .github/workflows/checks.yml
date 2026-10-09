@@ -1,0 +1,577 @@
+name: Checks
+
+# The one definition of what "this tree passes" means, called by:
+#   ci-fast.yml  fast tier on the PR (GitHub's test merge)
+#   slow.yml     slow tier on the merge of the PR head onto the pinned master
+#   master.yml   both tiers on a merge commit whose tree nothing tested (the fallback)
+#
+#   fast tier (GitHub-hosted: it runs for every PR author, Dependabot included)
+#     unit              fmt, clippy across the feature sets that matter, unit tests
+#                       (lib), the -D warnings doc build
+#     audit             cargo audit, cargo deny check
+#     publish-dry-run   cargo package --list, cargo publish --dry-run
+#   slow tier (self-hosted: it runs only for a PR armed for auto-merge, and on master)
+#     integration       every test target and doctest (all features, default, and the
+#                       doctests without axum), the examples
+#     msrv              build on Cargo.toml's rust-version
+#     semver            cargo-semver-checks against the newest crates.io release
+#     feature-powerset  cargo-hack over every feature combination that can compile
+#     minimal-versions  build against the lowest version every requirement allows
+#
+# Clippy runs several narrow feature sets because `--all-features` hides problems: a
+# `cfg` that only appears with `rustls-tls` off (the TLS backends are additive), and an
+# item only the axum module reads (dead code in a `tower`-only build). Every public item
+# needs a doc comment (`#![warn(missing_docs)]` plus the -D warnings doc build).
+#
+# Self-hosted placement: the runner is an ephemeral container on a host whose docker
+# socket it mounts. Only the slow tier runs there, and the slow tier runs only on a PR
+# armed for auto-merge (the owner's PRs on open; arming a contributor's or Dependabot's
+# PR by hand is the approval to run its code there) or on a master commit. No job here
+# holds a write credential.
+#
+# Merge mode (base-sha + head-sha + expected-tree): each job rebuilds the merge with
+# .github/scripts/merge-tree.sh and refuses a different tree. Ref mode (`ref`, or nothing
+# for the caller's own ref): a plain checkout.
+#
+# Every action is pinned to a full commit SHA, with the release it corresponds to in a
+# trailing comment (dtolnay/rust-toolchain publishes no releases, so it is pinned to a
+# commit of its `master` branch).
+
+on:
+  workflow_call:
+    inputs:
+      ref:
+        type: string
+        required: false
+        default: ""
+      base-sha:
+        type: string
+        required: false
+        default: ""
+      head-sha:
+        type: string
+        required: false
+        default: ""
+      expected-tree:
+        type: string
+        required: false
+        default: ""
+      fast:
+        type: boolean
+        required: false
+        default: true
+      slow:
+        type: boolean
+        required: false
+        default: false
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+  CARGO_INCREMENTAL: "0"
+  # The toolchain cargo-semver-checks runs on, not rust-toolchain.toml's: the tool refuses
+  # a rustc older than the rustdoc JSON format it reads. It moves together with the
+  # cargo-semver-checks version in the `semver` job (0.50.0 needs 1.93 or newer); a
+  # floating `stable` would break every PR when a new rustc changes the format.
+  SEMVER_TOOLCHAIN: "1.93"
+
+jobs:
+  # ─────────────────────────────── fast tier ───────────────────────────────
+  unit:
+    if: inputs.fast
+    runs-on: ubuntu-latest
+    timeout-minutes: 40
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ inputs.base-sha || inputs.ref }}
+          fetch-depth: ${{ inputs.expected-tree == '' && 1 || 0 }}
+          # merge-tree.sh may fetch the PR head, then drops the credentials.
+          persist-credentials: ${{ inputs.expected-tree != '' }}
+
+      - name: Merge the PR onto the pinned master
+        if: inputs.expected-tree != ''
+        env:
+          BASE_SHA: ${{ inputs.base-sha }}
+          HEAD_SHA: ${{ inputs.head-sha }}
+          EXPECTED_TREE: ${{ inputs.expected-tree }}
+        run: .github/scripts/merge-tree.sh "$BASE_SHA" "$HEAD_SHA" "$EXPECTED_TREE"
+
+      - name: Install system dependencies
+        # The `native-tls` feature builds against OpenSSL.
+        run: |
+          sudo apt-get update && sudo apt-get install -y --no-install-recommends \
+            pkg-config libssl-dev
+
+      - name: Read pinned Rust toolchain version
+        # rust-toolchain.toml's `channel` is the one source; dtolnay/rust-toolchain does
+        # not parse the file itself.
+        id: rust_version
+        run: |
+          version=$(grep -m1 '^channel' rust-toolchain.toml | sed -E 's/channel *= *"([^"]+)"/\1/')
+          [[ -n "$version" ]] || { echo "::error::could not parse channel from rust-toolchain.toml"; exit 1; }
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@02cb101ec7c40f2c49e1d9714d64511d8e1b74de # master, 2026-09-12
+        with:
+          toolchain: ${{ steps.rust_version.outputs.version }}
+          components: clippy, rustfmt
+
+      - name: Cache cargo registry and build artifacts
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: cargo-unit-${{ steps.rust_version.outputs.version }}-${{ hashFiles('Cargo.lock') }}
+          restore-keys: cargo-unit-${{ steps.rust_version.outputs.version }}-
+
+      - name: Format check
+        run: cargo fmt --all -- --check
+
+      - name: Clippy (all features)
+        run: cargo clippy --all-targets --all-features -- -D warnings
+
+      - name: Clippy (default features)
+        run: cargo clippy --all-targets -- -D warnings
+
+      - name: Clippy (native-tls only)
+        # A cfg that only exists with rustls-tls off; --all-features never builds it.
+        run: cargo clippy --all-targets --no-default-features --features native-tls -- -D warnings
+
+      - name: Clippy (rustls-tls-native-roots only)
+        run: cargo clippy --all-targets --no-default-features --features rustls-tls-native-roots -- -D warnings
+
+      - name: Clippy (tower without axum)
+        # --all-features switches axum on, hiding an item only the axum module reads.
+        run: cargo clippy --all-targets --no-default-features --features rustls-tls,tower -- -D warnings
+
+      - name: Clippy (metrics and mcp without axum)
+        # The same for `metrics`: its cfgs vary with `tower`, not `axum`.
+        run: cargo clippy --all-targets --no-default-features --features rustls-tls,metrics,mcp -- -D warnings
+
+      - name: Unit tests (all features)
+        run: cargo test --all-features --lib
+
+      - name: Unit tests (default features)
+        run: cargo test --lib
+
+      - name: Build docs (-D warnings)
+        # A missing doc comment on a public item or a broken rustdoc link fails here.
+        env:
+          RUSTDOCFLAGS: -D warnings
+        run: cargo doc --no-deps --all-features
+
+  audit:
+    if: inputs.fast
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ inputs.base-sha || inputs.ref }}
+          fetch-depth: ${{ inputs.expected-tree == '' && 1 || 0 }}
+          persist-credentials: ${{ inputs.expected-tree != '' }}
+
+      - name: Merge the PR onto the pinned master
+        if: inputs.expected-tree != ''
+        env:
+          BASE_SHA: ${{ inputs.base-sha }}
+          HEAD_SHA: ${{ inputs.head-sha }}
+          EXPECTED_TREE: ${{ inputs.expected-tree }}
+        run: .github/scripts/merge-tree.sh "$BASE_SHA" "$HEAD_SHA" "$EXPECTED_TREE"
+
+      - name: Read pinned Rust toolchain version
+        id: rust_version
+        run: |
+          version=$(grep -m1 '^channel' rust-toolchain.toml | sed -E 's/channel *= *"([^"]+)"/\1/')
+          [[ -n "$version" ]] || { echo "::error::could not parse channel from rust-toolchain.toml"; exit 1; }
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+
+      - name: Install Rust toolchain
+        # cargo is the entry point for both tools; rust-toolchain.toml selects this one.
+        uses: dtolnay/rust-toolchain@02cb101ec7c40f2c49e1d9714d64511d8e1b74de # master, 2026-09-12
+        with:
+          toolchain: ${{ steps.rust_version.outputs.version }}
+          components: clippy, rustfmt
+
+      - name: Install cargo-audit and cargo-deny
+        # A SHA-pinned action, not a `curl ... | bash` of a mutable branch.
+        uses: taiki-e/install-action@4cef1412cce204788f482e778a0b9187f9626a29 # v2.87.21
+        with:
+          tool: cargo-audit,cargo-deny
+
+      - name: Audit dependencies
+        # Reads .cargo/audit.toml.
+        run: cargo audit
+
+      - name: Check licenses, bans, sources and advisories
+        # Reads deny.toml. Duplicate crate versions are a warning there; everything else
+        # fails.
+        run: cargo deny check
+
+  # Catches a file left out of the package (the `include` list); lets the release publish
+  # with --no-verify.
+  publish-dry-run:
+    if: inputs.fast
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ inputs.base-sha || inputs.ref }}
+          fetch-depth: ${{ inputs.expected-tree == '' && 1 || 0 }}
+          persist-credentials: ${{ inputs.expected-tree != '' }}
+
+      - name: Merge the PR onto the pinned master
+        if: inputs.expected-tree != ''
+        env:
+          BASE_SHA: ${{ inputs.base-sha }}
+          HEAD_SHA: ${{ inputs.head-sha }}
+          EXPECTED_TREE: ${{ inputs.expected-tree }}
+        run: .github/scripts/merge-tree.sh "$BASE_SHA" "$HEAD_SHA" "$EXPECTED_TREE"
+
+      - name: Read pinned Rust toolchain version
+        id: rust_version
+        run: |
+          version=$(grep -m1 '^channel' rust-toolchain.toml | sed -E 's/channel *= *"([^"]+)"/\1/')
+          [[ -n "$version" ]] || { echo "::error::could not parse channel from rust-toolchain.toml"; exit 1; }
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@02cb101ec7c40f2c49e1d9714d64511d8e1b74de # master, 2026-09-12
+        with:
+          toolchain: ${{ steps.rust_version.outputs.version }}
+          components: clippy, rustfmt
+
+      - name: Cache cargo registry and build artifacts
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: cargo-package-${{ steps.rust_version.outputs.version }}-${{ hashFiles('Cargo.lock') }}
+          restore-keys: cargo-package-${{ steps.rust_version.outputs.version }}-
+
+      - name: cargo package --list
+        # The `include` list in Cargo.toml resolves to the files the package should ship.
+        run: cargo package --list
+
+      - name: cargo publish --dry-run
+        # Packages and verifies the crate (metadata, `include` list, a build inside the
+        # package) without uploading anything.
+        run: cargo publish --dry-run --locked
+
+  # ─────────────────────────────── slow tier ───────────────────────────────
+  integration:
+    if: inputs.slow
+    runs-on: [self-hosted, linux, x64]
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ inputs.base-sha || inputs.ref }}
+          fetch-depth: ${{ inputs.expected-tree == '' && 1 || 0 }}
+          persist-credentials: ${{ inputs.expected-tree != '' }}
+
+      - name: Merge the PR onto the pinned master
+        if: inputs.expected-tree != ''
+        env:
+          BASE_SHA: ${{ inputs.base-sha }}
+          HEAD_SHA: ${{ inputs.head-sha }}
+          EXPECTED_TREE: ${{ inputs.expected-tree }}
+        run: .github/scripts/merge-tree.sh "$BASE_SHA" "$HEAD_SHA" "$EXPECTED_TREE"
+
+      - name: Install system dependencies
+        run: |
+          sudo apt-get update && sudo apt-get install -y --no-install-recommends \
+            pkg-config libssl-dev
+
+      - name: Read pinned Rust toolchain version
+        id: rust_version
+        run: |
+          version=$(grep -m1 '^channel' rust-toolchain.toml | sed -E 's/channel *= *"([^"]+)"/\1/')
+          [[ -n "$version" ]] || { echo "::error::could not parse channel from rust-toolchain.toml"; exit 1; }
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@02cb101ec7c40f2c49e1d9714d64511d8e1b74de # master, 2026-09-12
+        with:
+          toolchain: ${{ steps.rust_version.outputs.version }}
+          components: clippy, rustfmt
+
+      - name: Cache cargo registry and build artifacts
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: cargo-checks-${{ steps.rust_version.outputs.version }}-${{ hashFiles('Cargo.lock') }}
+          restore-keys: cargo-checks-${{ steps.rust_version.outputs.version }}-
+
+      - name: Tests (all features)
+        run: cargo test --all-features
+
+      - name: Tests (default features)
+        run: cargo test
+
+      - name: Doctests (tower and mcp without axum)
+        # --all-features compiles every doc example with axum on, so an example in the
+        # tower or mcp docs that reaches for `oauth_resource_server::axum` passes there and
+        # fails for a consumer who enabled only `mcp`.
+        run: cargo test --doc --no-default-features --features rustls-tls,mcp
+
+      - name: Build examples (all features)
+        # examples/ is documentation that must keep compiling.
+        run: cargo build --examples --all-features
+
+  msrv:
+    if: inputs.slow
+    runs-on: [self-hosted, linux, x64]
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ inputs.base-sha || inputs.ref }}
+          fetch-depth: ${{ inputs.expected-tree == '' && 1 || 0 }}
+          persist-credentials: ${{ inputs.expected-tree != '' }}
+
+      - name: Merge the PR onto the pinned master
+        if: inputs.expected-tree != ''
+        env:
+          BASE_SHA: ${{ inputs.base-sha }}
+          HEAD_SHA: ${{ inputs.head-sha }}
+          EXPECTED_TREE: ${{ inputs.expected-tree }}
+        run: .github/scripts/merge-tree.sh "$BASE_SHA" "$HEAD_SHA" "$EXPECTED_TREE"
+
+      - name: Install system dependencies
+        run: |
+          sudo apt-get update && sudo apt-get install -y --no-install-recommends \
+            pkg-config libssl-dev
+
+      - name: Read MSRV from Cargo.toml
+        # Not `cargo metadata`: that needs a toolchain installed first.
+        id: msrv
+        run: |
+          version=$(grep -m1 '^rust-version' Cargo.toml | sed -E 's/^rust-version *= *"([^"]+)".*/\1/')
+          [[ -n "$version" ]] || { echo "::error::could not resolve rust-version from Cargo.toml"; exit 1; }
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+
+      - name: Install MSRV toolchain
+        uses: dtolnay/rust-toolchain@02cb101ec7c40f2c49e1d9714d64511d8e1b74de # master, 2026-09-12
+        with:
+          toolchain: ${{ steps.msrv.outputs.version }}
+
+      - name: Cache cargo registry and build artifacts
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: cargo-msrv-${{ steps.msrv.outputs.version }}-${{ hashFiles('Cargo.lock') }}
+          restore-keys: cargo-msrv-${{ steps.msrv.outputs.version }}-
+
+      - name: Build on MSRV (all features)
+        # The explicit `+<version>` overrides rust-toolchain.toml.
+        env:
+          MSRV: ${{ steps.msrv.outputs.version }}
+        run: cargo "+${MSRV}" build --all-features --locked
+
+  semver:
+    if: inputs.slow
+    runs-on: [self-hosted, linux, x64]
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ inputs.base-sha || inputs.ref }}
+          fetch-depth: ${{ inputs.expected-tree == '' && 1 || 0 }}
+          persist-credentials: ${{ inputs.expected-tree != '' }}
+
+      - name: Merge the PR onto the pinned master
+        if: inputs.expected-tree != ''
+        env:
+          BASE_SHA: ${{ inputs.base-sha }}
+          HEAD_SHA: ${{ inputs.head-sha }}
+          EXPECTED_TREE: ${{ inputs.expected-tree }}
+        run: .github/scripts/merge-tree.sh "$BASE_SHA" "$HEAD_SHA" "$EXPECTED_TREE"
+
+      - name: Install system dependencies
+        run: |
+          sudo apt-get update && sudo apt-get install -y --no-install-recommends \
+            pkg-config libssl-dev
+
+      - name: Install the cargo-semver-checks toolchain
+        uses: dtolnay/rust-toolchain@02cb101ec7c40f2c49e1d9714d64511d8e1b74de # master, 2026-09-12
+        with:
+          toolchain: ${{ env.SEMVER_TOOLCHAIN }}
+
+      - name: Cache cargo registry and build artifacts
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: cargo-semver-${{ hashFiles('Cargo.lock') }}
+          restore-keys: cargo-semver-
+
+      - name: Install cargo-semver-checks
+        uses: taiki-e/install-action@4cef1412cce204788f482e778a0b9187f9626a29 # v2.87.21
+        with:
+          tool: cargo-semver-checks@0.50.0
+
+      - name: Check for breaking changes against the latest crates.io release
+        # The baseline is the newest version on crates.io. master's Cargo.toml names the
+        # NEXT release (one patch above it after the roll PR), so a breaking change fails
+        # unless its PR also bumps the minor (`cargo release version minor`).
+        run: cargo "+${SEMVER_TOOLCHAIN}" semver-checks check-release --all-features
+
+  feature-powerset:
+    if: inputs.slow
+    runs-on: [self-hosted, linux, x64]
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ inputs.base-sha || inputs.ref }}
+          fetch-depth: ${{ inputs.expected-tree == '' && 1 || 0 }}
+          persist-credentials: ${{ inputs.expected-tree != '' }}
+
+      - name: Merge the PR onto the pinned master
+        if: inputs.expected-tree != ''
+        env:
+          BASE_SHA: ${{ inputs.base-sha }}
+          HEAD_SHA: ${{ inputs.head-sha }}
+          EXPECTED_TREE: ${{ inputs.expected-tree }}
+        run: .github/scripts/merge-tree.sh "$BASE_SHA" "$HEAD_SHA" "$EXPECTED_TREE"
+
+      - name: Install system dependencies
+        run: |
+          sudo apt-get update && sudo apt-get install -y --no-install-recommends \
+            pkg-config libssl-dev
+
+      - name: Read pinned Rust toolchain version
+        id: rust_version
+        run: |
+          version=$(grep -m1 '^channel' rust-toolchain.toml | sed -E 's/channel *= *"([^"]+)"/\1/')
+          [[ -n "$version" ]] || { echo "::error::could not parse channel from rust-toolchain.toml"; exit 1; }
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@02cb101ec7c40f2c49e1d9714d64511d8e1b74de # master, 2026-09-12
+        with:
+          toolchain: ${{ steps.rust_version.outputs.version }}
+
+      - name: Cache cargo registry and build artifacts
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: cargo-powerset-${{ steps.rust_version.outputs.version }}-${{ hashFiles('Cargo.lock') }}
+          restore-keys: cargo-powerset-${{ steps.rust_version.outputs.version }}-
+
+      - name: Install cargo-hack
+        uses: taiki-e/install-action@4cef1412cce204788f482e778a0b9187f9626a29 # v2.87.21
+        with:
+          tool: cargo-hack
+
+      - name: Check every feature combination
+        # Every build needs a TLS backend (`compile_error!` otherwise), hence
+        # --at-least-one-of. The three backends are additive and only choose which
+        # reqwest feature is on, so they are made mutually exclusive here: each is
+        # combined with every subset of serde/env/tower/axum/mcp/testing, with `metrics`
+        # toggled together with `testing` (no cfg of either touches the other); the
+        # all-features combination, where the backends meet, is built by `unit` and
+        # `integration`. --no-dev-deps keeps dev-dependencies (which switch on axum, tokio
+        # and serde features) from hiding a feature the library needs and does not enable.
+        run: |
+          cargo hack check --feature-powerset --no-dev-deps \
+            --mutually-exclusive-features rustls-tls,native-tls,rustls-tls-native-roots \
+            --at-least-one-of rustls-tls,native-tls,rustls-tls-native-roots \
+            --group-features metrics,testing
+
+  minimal-versions:
+    if: inputs.slow
+    runs-on: [self-hosted, linux, x64]
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ inputs.base-sha || inputs.ref }}
+          fetch-depth: ${{ inputs.expected-tree == '' && 1 || 0 }}
+          persist-credentials: ${{ inputs.expected-tree != '' }}
+
+      - name: Merge the PR onto the pinned master
+        if: inputs.expected-tree != ''
+        env:
+          BASE_SHA: ${{ inputs.base-sha }}
+          HEAD_SHA: ${{ inputs.head-sha }}
+          EXPECTED_TREE: ${{ inputs.expected-tree }}
+        run: .github/scripts/merge-tree.sh "$BASE_SHA" "$HEAD_SHA" "$EXPECTED_TREE"
+
+      - name: Install system dependencies
+        run: |
+          sudo apt-get update && sudo apt-get install -y --no-install-recommends \
+            pkg-config libssl-dev
+
+      - name: Read pinned Rust toolchain version
+        id: rust_version
+        run: |
+          version=$(grep -m1 '^channel' rust-toolchain.toml | sed -E 's/channel *= *"([^"]+)"/\1/')
+          [[ -n "$version" ]] || { echo "::error::could not parse channel from rust-toolchain.toml"; exit 1; }
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@02cb101ec7c40f2c49e1d9714d64511d8e1b74de # master, 2026-09-12
+        with:
+          toolchain: ${{ steps.rust_version.outputs.version }}
+
+      - name: Install nightly toolchain
+        # Only for `cargo update -Z direct-minimal-versions`, which is nightly-only. The
+        # build below uses the pinned toolchain.
+        uses: dtolnay/rust-toolchain@02cb101ec7c40f2c49e1d9714d64511d8e1b74de # master, 2026-09-12
+        with:
+          toolchain: nightly
+
+      - name: Cache cargo registry and build artifacts
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: cargo-minver-${{ steps.rust_version.outputs.version }}-${{ hashFiles('Cargo.toml') }}
+          restore-keys: cargo-minver-${{ steps.rust_version.outputs.version }}-
+
+      - name: Install cargo-hack
+        uses: taiki-e/install-action@4cef1412cce204788f482e778a0b9187f9626a29 # v2.87.21
+        with:
+          tool: cargo-hack
+
+      - name: Remove dev-dependencies
+        # A consumer never resolves them, and their own floors (tower-http's, for one)
+        # would otherwise force this crate's bounds up for no reason. Rewrites Cargo.toml
+        # in this throwaway checkout only.
+        run: cargo hack --remove-dev-deps
+
+      - name: Resolve every direct dependency to its lowest allowed version
+        run: cargo +nightly update -Z direct-minimal-versions
+
+      - name: Lift `time` off its ancient floor
+        # `simple_asn1` (via jsonwebtoken) allows `time` 0.3.x from 0.3.0, and `time`
+        # before 0.3.35 no longer compiles on current rustc: a transitive floor this crate
+        # cannot raise, so it is put back to the newest release.
+        run: cargo update -p time
+
+      - name: Build against the lowest versions
+        run: cargo build --all-features
