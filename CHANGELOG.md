@@ -8,6 +8,8 @@ Before 1.0, a breaking change increments the minor version.
 
 ## [Unreleased]
 
+## [0.4.1] - 2026-10-09
+
 ## [0.4.0] - 2026-10-05
 
 Additive only; the minor bump follows this crate's convention of shipping new
@@ -948,7 +950,8 @@ MSRV: Rust 1.89. License: MIT.
   resource on a non-loopback host needs `<PREFIX>ALLOW_INSECURE_HTTP=true`
   (`allow_insecure_http`).
 
-[Unreleased]: https://github.com/St0nefish/oauth-resource-server/compare/v0.4.0...HEAD
+[Unreleased]: https://github.com/St0nefish/oauth-resource-server/compare/v0.4.1...HEAD
+[0.4.1]: https://github.com/St0nefish/oauth-resource-server/compare/v0.4.0...v0.4.1
 [0.4.0]: https://github.com/St0nefish/oauth-resource-server/compare/v0.3.1...v0.4.0
 [0.3.1]: https://github.com/St0nefish/oauth-resource-server/compare/v0.3.0...v0.3.1
 [0.3.0]: https://github.com/St0nefish/oauth-resource-server/compare/v0.2.0...v0.3.0
