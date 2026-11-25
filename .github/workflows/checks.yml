@@ -23,8 +23,8 @@ name: Checks
 # item only the axum module reads (dead code in a `tower`-only build). Every public item
 # needs a doc comment (`#![warn(missing_docs)]` plus the -D warnings doc build).
 #
-# Self-hosted placement: the runner is an ephemeral container on a host whose docker
-# socket it mounts. Only the slow tier runs there, and the slow tier runs only on a PR
+# Self-hosted placement: the runner is an ephemeral container with no docker socket
+# mounted. Only the slow tier runs there, and the slow tier runs only on a PR
 # armed for auto-merge (the owner's PRs on open; arming a contributor's or Dependabot's
 # PR by hand is the approval to run its code there) or on a master commit. No job here
 # holds a write credential.
