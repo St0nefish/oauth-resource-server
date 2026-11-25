@@ -47,8 +47,8 @@ name: Release
 # The ancestry-to-master check is a mistake catcher, not a boundary: the run uses the
 # workflow file at the tagged commit.
 #
-# `publish` runs on a GitHub-hosted runner, never the self-hosted one (which mounts its
-# host's docker socket and runs the slow tier), and runs as little code as possible: no
+# `publish` runs on a GitHub-hosted runner, never the self-hosted one (which runs the
+# slow tier), and runs as little code as possible: no
 # dev-dependency, test or tooling install, no restored cache.
 #
 # Recovery: a transient failure (crates.io outage, runner hiccup) -> "re-run failed jobs"
